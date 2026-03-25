@@ -20,6 +20,7 @@ CacheDType = Literal[
     "fp8_e5m2",
     "fp8_inc",
     "fp8_ds_mla",
+    "int4_fused",
 ]
 MambaDType = Literal["auto", "float32", "float16"]
 MambaCacheMode = Literal["all", "align", "none"]
@@ -227,5 +228,13 @@ class CacheConfig:
                 "memory footprint and boosts the performance. "
                 "Meanwhile, it may cause accuracy drop without a proper "
                 "scaling factor."
+            )
+        elif cache_dtype == "int4_fused":
+            logger.info(
+                "Using INT4 fused quantization for KV cache. K and V are "
+                "packed as 2 values per byte with per-group FP16 scales "
+                "(group_size=32). Decode uses a fused Triton kernel that "
+                "dequantizes in-register without materializing FP16 "
+                "intermediates. This reduces memory footprint ~4x vs FP16."
             )
         return cache_dtype

@@ -248,6 +248,11 @@ def get_kv_cache_torch_dtype(
                 torch_dtype = model_dtype
             else:
                 raise ValueError(f"Invalid model dtype: {model_dtype}")
+        elif cache_dtype == "int4_fused":
+            # INT4 fused packs 2 values per uint8 byte.  The cache tensor
+            # element type is uint8; the "compute dtype" for Q/output stays
+            # at the model's native precision.
+            torch_dtype = torch.uint8
         elif cache_dtype in STR_DTYPE_TO_TORCH_DTYPE:
             torch_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_dtype]
         else:
@@ -347,6 +352,12 @@ def kv_cache_dtype_str_to_dtype(
 ) -> torch.dtype:
     if kv_cache_dtype == "auto":
         # Model config may not be specified for unit tests, default to float16
+        return model_config.dtype if model_config else torch.half
+    # INT4 fused stores packed uint8 bytes — the "compute dtype" for the
+    # attention layer's Q tensor and output remains FP16/BF16 (from the model).
+    # Return the model dtype so the attention layer allocates Q/output buffers
+    # in the model's native precision.
+    if kv_cache_dtype == "int4_fused":
         return model_config.dtype if model_config else torch.half
     return STR_DTYPE_TO_TORCH_DTYPE[kv_cache_dtype]
 
