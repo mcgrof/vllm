@@ -14,15 +14,14 @@ Design notes for future asymmetric K/V:
     threaded through as a parameter so it can become per-K / per-V later
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 
-from vllm.config import VllmConfig
-from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
-from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -33,7 +32,11 @@ from vllm.v1.attention.backend import (
     AttentionType,
     CommonAttentionMetadata,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
+    from vllm.config.cache import CacheDType
+    from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
 
@@ -42,6 +45,13 @@ logger = init_logger(__name__)
 # ---------------------------------------------------------------------------
 GROUP_SIZE: int = 32  # number of elements per quantization group
 INT4_RANGE: int = 7  # max absolute value representable in signed INT4
+
+
+# Portable rounding helper that works on both CUDA and ROCm Triton
+@triton.jit
+def _triton_round(x):
+    """Round-half-away-from-zero, portable across Triton backends."""
+    return tl.where(x >= 0, tl.floor(x + 0.5), tl.ceil(x - 0.5))
 
 
 # ===================================================================
@@ -129,9 +139,9 @@ def _reshape_and_cache_int4_kernel(
                          mask=elem_idx < head_size).to(tl.float32)
         k_amax = tl.max(tl.abs(k_vals))
         k_amax = tl.maximum(k_amax, 1e-8)
-        k_scale = k_amax / INT4_RANGE
-        k_q = tl.math.round(k_vals / k_scale)
-        k_q = tl.maximum(tl.minimum(k_q, INT4_RANGE), -8.0)
+        k_scale = k_amax / 7.0
+        k_q = _triton_round(k_vals / k_scale)
+        k_q = tl.maximum(tl.minimum(k_q, 7.0), -8.0)
         k_unsigned = (k_q + 8.0).to(tl.uint8)
 
         # Pack pairs: low nibble = even index, high nibble = odd index
@@ -141,12 +151,12 @@ def _reshape_and_cache_int4_kernel(
         k_high = tl.load(key_ptr + src_k_base + g_start + half_offs * 2 + 1,
                           mask=(g_start + half_offs * 2 + 1) < head_size).to(tl.float32)
 
-        k_low_q = tl.math.round(k_low / k_scale)
-        k_low_q = tl.maximum(tl.minimum(k_low_q, INT4_RANGE), -8.0)
+        k_low_q = _triton_round(k_low / k_scale)
+        k_low_q = tl.maximum(tl.minimum(k_low_q, 7.0), -8.0)
         k_low_u = (k_low_q + 8.0).to(tl.uint8)
 
-        k_high_q = tl.math.round(k_high / k_scale)
-        k_high_q = tl.maximum(tl.minimum(k_high_q, INT4_RANGE), -8.0)
+        k_high_q = _triton_round(k_high / k_scale)
+        k_high_q = tl.maximum(tl.minimum(k_high_q, 7.0), -8.0)
         k_high_u = (k_high_q + 8.0).to(tl.uint8)
 
         k_packed = k_low_u | (k_high_u << 4)
@@ -169,14 +179,14 @@ def _reshape_and_cache_int4_kernel(
                          mask=elem_idx < head_size).to(tl.float32)
         v_amax = tl.max(tl.abs(v_vals))
         v_amax = tl.maximum(v_amax, 1e-8)
-        v_scale = v_amax / INT4_RANGE
+        v_scale = v_amax / 7.0
 
-        v_low_q = tl.math.round(v_low / v_scale)
-        v_low_q = tl.maximum(tl.minimum(v_low_q, INT4_RANGE), -8.0)
+        v_low_q = _triton_round(v_low / v_scale)
+        v_low_q = tl.maximum(tl.minimum(v_low_q, 7.0), -8.0)
         v_low_u = (v_low_q + 8.0).to(tl.uint8)
 
-        v_high_q = tl.math.round(v_high / v_scale)
-        v_high_q = tl.maximum(tl.minimum(v_high_q, INT4_RANGE), -8.0)
+        v_high_q = _triton_round(v_high / v_scale)
+        v_high_q = tl.maximum(tl.minimum(v_high_q, 7.0), -8.0)
         v_high_u = (v_high_q + 8.0).to(tl.uint8)
 
         v_packed = v_low_u | (v_high_u << 4)
