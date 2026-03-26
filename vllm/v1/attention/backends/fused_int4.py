@@ -1133,6 +1133,8 @@ class FusedInt4AttentionImpl(
         combined = torch.cat(results, dim=0)
         flat = combined.reshape(combined.shape[0], -1)
         if output is not None:
-            output[:flat.shape[0]].copy_(flat)
+            output[:flat.shape[0]].copy_(
+                flat.view(output[:flat.shape[0]].shape)
+            )
             return output
         return flat
