@@ -47,6 +47,15 @@ logger = init_logger(__name__)
 GROUP_SIZE: int = 32  # number of elements per quantization group
 INT4_RANGE: int = 7  # max absolute value representable in signed INT4
 
+# Minimum sequence length to use fused INT4 decode kernel.  For shorter
+# sequences the quantisation error per-token is amplified (fewer tokens
+# to dilute it through softmax), which compounds across 28+ transformer
+# layers and flips the argmax.  Below this threshold we dequantise the
+# cache to FP16 and use a torch SDPA fallback — slower but correct.
+MIN_FUSED_SEQ_LEN: int = int(
+    os.environ.get("VLLM_FUSED_INT4_MIN_SEQ_LEN", "8")
+)
+
 # ---------------------------------------------------------------------------
 # Debug instrumentation (guarded by VLLM_FUSED_INT4_DEBUG=1)
 #
@@ -63,6 +72,8 @@ _debug_snapshots: list[dict] = []
 _debug_write_count: int = 0   # how many cache-write dumps we've done
 _debug_decode_count: int = 0  # how many decode dumps we've done
 _DEBUG_MAX_DUMPS: int = 3     # cap per phase to stay bounded
+_debug_forward_count: int = 0  # total forward calls (both prefill and decode)
+_DEBUG_MAX_FWD: int = 200      # cap forward dumps
 
 
 def _debug_flush() -> None:
@@ -742,6 +753,49 @@ def fused_int4_decode(
     return output
 
 
+def decode_fp16_sdpa(
+    query: torch.Tensor,         # [num_seqs, num_heads, head_size]
+    fp16_k: torch.Tensor,        # [max_seqs, max_ctx, num_kv_heads, head_size]
+    fp16_v: torch.Tensor,        # [max_seqs, max_ctx, num_kv_heads, head_size]
+    seq_lens: torch.Tensor,      # [num_seqs]
+    num_kv_heads: int,
+    num_heads: int,
+    head_size: int,
+) -> torch.Tensor:
+    """Decode attention using FP16 shadow K/V for short sequences.
+
+    Uses the original FP16 K/V stored in the shadow buffer, avoiding
+    INT4 quantization error entirely.
+    """
+    num_seqs = query.shape[0]
+    n_rep = num_heads // num_kv_heads
+    scale = 1.0 / (head_size ** 0.5)
+
+    outputs = []
+    for s in range(num_seqs):
+        sl = seq_lens[s].item()
+        k_fp16 = fp16_k[s, :sl]  # [sl, num_kv_heads, head_size]
+        v_fp16 = fp16_v[s, :sl]  # [sl, num_kv_heads, head_size]
+
+        # GQA expansion
+        if n_rep > 1:
+            k_fp16 = k_fp16.repeat_interleave(n_rep, dim=1)
+            v_fp16 = v_fp16.repeat_interleave(n_rep, dim=1)
+
+        # SDPA: [1, H, S, D]
+        q = query[s:s+1].transpose(0, 1).unsqueeze(0)   # [1, H, 1, D]
+        k = k_fp16.transpose(0, 1).unsqueeze(0)          # [1, H, S, D]
+        v = v_fp16.transpose(0, 1).unsqueeze(0)          # [1, H, S, D]
+
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, is_causal=False,
+            scale=scale,
+        )  # [1, H, 1, D]
+        outputs.append(out.squeeze(0).transpose(0, 1))   # [1, H, D]
+
+    return torch.cat(outputs, dim=0)  # [num_seqs, H, D]
+
+
 # ===================================================================
 # Attention metadata
 # ===================================================================
@@ -921,6 +975,14 @@ class FusedInt4AttentionImpl(
         self._k_scales: torch.Tensor | None = None
         self._v_scales: torch.Tensor | None = None
 
+        # FP16 shadow buffer for short-sequence decode fallback.
+        # Stores the original (unquantized) FP16 K/V for the first
+        # MIN_FUSED_SEQ_LEN tokens per sequence.  Indexed by
+        # [seq_idx, token_position, num_kv_heads, head_size].
+        # Lazily allocated on first forward.
+        self._fp16_k_shadow: torch.Tensor | None = None
+        self._fp16_v_shadow: torch.Tensor | None = None
+
         # Verification counters (logged periodically)
         self._decode_fused_count: int = 0
         self._prefill_fallback_count: int = 0
@@ -938,6 +1000,8 @@ class FusedInt4AttentionImpl(
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        global _debug_forward_count
+
         # During warmup/profiling attn_metadata may be None
         if attn_metadata is None:
             if output is not None:
@@ -992,6 +1056,14 @@ class FusedInt4AttentionImpl(
                     attn_metadata.slot_mapping,
                 )
 
+                # ---- FP16 shadow buffer for short-sequence fallback ----
+                # Write original FP16 K/V to the shadow buffer so that
+                # early decode steps can use unquantized values.
+                if MIN_FUSED_SEQ_LEN > 1:
+                    self._update_fp16_shadow(
+                        key, value, attn_metadata,
+                    )
+
                 # Debug: dump cache-write info for first token/head
                 if _FUSED_INT4_DEBUG:
                     is_decode_step = (attn_metadata.max_query_len == 1)
@@ -1007,13 +1079,13 @@ class FusedInt4AttentionImpl(
 
             # ---- Decode: fused attention ----
             if attn_metadata.max_query_len == 1:
-                # Pure decode — use fused INT4 kernel
+                # Pure decode path
                 if query.dim() == 2:
                     query = query.view(-1, self.num_heads, self.head_size)
 
-                # Select BLOCK_N for bounded dispatch
-                # (future: use batch-dependent heuristic here)
-                block_n = 64
+                num_seqs = attn_metadata.seq_lens.shape[0]
+                decode_query = query[:num_seqs]
+                use_fused = attn_metadata.max_seq_len >= MIN_FUSED_SEQ_LEN
 
                 # Backend verification logging
                 if not self._logged_init:
@@ -1025,17 +1097,16 @@ class FusedInt4AttentionImpl(
                         "decode_kernel=fused_int4_triton, "
                         "group_size=%d, "
                         "num_kv_heads=%d, head_size=%d, "
-                        "block_n=%d, "
-                        "fallback=none",
+                        "min_fused_seq_len=%d, "
+                        "fallback=fp16_shadow_sdpa",
                         GROUP_SIZE, self.num_kv_heads,
-                        self.head_size, block_n,
+                        self.head_size, MIN_FUSED_SEQ_LEN,
                     )
-                self._decode_fused_count += 1
 
                 # Debug: dump decode-launch info for first seq/head
                 if _FUSED_INT4_DEBUG:
                     _debug_dump_decode(
-                        query[:attn_metadata.seq_lens.shape[0]],
+                        decode_query,
                         key_cache, value_cache,
                         self._k_scales, self._v_scales,
                         attn_metadata.block_table,
@@ -1044,16 +1115,63 @@ class FusedInt4AttentionImpl(
                         head_size=self.head_size,
                     )
 
-                decode_output = fused_int4_decode(
-                    query[:attn_metadata.seq_lens.shape[0]],
-                    key_cache, value_cache,
-                    self._k_scales, self._v_scales,
-                    attn_metadata.block_table,
-                    attn_metadata.seq_lens,
-                    num_kv_heads=self.num_kv_heads,
-                    head_size=self.head_size,
-                    block_n=block_n,
-                )
+                if use_fused:
+                    self._decode_fused_count += 1
+                    block_n = 64
+                    decode_output = fused_int4_decode(
+                        decode_query,
+                        key_cache, value_cache,
+                        self._k_scales, self._v_scales,
+                        attn_metadata.block_table,
+                        attn_metadata.seq_lens,
+                        num_kv_heads=self.num_kv_heads,
+                        head_size=self.head_size,
+                        block_n=block_n,
+                    )
+                else:
+                    # Short sequence: use FP16 shadow K/V for attention
+                    decode_output = decode_fp16_sdpa(
+                        decode_query,
+                        self._fp16_k_shadow,
+                        self._fp16_v_shadow,
+                        attn_metadata.seq_lens,
+                        num_kv_heads=self.num_kv_heads,
+                        num_heads=self.num_heads,
+                        head_size=self.head_size,
+                    )
+
+                # Debug: capture decode output for first few calls
+                if _FUSED_INT4_DEBUG:
+                    if _debug_forward_count < _DEBUG_MAX_FWD:
+                        _debug_forward_count += 1
+                        torch.cuda.synchronize()
+                        d_out = decode_output[0].detach().cpu().float()
+                        q_in = decode_query[0].detach().cpu().float()
+                        _debug_snapshots.append({
+                            "phase": "decode_output",
+                            "fwd_index": _debug_forward_count,
+                            "seq_lens": attn_metadata.seq_lens
+                                .cpu().tolist(),
+                            "decode_output_shape": list(
+                                decode_output.shape),
+                            "query_shape": list(decode_query.shape),
+                            "output_shape": list(output.shape)
+                                if output is not None else None,
+                            "out_abs_max": round(
+                                d_out.abs().max().item(), 6),
+                            "out_abs_mean": round(
+                                d_out.abs().mean().item(), 6),
+                            "out_zero_frac": round(
+                                (d_out == 0).float().mean().item(), 4),
+                            "out_nan": bool(torch.isnan(d_out).any()),
+                            "out_inf": bool(torch.isinf(d_out).any()),
+                            "out_first_head_16":
+                                d_out[0, :16].tolist(),
+                            "query_first_head_16":
+                                q_in[0, :16].tolist(),
+                        })
+                        if _debug_forward_count % 28 == 0:
+                            _debug_flush()
 
                 if output is not None:
                     output[:decode_output.shape[0]].copy_(
@@ -1074,9 +1192,33 @@ class FusedInt4AttentionImpl(
                     "Only decode uses the fused INT4 kernel. "
                     "fallback_reason=prefill_not_fused"
                 )
-                return self._prefill_fallback(
+                result = self._prefill_fallback(
                     query, key, value, kv_cache, attn_metadata, output,
                 )
+
+                # Debug: capture prefill output
+                if _FUSED_INT4_DEBUG:
+                    if _debug_forward_count < _DEBUG_MAX_FWD:
+                        _debug_forward_count += 1
+                        torch.cuda.synchronize()
+                        r_out = result[0].detach().cpu().float()
+                        _debug_snapshots.append({
+                            "phase": "prefill_output",
+                            "fwd_index": _debug_forward_count,
+                            "seq_lens": attn_metadata.seq_lens
+                                .cpu().tolist(),
+                            "result_shape": list(result.shape),
+                            "output_shape": list(output.shape)
+                                if output is not None else None,
+                            "out_abs_max": round(
+                                r_out.abs().max().item(), 6),
+                            "out_abs_mean": round(
+                                r_out.abs().mean().item(), 6),
+                        })
+                        if _debug_forward_count % 28 == 0:
+                            _debug_flush()
+
+                return result
         else:
             # No cache — just compute attention directly (e.g. prompt eval
             # with no prior context).  This shouldn't normally happen in
@@ -1085,6 +1227,67 @@ class FusedInt4AttentionImpl(
                 output.zero_()
                 return output
             return torch.zeros_like(query)
+
+    def _update_fp16_shadow(
+        self,
+        key: torch.Tensor,      # [num_tokens, num_kv_heads, head_size]
+        value: torch.Tensor,
+        attn_metadata: FusedInt4AttentionMetadata,
+    ) -> None:
+        """Write original FP16 K/V into the shadow buffer.
+
+        The shadow buffer is indexed as [seq_idx, position, num_kv_heads,
+        head_size].  During prefill the tokens are laid out contiguously
+        per-sequence (query_start_loc gives boundaries).  During decode
+        each sequence contributes exactly one token.
+
+        We only need to populate positions < MIN_FUSED_SEQ_LEN because
+        once a sequence exceeds the threshold we switch to the fused
+        INT4 kernel.
+        """
+        num_seqs = attn_metadata.seq_lens.shape[0]
+        device = key.device
+
+        # Lazily allocate the shadow buffer.  We size it for the current
+        # batch; it will be re-allocated if batch size grows.
+        if (self._fp16_k_shadow is None
+                or self._fp16_k_shadow.shape[0] < num_seqs):
+            self._fp16_k_shadow = torch.zeros(
+                max(num_seqs, 8), MIN_FUSED_SEQ_LEN,
+                self.num_kv_heads, self.head_size,
+                dtype=torch.float16, device=device,
+            )
+            self._fp16_v_shadow = torch.zeros(
+                max(num_seqs, 8), MIN_FUSED_SEQ_LEN,
+                self.num_kv_heads, self.head_size,
+                dtype=torch.float16, device=device,
+            )
+
+        is_decode = (attn_metadata.max_query_len == 1)
+
+        if is_decode:
+            # Decode: one token per sequence.
+            # seq_lens[i] is the length AFTER this token was appended.
+            # The new token's position is seq_lens[i] - 1.
+            for s in range(num_seqs):
+                sl = attn_metadata.seq_lens[s].item()
+                pos = sl - 1  # position of the just-written token
+                if pos < MIN_FUSED_SEQ_LEN:
+                    self._fp16_k_shadow[s, pos] = key[s]
+                    self._fp16_v_shadow[s, pos] = value[s]
+        else:
+            # Prefill: tokens are contiguous, query_start_loc gives bounds.
+            query_start_loc = attn_metadata.query_start_loc
+            for s in range(num_seqs):
+                start = query_start_loc[s].item()
+                end = query_start_loc[s + 1].item()
+                n_tokens = end - start
+                # During prefill, the tokens fill positions 0..n_tokens-1.
+                # (Prior cached tokens would have seq_lens > n_tokens,
+                # but for the first prefill they're equal.)
+                n_copy = min(n_tokens, MIN_FUSED_SEQ_LEN)
+                self._fp16_k_shadow[s, :n_copy] = key[start:start + n_copy]
+                self._fp16_v_shadow[s, :n_copy] = value[start:start + n_copy]
 
     def _prefill_fallback(
         self,
