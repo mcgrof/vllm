@@ -69,6 +69,14 @@ MIN_FUSED_SEQ_LEN: int = int(
     os.environ.get("VLLM_FUSED_INT4_MIN_SEQ_LEN", "48")
 )
 
+# K-cache precision override for K/V precision-split experiments.
+# "int4" (default): both K and V use INT4 (existing behaviour).
+# "int8": K is quantised to symmetric INT8, V stays INT4.
+# "fp16": K is read from the FP16 paged cache, V uses INT4.
+# This tests the paper claim that Qwen-class 7B models need much higher
+# precision for K than V.
+K_PRECISION: str = os.environ.get("VLLM_FUSED_INT4_K_PRECISION", "int4")
+
 
 def _cpu_dequant_slot(
     cache: torch.Tensor,
@@ -675,6 +683,570 @@ def fused_int4_decode(
     return output
 
 
+# ===================================================================
+# Triton kernel: K_FP16 / V_INT4 hybrid decode attention
+# Reads K from the FP16 paged cache, V from packed INT4 cache.
+# Tests the paper claim: Qwen-class models need high K precision.
+# ===================================================================
+@triton.jit
+def _kfp16_vint4_decode_kernel(
+    # Query
+    Q_ptr,  # [num_seqs, num_heads, head_size]
+    # FP16 K paged cache (written by reshape_and_cache_flash)
+    K_fp16_ptr,  # [num_blocks, block_size, num_kv_heads, head_size]
+    # Packed INT4 V cache
+    V_cache_ptr,  # [num_blocks, block_size, num_kv_heads, half_hd]
+    V_scales_ptr,  # [num_blocks, block_size, num_kv_heads, num_groups]
+    V_zeros_ptr,
+    # Output
+    Out_ptr,  # [num_seqs, num_heads, head_size]
+    # Block table and seq lens
+    block_table_ptr,
+    seq_lens_ptr,
+    # Strides — Q
+    q_stride_seq: tl.int64,
+    q_stride_head: tl.int64,
+    # Strides — FP16 K cache
+    kf_stride_block: tl.int64,
+    kf_stride_page: tl.int64,
+    kf_stride_head: tl.int64,
+    # Strides — packed V cache
+    vc_stride_block: tl.int64,
+    vc_stride_page: tl.int64,
+    vc_stride_head: tl.int64,
+    # Strides — V scales
+    vs_stride_block: tl.int64,
+    vs_stride_page: tl.int64,
+    vs_stride_head: tl.int64,
+    # Strides — V zeros
+    vz_stride_block: tl.int64,
+    vz_stride_page: tl.int64,
+    vz_stride_head: tl.int64,
+    # Strides — output
+    o_stride_seq: tl.int64,
+    o_stride_head: tl.int64,
+    # Strides — block table
+    bt_stride_seq: tl.int64,
+    # Dims
+    num_kv_heads: tl.int32,
+    scale: tl.float32,
+    HEAD_DIM: tl.constexpr,
+    HALF_HD: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    BYTES_PER_GROUP: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    N_REP: tl.constexpr,
+    IS_ASYMMETRIC: tl.constexpr,
+):
+    """Hybrid decode: FP16 K (full precision) + INT4 V (quantised)."""
+    pid_sh = tl.program_id(0)
+    num_q_heads = num_kv_heads * N_REP
+    seq_idx = pid_sh // num_q_heads
+    head_idx = pid_sh % num_q_heads
+    kv_head_idx = head_idx // N_REP
+
+    seq_len = tl.load(seq_lens_ptr + seq_idx)
+
+    # Load Q — full precision for K dot product
+    q_base = Q_ptr + seq_idx * q_stride_seq + head_idx * q_stride_head
+    d_offs = tl.arange(0, HEAD_DIM)
+    q_vec = tl.load(q_base + d_offs, mask=d_offs < HEAD_DIM).to(tl.float32)
+
+    # V uses packed even/odd decomposition
+    packed_d_offs = tl.arange(0, HALF_HD)
+    group_idx = packed_d_offs // BYTES_PER_GROUP
+
+    # Online softmax accumulators (V is still even/odd packed)
+    m_i = float("-inf")
+    l_i = 0.0
+    acc_even = tl.zeros([HALF_HD], dtype=tl.float32)
+    acc_odd = tl.zeros([HALF_HD], dtype=tl.float32)
+
+    for start_n in range(0, seq_len, BLOCK_N):
+        n_offs = start_n + tl.arange(0, BLOCK_N)
+        n_mask = n_offs < seq_len
+
+        logical_block = n_offs // BLOCK_SIZE
+        block_offset = n_offs % BLOCK_SIZE
+        phys_block = tl.load(
+            block_table_ptr + seq_idx * bt_stride_seq + logical_block,
+            mask=n_mask, other=0,
+        ).to(tl.int64)
+
+        # ---- Load K from FP16 paged cache (full precision) ----
+        k_base = (phys_block[:, None] * kf_stride_block
+                  + block_offset[:, None] * kf_stride_page
+                  + kv_head_idx * kf_stride_head)
+        k_fp16 = tl.load(
+            K_fp16_ptr + k_base + d_offs[None, :],
+            mask=n_mask[:, None] & (d_offs[None, :] < HEAD_DIM),
+            other=0.0,
+        ).to(tl.float32)
+
+        # QK^T: full-precision dot product
+        qk = tl.sum(q_vec[None, :] * k_fp16, axis=1) * scale
+        qk = tl.where(n_mask, qk, float("-inf"))
+
+        # Online softmax
+        m_ij = tl.max(qk)
+        m_new = tl.maximum(m_i, m_ij)
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(qk - m_new)
+        l_i = l_i * alpha + tl.sum(p)
+        acc_even = acc_even * alpha
+        acc_odd = acc_odd * alpha
+
+        # ---- Load and dequantize V from INT4 cache ----
+        v_base = (phys_block[:, None] * vc_stride_block
+                  + block_offset[:, None] * vc_stride_page
+                  + kv_head_idx * vc_stride_head)
+        v_packed = tl.load(
+            V_cache_ptr + v_base + packed_d_offs[None, :],
+            mask=n_mask[:, None], other=0,
+        ).to(tl.uint8)
+
+        if IS_ASYMMETRIC:
+            v_low = (v_packed & 0x0F).to(tl.float32)
+            v_high = ((v_packed >> 4) & 0x0F).to(tl.float32)
+        else:
+            v_low = ((v_packed & 0x0F).to(tl.int8) - 8).to(tl.float32)
+            v_high = (((v_packed >> 4) & 0x0F).to(tl.int8) - 8).to(tl.float32)
+
+        vs_base = (phys_block[:, None] * vs_stride_block
+                   + block_offset[:, None] * vs_stride_page
+                   + kv_head_idx * vs_stride_head)
+        scale_v_expanded = tl.zeros([BLOCK_N, HALF_HD], dtype=tl.float32)
+        zero_v_expanded = tl.zeros([BLOCK_N, HALF_HD], dtype=tl.float32)
+        if IS_ASYMMETRIC:
+            vz_base = (phys_block[:, None] * vz_stride_block
+                       + block_offset[:, None] * vz_stride_page
+                       + kv_head_idx * vz_stride_head)
+        for g in tl.static_range(0, NUM_GROUPS):
+            g_mask = (group_idx == g).to(tl.float32)
+            sv_g = tl.load(
+                V_scales_ptr + vs_base + g,
+                mask=n_mask[:, None], other=1.0,
+            ).to(tl.float32)
+            scale_v_expanded += sv_g * g_mask[None, :]
+            if IS_ASYMMETRIC:
+                zv_g = tl.load(
+                    V_zeros_ptr + vz_base + g,
+                    mask=n_mask[:, None], other=0.0,
+                ).to(tl.float32)
+                zero_v_expanded += zv_g * g_mask[None, :]
+
+        v_low = v_low * scale_v_expanded
+        v_high = v_high * scale_v_expanded
+        if IS_ASYMMETRIC:
+            v_low = v_low + zero_v_expanded
+            v_high = v_high + zero_v_expanded
+
+        acc_even += tl.sum(p[:, None] * v_low, axis=0)
+        acc_odd += tl.sum(p[:, None] * v_high, axis=0)
+        m_i = m_new
+
+    acc_even = acc_even / l_i
+    acc_odd = acc_odd / l_i
+
+    # Write output — interleave even/odd
+    out_base = Out_ptr + seq_idx * o_stride_seq + head_idx * o_stride_head
+    even_offs = tl.arange(0, HALF_HD) * 2
+    odd_offs = tl.arange(0, HALF_HD) * 2 + 1
+    tl.store(out_base + even_offs, acc_even.to(tl.float16),
+             mask=even_offs < HEAD_DIM)
+    tl.store(out_base + odd_offs, acc_odd.to(tl.float16),
+             mask=odd_offs < HEAD_DIM)
+
+
+def kfp16_vint4_decode(
+    query: torch.Tensor,          # [num_seqs, num_heads, head_size]
+    key_cache_fp16: torch.Tensor,  # [num_blocks, block_size, kv_heads, head_size]
+    value_cache_int4: torch.Tensor,  # [num_blocks, block_size, kv_heads, half_hd]
+    v_scales: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    num_kv_heads: int,
+    head_size: int,
+    block_n: int = 64,
+    v_zeros: torch.Tensor | None = None,
+    asymmetric: bool = False,
+) -> torch.Tensor:
+    """K_FP16 / V_INT4 hybrid decode: K from FP16 cache, V from INT4."""
+    num_seqs = query.shape[0]
+    num_heads = query.shape[1]
+    n_rep = num_heads // num_kv_heads
+    half_hd = head_size // 2
+    num_groups = head_size // GROUP_SIZE
+    bytes_per_group = GROUP_SIZE // 2
+    block_size = key_cache_fp16.shape[1]
+    scale = 1.0 / (head_size ** 0.5)
+
+    if v_zeros is None:
+        v_zeros = v_scales
+
+    output = torch.empty_like(query)
+
+    grid = (num_seqs * num_heads,)
+    _kfp16_vint4_decode_kernel[grid](
+        query,
+        key_cache_fp16, value_cache_int4,
+        v_scales, v_zeros,
+        output,
+        block_table, seq_lens,
+        query.stride(0), query.stride(1),
+        key_cache_fp16.stride(0), key_cache_fp16.stride(1),
+        key_cache_fp16.stride(2),
+        value_cache_int4.stride(0), value_cache_int4.stride(1),
+        value_cache_int4.stride(2),
+        v_scales.stride(0), v_scales.stride(1), v_scales.stride(2),
+        v_zeros.stride(0), v_zeros.stride(1), v_zeros.stride(2),
+        output.stride(0), output.stride(1),
+        block_table.stride(0),
+        num_kv_heads=num_kv_heads,
+        scale=scale,
+        HEAD_DIM=head_size,
+        HALF_HD=half_hd,
+        NUM_GROUPS=num_groups,
+        BYTES_PER_GROUP=bytes_per_group,
+        BLOCK_SIZE=block_size,
+        BLOCK_N=min(block_n, 128),
+        N_REP=n_rep,
+        IS_ASYMMETRIC=asymmetric,
+    )
+    return output
+
+
+# ===================================================================
+# Triton kernel: K_INT8 quantize + cache write
+# Quantises K to symmetric INT8 (1 byte per element, per-group scale).
+# ===================================================================
+@triton.jit
+def _reshape_and_cache_k_int8_kernel(
+    key_ptr,  # [num_tokens, num_heads, head_size]
+    key_cache_ptr,  # [num_blocks, block_size, num_heads, head_size] int8
+    k_scales_ptr,  # [num_blocks, block_size, num_heads, num_groups] fp16
+    slot_mapping_ptr,
+    key_stride_token: tl.int64,
+    key_stride_head: tl.int64,
+    kc_stride_block: tl.int64,
+    kc_stride_page: tl.int64,
+    kc_stride_head: tl.int64,
+    ks_stride_block: tl.int64,
+    ks_stride_page: tl.int64,
+    ks_stride_head: tl.int64,
+    num_heads: tl.constexpr,
+    head_size: tl.constexpr,
+    block_size: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+):
+    """Quantise K to symmetric INT8 with per-group scales."""
+    token_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+
+    slot_idx = tl.load(slot_mapping_ptr + token_idx).to(tl.int64)
+    if slot_idx < 0:
+        return
+
+    block_idx = slot_idx // block_size
+    block_offset = slot_idx % block_size
+
+    src_base = token_idx * key_stride_token + head_idx * key_stride_head
+    dst_base = (block_idx * kc_stride_block
+                + block_offset * kc_stride_page
+                + head_idx * kc_stride_head)
+    dst_s_base = (block_idx * ks_stride_block
+                  + block_offset * ks_stride_page
+                  + head_idx * ks_stride_head)
+
+    for g in tl.static_range(0, NUM_GROUPS):
+        g_start = g * GROUP_SIZE
+        offs = tl.arange(0, GROUP_SIZE)
+        vals = tl.load(key_ptr + src_base + g_start + offs,
+                       mask=(g_start + offs) < head_size).to(tl.float32)
+        amax = tl.max(tl.abs(vals))
+        amax = tl.maximum(amax, 1e-8)
+        k_scale = amax / 127.0
+
+        q_vals = _triton_round(vals / k_scale)
+        q_vals = tl.maximum(tl.minimum(q_vals, 127.0), -128.0)
+
+        tl.store(key_cache_ptr + dst_base + g_start + offs,
+                 q_vals.to(tl.int8), mask=(g_start + offs) < head_size)
+        tl.store(k_scales_ptr + dst_s_base + g, k_scale.to(tl.float16))
+
+
+def reshape_and_cache_k_int8(
+    key: torch.Tensor,
+    key_cache_int8: torch.Tensor,  # [num_blocks, block_size, num_heads, head_size] int8
+    k_scales: torch.Tensor,       # [num_blocks, block_size, num_heads, num_groups] fp16
+    slot_mapping: torch.Tensor,
+) -> None:
+    """Quantise K to symmetric INT8 and write into dedicated cache."""
+    num_tokens = key.shape[0]
+    num_heads = key.shape[1]
+    head_size = key.shape[2]
+    block_size = key_cache_int8.shape[1]
+    num_groups = head_size // GROUP_SIZE
+
+    grid = (num_tokens, num_heads)
+    _reshape_and_cache_k_int8_kernel[grid](
+        key, key_cache_int8, k_scales, slot_mapping,
+        key.stride(0), key.stride(1),
+        key_cache_int8.stride(0), key_cache_int8.stride(1),
+        key_cache_int8.stride(2),
+        k_scales.stride(0), k_scales.stride(1), k_scales.stride(2),
+        num_heads=num_heads,
+        head_size=head_size,
+        block_size=block_size,
+        GROUP_SIZE=GROUP_SIZE,
+        NUM_GROUPS=num_groups,
+    )
+
+
+# ===================================================================
+# Triton kernel: K_INT8 / V_INT4 hybrid decode attention
+# ===================================================================
+@triton.jit
+def _kint8_vint4_decode_kernel(
+    Q_ptr,
+    K_cache_ptr,  # [num_blocks, block_size, num_kv_heads, head_size] int8
+    V_cache_ptr,  # [num_blocks, block_size, num_kv_heads, half_hd] uint8
+    K_scales_ptr,
+    V_scales_ptr,
+    V_zeros_ptr,
+    Out_ptr,
+    block_table_ptr,
+    seq_lens_ptr,
+    q_stride_seq: tl.int64,
+    q_stride_head: tl.int64,
+    kc_stride_block: tl.int64,
+    kc_stride_page: tl.int64,
+    kc_stride_head: tl.int64,
+    vc_stride_block: tl.int64,
+    vc_stride_page: tl.int64,
+    vc_stride_head: tl.int64,
+    ks_stride_block: tl.int64,
+    ks_stride_page: tl.int64,
+    ks_stride_head: tl.int64,
+    vs_stride_block: tl.int64,
+    vs_stride_page: tl.int64,
+    vs_stride_head: tl.int64,
+    vz_stride_block: tl.int64,
+    vz_stride_page: tl.int64,
+    vz_stride_head: tl.int64,
+    o_stride_seq: tl.int64,
+    o_stride_head: tl.int64,
+    bt_stride_seq: tl.int64,
+    num_kv_heads: tl.int32,
+    scale: tl.float32,
+    HEAD_DIM: tl.constexpr,
+    HALF_HD: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    BYTES_PER_GROUP: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    N_REP: tl.constexpr,
+    IS_ASYMMETRIC: tl.constexpr,
+    K_GROUP_SIZE: tl.constexpr,
+):
+    """Hybrid decode: INT8 K + INT4 V."""
+    pid_sh = tl.program_id(0)
+    num_q_heads = num_kv_heads * N_REP
+    seq_idx = pid_sh // num_q_heads
+    head_idx = pid_sh % num_q_heads
+    kv_head_idx = head_idx // N_REP
+
+    seq_len = tl.load(seq_lens_ptr + seq_idx)
+
+    # Load Q (full precision)
+    q_base = Q_ptr + seq_idx * q_stride_seq + head_idx * q_stride_head
+    d_offs = tl.arange(0, HEAD_DIM)
+    q_vec = tl.load(q_base + d_offs, mask=d_offs < HEAD_DIM).to(tl.float32)
+
+    # V packed offsets and group mapping
+    packed_d_offs = tl.arange(0, HALF_HD)
+    group_idx_packed = packed_d_offs // BYTES_PER_GROUP
+    # K group mapping over full head_dim
+    group_idx_full = d_offs // K_GROUP_SIZE
+
+    m_i = float("-inf")
+    l_i = 0.0
+    acc_even = tl.zeros([HALF_HD], dtype=tl.float32)
+    acc_odd = tl.zeros([HALF_HD], dtype=tl.float32)
+
+    for start_n in range(0, seq_len, BLOCK_N):
+        n_offs = start_n + tl.arange(0, BLOCK_N)
+        n_mask = n_offs < seq_len
+
+        logical_block = n_offs // BLOCK_SIZE
+        block_offset = n_offs % BLOCK_SIZE
+        phys_block = tl.load(
+            block_table_ptr + seq_idx * bt_stride_seq + logical_block,
+            mask=n_mask, other=0,
+        ).to(tl.int64)
+
+        # ---- Load K from INT8 cache ----
+        k_base = (phys_block[:, None] * kc_stride_block
+                  + block_offset[:, None] * kc_stride_page
+                  + kv_head_idx * kc_stride_head)
+        k_int8 = tl.load(
+            K_cache_ptr + k_base + d_offs[None, :],
+            mask=n_mask[:, None] & (d_offs[None, :] < HEAD_DIM),
+            other=0,
+        ).to(tl.float32)
+
+        # Load K scales and dequantise
+        ks_base = (phys_block[:, None] * ks_stride_block
+                   + block_offset[:, None] * ks_stride_page
+                   + kv_head_idx * ks_stride_head)
+        scale_k_expanded = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
+        for g in tl.static_range(0, NUM_GROUPS):
+            g_mask_k = (group_idx_full == g).to(tl.float32)
+            sk_g = tl.load(
+                K_scales_ptr + ks_base + g,
+                mask=n_mask[:, None], other=1.0,
+            ).to(tl.float32)
+            scale_k_expanded += sk_g * g_mask_k[None, :]
+
+        k_deq = k_int8 * scale_k_expanded
+
+        # QK^T
+        qk = tl.sum(q_vec[None, :] * k_deq, axis=1) * scale
+        qk = tl.where(n_mask, qk, float("-inf"))
+
+        # Online softmax
+        m_ij = tl.max(qk)
+        m_new = tl.maximum(m_i, m_ij)
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(qk - m_new)
+        l_i = l_i * alpha + tl.sum(p)
+        acc_even = acc_even * alpha
+        acc_odd = acc_odd * alpha
+
+        # ---- Load and dequantize V from INT4 cache ----
+        v_base = (phys_block[:, None] * vc_stride_block
+                  + block_offset[:, None] * vc_stride_page
+                  + kv_head_idx * vc_stride_head)
+        v_packed = tl.load(
+            V_cache_ptr + v_base + packed_d_offs[None, :],
+            mask=n_mask[:, None], other=0,
+        ).to(tl.uint8)
+
+        if IS_ASYMMETRIC:
+            v_low = (v_packed & 0x0F).to(tl.float32)
+            v_high = ((v_packed >> 4) & 0x0F).to(tl.float32)
+        else:
+            v_low = ((v_packed & 0x0F).to(tl.int8) - 8).to(tl.float32)
+            v_high = (((v_packed >> 4) & 0x0F).to(tl.int8) - 8).to(tl.float32)
+
+        vs_base = (phys_block[:, None] * vs_stride_block
+                   + block_offset[:, None] * vs_stride_page
+                   + kv_head_idx * vs_stride_head)
+        scale_v_expanded = tl.zeros([BLOCK_N, HALF_HD], dtype=tl.float32)
+        zero_v_expanded = tl.zeros([BLOCK_N, HALF_HD], dtype=tl.float32)
+        if IS_ASYMMETRIC:
+            vz_base = (phys_block[:, None] * vz_stride_block
+                       + block_offset[:, None] * vz_stride_page
+                       + kv_head_idx * vz_stride_head)
+        for g in tl.static_range(0, NUM_GROUPS):
+            g_mask_v = (group_idx_packed == g).to(tl.float32)
+            sv_g = tl.load(
+                V_scales_ptr + vs_base + g,
+                mask=n_mask[:, None], other=1.0,
+            ).to(tl.float32)
+            scale_v_expanded += sv_g * g_mask_v[None, :]
+            if IS_ASYMMETRIC:
+                zv_g = tl.load(
+                    V_zeros_ptr + vz_base + g,
+                    mask=n_mask[:, None], other=0.0,
+                ).to(tl.float32)
+                zero_v_expanded += zv_g * g_mask_v[None, :]
+
+        v_low = v_low * scale_v_expanded
+        v_high = v_high * scale_v_expanded
+        if IS_ASYMMETRIC:
+            v_low = v_low + zero_v_expanded
+            v_high = v_high + zero_v_expanded
+
+        acc_even += tl.sum(p[:, None] * v_low, axis=0)
+        acc_odd += tl.sum(p[:, None] * v_high, axis=0)
+        m_i = m_new
+
+    acc_even = acc_even / l_i
+    acc_odd = acc_odd / l_i
+
+    out_base = Out_ptr + seq_idx * o_stride_seq + head_idx * o_stride_head
+    even_offs = tl.arange(0, HALF_HD) * 2
+    odd_offs = tl.arange(0, HALF_HD) * 2 + 1
+    tl.store(out_base + even_offs, acc_even.to(tl.float16),
+             mask=even_offs < HEAD_DIM)
+    tl.store(out_base + odd_offs, acc_odd.to(tl.float16),
+             mask=odd_offs < HEAD_DIM)
+
+
+def kint8_vint4_decode(
+    query: torch.Tensor,
+    key_cache_int8: torch.Tensor,  # [num_blocks, block_size, kv_heads, head_size] int8
+    value_cache_int4: torch.Tensor,  # [num_blocks, block_size, kv_heads, half_hd] uint8
+    k_scales: torch.Tensor,
+    v_scales: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    num_kv_heads: int,
+    head_size: int,
+    block_n: int = 64,
+    v_zeros: torch.Tensor | None = None,
+    asymmetric: bool = False,
+) -> torch.Tensor:
+    """K_INT8 / V_INT4 hybrid decode."""
+    num_seqs = query.shape[0]
+    num_heads = query.shape[1]
+    n_rep = num_heads // num_kv_heads
+    half_hd = head_size // 2
+    num_groups = head_size // GROUP_SIZE
+    bytes_per_group = GROUP_SIZE // 2
+    block_size = key_cache_int8.shape[1]
+    scale_val = 1.0 / (head_size ** 0.5)
+
+    if v_zeros is None:
+        v_zeros = v_scales
+
+    output = torch.empty_like(query)
+
+    grid = (num_seqs * num_heads,)
+    _kint8_vint4_decode_kernel[grid](
+        query,
+        key_cache_int8, value_cache_int4,
+        k_scales, v_scales, v_zeros,
+        output,
+        block_table, seq_lens,
+        query.stride(0), query.stride(1),
+        key_cache_int8.stride(0), key_cache_int8.stride(1),
+        key_cache_int8.stride(2),
+        value_cache_int4.stride(0), value_cache_int4.stride(1),
+        value_cache_int4.stride(2),
+        k_scales.stride(0), k_scales.stride(1), k_scales.stride(2),
+        v_scales.stride(0), v_scales.stride(1), v_scales.stride(2),
+        v_zeros.stride(0), v_zeros.stride(1), v_zeros.stride(2),
+        output.stride(0), output.stride(1),
+        block_table.stride(0),
+        num_kv_heads=num_kv_heads,
+        scale=scale_val,
+        HEAD_DIM=head_size,
+        HALF_HD=half_hd,
+        NUM_GROUPS=num_groups,
+        BYTES_PER_GROUP=bytes_per_group,
+        BLOCK_SIZE=block_size,
+        BLOCK_N=min(block_n, 128),
+        N_REP=n_rep,
+        IS_ASYMMETRIC=asymmetric,
+        K_GROUP_SIZE=GROUP_SIZE,
+    )
+    return output
+
+
 def decode_fp16_sdpa(
     query: torch.Tensor,         # [num_seqs, num_heads, head_size]
     fp16_k: torch.Tensor,        # [max_seqs, max_ctx, num_kv_heads, head_size]
@@ -913,47 +1485,84 @@ class FusedInt4AttentionImpl(
         self._k_zeros: torch.Tensor | None = None
         self._v_zeros: torch.Tensor | None = None
         self._asymmetric: bool = ASYMMETRIC
+        self._k_precision: str = K_PRECISION  # "int4" | "int8" | "fp16"
+
+        # INT8 K cache (only allocated when k_precision == "int8")
+        self._int8_key_cache: torch.Tensor | None = None
+        self._k_int8_scales: torch.Tensor | None = None
 
         self._logged_init: bool = False
 
     def _ensure_int4_cache(
         self, num_blocks: int, block_size: int, device: torch.device,
     ) -> None:
-        """Lazily allocate dedicated contiguous INT4 cache + scales."""
-        if self._int4_key_cache is not None:
+        """Lazily allocate dedicated cache buffers (INT4 V always, K per policy)."""
+        if self._int4_value_cache is not None:
             return
         logger.info(
-            "[FusedInt4] Allocating dedicated INT4 cache: "
+            "[FusedInt4] Allocating caches: k_precision=%s, "
             "num_blocks=%d, block_size=%d, num_kv_heads=%d, half_hd=%d, "
             "asymmetric=%s, group_size=%d",
+            self._k_precision,
             num_blocks, block_size, self.num_kv_heads, self.half_hd,
             self._asymmetric, GROUP_SIZE,
         )
-        self._int4_key_cache = torch.zeros(
-            num_blocks, block_size, self.num_kv_heads, self.half_hd,
-            dtype=torch.uint8, device=device,
-        )
+        # V cache is always INT4
         self._int4_value_cache = torch.zeros(
             num_blocks, block_size, self.num_kv_heads, self.half_hd,
             dtype=torch.uint8, device=device,
-        )
-        self._k_scales = torch.zeros(
-            num_blocks, block_size, self.num_kv_heads, self.num_groups,
-            dtype=torch.float16, device=device,
         )
         self._v_scales = torch.zeros(
             num_blocks, block_size, self.num_kv_heads, self.num_groups,
             dtype=torch.float16, device=device,
         )
         if self._asymmetric:
-            self._k_zeros = torch.zeros(
-                num_blocks, block_size, self.num_kv_heads, self.num_groups,
-                dtype=torch.float16, device=device,
-            )
             self._v_zeros = torch.zeros(
                 num_blocks, block_size, self.num_kv_heads, self.num_groups,
                 dtype=torch.float16, device=device,
             )
+
+        if self._k_precision == "int4":
+            # K cache as INT4 packed (existing behaviour)
+            self._int4_key_cache = torch.zeros(
+                num_blocks, block_size, self.num_kv_heads, self.half_hd,
+                dtype=torch.uint8, device=device,
+            )
+            self._k_scales = torch.zeros(
+                num_blocks, block_size, self.num_kv_heads, self.num_groups,
+                dtype=torch.float16, device=device,
+            )
+            if self._asymmetric:
+                self._k_zeros = torch.zeros(
+                    num_blocks, block_size, self.num_kv_heads, self.num_groups,
+                    dtype=torch.float16, device=device,
+                )
+        elif self._k_precision == "int8":
+            # K cache as INT8 (1 byte per element, no packing)
+            self._int8_key_cache = torch.zeros(
+                num_blocks, block_size, self.num_kv_heads, self.head_size,
+                dtype=torch.int8, device=device,
+            )
+            self._k_int8_scales = torch.zeros(
+                num_blocks, block_size, self.num_kv_heads, self.num_groups,
+                dtype=torch.float16, device=device,
+            )
+        # else: k_precision == "fp16" — K read from FP16 paged cache, no extra alloc
+
+        # Scratch K buffers for non-int4 K modes: the reshape_and_cache_int4
+        # kernel always writes both K and V, so we need somewhere for K to go.
+        if self._k_precision != "int4":
+            self._scratch_k_cache = torch.zeros(
+                num_blocks, block_size, self.num_kv_heads, self.half_hd,
+                dtype=torch.uint8, device=device,
+            )
+            self._scratch_k_scales = torch.zeros(
+                num_blocks, block_size, self.num_kv_heads, self.num_groups,
+                dtype=torch.float16, device=device,
+            )
+        else:
+            self._scratch_k_cache = None
+            self._scratch_k_scales = None
 
     def do_kv_cache_update(
         self,
@@ -1015,22 +1624,44 @@ class FusedInt4AttentionImpl(
         # Ensure dedicated INT4 cache exists
         self._ensure_int4_cache(num_blocks, block_size, kv_cache.device)
 
-        # ---- INT4 cache write ----
+        # ---- Quantised cache write ----
         num_actual_tokens = attn_metadata.num_actual_tokens
         if num_actual_tokens > 0 and key.numel() > 0:
             if key.dim() == 2:
                 key = key.view(-1, self.num_kv_heads, self.head_size)
                 value = value.view(-1, self.num_kv_heads, self.head_size)
 
-            reshape_and_cache_int4(
-                key, value,
-                self._int4_key_cache, self._int4_value_cache,
-                self._k_scales, self._v_scales,
-                attn_metadata.slot_mapping,
-                k_zeros=self._k_zeros,
-                v_zeros=self._v_zeros,
-                asymmetric=self._asymmetric,
-            )
+            if self._k_precision == "int4":
+                # Both K and V quantised to INT4 (original path)
+                reshape_and_cache_int4(
+                    key, value,
+                    self._int4_key_cache, self._int4_value_cache,
+                    self._k_scales, self._v_scales,
+                    attn_metadata.slot_mapping,
+                    k_zeros=self._k_zeros,
+                    v_zeros=self._v_zeros,
+                    asymmetric=self._asymmetric,
+                )
+            else:
+                # V always INT4.  The kernel writes K and V to separate
+                # buffers, so pass a scratch buffer for K (never read).
+                reshape_and_cache_int4(
+                    key, value,
+                    self._scratch_k_cache, self._int4_value_cache,
+                    self._scratch_k_scales, self._v_scales,
+                    attn_metadata.slot_mapping,
+                    k_zeros=None,
+                    v_zeros=self._v_zeros,
+                    asymmetric=self._asymmetric,
+                )
+
+            if self._k_precision == "int8":
+                reshape_and_cache_k_int8(
+                    key,
+                    self._int8_key_cache,
+                    self._k_int8_scales,
+                    attn_metadata.slot_mapping,
+                )
 
         # ---- Decode path ----
         if attn_metadata.max_query_len == 1:
@@ -1045,29 +1676,65 @@ class FusedInt4AttentionImpl(
                 self._logged_init = True
                 logger.info(
                     "[FusedInt4] Backend: separate-cache mode, "
-                    "decode_kernel=fused_int4_triton, "
+                    "k_precision=%s, decode_kernel=%s, "
                     "fallback=fp16_paged_sdpa, "
                     "group_size=%d, num_kv_heads=%d, head_size=%d, "
                     "min_fused_seq_len=%d, asymmetric=%s",
+                    self._k_precision,
+                    {
+                        "int4": "fused_int4_triton",
+                        "int8": "kint8_vint4_triton",
+                        "fp16": "kfp16_vint4_triton",
+                    }.get(self._k_precision, "unknown"),
                     GROUP_SIZE, self.num_kv_heads,
                     self.head_size, MIN_FUSED_SEQ_LEN,
                     self._asymmetric,
                 )
 
             if use_fused:
-                decode_output = fused_int4_decode(
-                    decode_query,
-                    self._int4_key_cache, self._int4_value_cache,
-                    self._k_scales, self._v_scales,
-                    attn_metadata.block_table,
-                    attn_metadata.seq_lens,
-                    num_kv_heads=self.num_kv_heads,
-                    head_size=self.head_size,
-                    block_n=64,
-                    k_zeros=self._k_zeros,
-                    v_zeros=self._v_zeros,
-                    asymmetric=self._asymmetric,
-                )
+                if self._k_precision == "fp16":
+                    decode_output = kfp16_vint4_decode(
+                        decode_query,
+                        key_cache_fp16,
+                        self._int4_value_cache,
+                        self._v_scales,
+                        attn_metadata.block_table,
+                        attn_metadata.seq_lens,
+                        num_kv_heads=self.num_kv_heads,
+                        head_size=self.head_size,
+                        block_n=64,
+                        v_zeros=self._v_zeros,
+                        asymmetric=self._asymmetric,
+                    )
+                elif self._k_precision == "int8":
+                    decode_output = kint8_vint4_decode(
+                        decode_query,
+                        self._int8_key_cache,
+                        self._int4_value_cache,
+                        self._k_int8_scales,
+                        self._v_scales,
+                        attn_metadata.block_table,
+                        attn_metadata.seq_lens,
+                        num_kv_heads=self.num_kv_heads,
+                        head_size=self.head_size,
+                        block_n=64,
+                        v_zeros=self._v_zeros,
+                        asymmetric=self._asymmetric,
+                    )
+                else:
+                    decode_output = fused_int4_decode(
+                        decode_query,
+                        self._int4_key_cache, self._int4_value_cache,
+                        self._k_scales, self._v_scales,
+                        attn_metadata.block_table,
+                        attn_metadata.seq_lens,
+                        num_kv_heads=self.num_kv_heads,
+                        head_size=self.head_size,
+                        block_n=64,
+                        k_zeros=self._k_zeros,
+                        v_zeros=self._v_zeros,
+                        asymmetric=self._asymmetric,
+                    )
             else:
                 # Short sequence: read from FP16 paged cache via SDPA
                 decode_output = self._decode_from_paged_fp16(
