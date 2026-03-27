@@ -54,14 +54,19 @@ ASYMMETRIC: bool = os.environ.get("VLLM_FUSED_INT4_ASYMMETRIC", "0") == "1"
 
 # Minimum sequence length to use fused INT4 decode kernel.  Below this
 # threshold the decode path reads from the FP16 paged cache (written by
-# the standard reshape_and_cache_flash path) via SDPA — slower but
-# correct.  The fused Triton decode kernel has a known correctness bug
-# in the integrated vLLM flow (works in standalone tests but fails when
-# run through the full engine).  Default to a very high value so the
-# FP16 paged SDPA path is always used until the kernel bug is fixed.
-# Set VLLM_FUSED_INT4_MIN_SEQ_LEN=8 to re-enable the fused kernel.
+# the standard reshape_and_cache_flash path) via SDPA.  The current
+# validated H100/Qwen2.5-7B-Instruct policy is 48: this keeps the first
+# 48 decode positions on the safer FP16-shadow / paged path, then enters
+# the fused INT4 path once the tested correctness envelope remains stable.
+#
+# Why 48 instead of 64: the Qwen H100 policy sweep showed 48 preserves the
+# tested text-match envelope while recovering 16 decode positions per
+# sequence versus 64, i.e. a 25% smaller FP16 protected window and earlier
+# entry into the lower-memory-traffic fused path.  This is a model-specific
+# default, not a universal rule. Override with VLLM_FUSED_INT4_MIN_SEQ_LEN
+# when calibrating other models or regimes.
 MIN_FUSED_SEQ_LEN: int = int(
-    os.environ.get("VLLM_FUSED_INT4_MIN_SEQ_LEN", "999999")
+    os.environ.get("VLLM_FUSED_INT4_MIN_SEQ_LEN", "48")
 )
 
 
