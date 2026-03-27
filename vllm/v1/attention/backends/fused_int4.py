@@ -44,8 +44,13 @@ logger = init_logger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-GROUP_SIZE: int = 32  # number of elements per quantization group
+GROUP_SIZE: int = int(os.environ.get("VLLM_FUSED_INT4_GROUP_SIZE", "32"))
 INT4_RANGE: int = 7  # max absolute value representable in signed INT4
+
+# Asymmetric quantization: uses min/max range with zero-point offset
+# instead of symmetric abs-max.  Better for distributions with non-zero mean
+# (common in V cache).  Set VLLM_FUSED_INT4_ASYMMETRIC=1 to enable.
+ASYMMETRIC: bool = os.environ.get("VLLM_FUSED_INT4_ASYMMETRIC", "0") == "1"
 
 # Minimum sequence length to use fused INT4 decode kernel.  Below this
 # threshold the decode path reads from the FP16 paged cache (written by
@@ -59,226 +64,6 @@ MIN_FUSED_SEQ_LEN: int = int(
     os.environ.get("VLLM_FUSED_INT4_MIN_SEQ_LEN", "999999")
 )
 
-# ---------------------------------------------------------------------------
-# Debug instrumentation (guarded by VLLM_FUSED_INT4_DEBUG=1)
-#
-# When enabled, captures bounded debug snapshots for the first
-# request/head/slot at both cache-write and decode-launch boundaries.
-# Snapshots are accumulated in _debug_snapshots and can be flushed to
-# a JSON file via _debug_flush().
-# ---------------------------------------------------------------------------
-_FUSED_INT4_DEBUG: bool = os.environ.get("VLLM_FUSED_INT4_DEBUG",
-                                          "0") == "1"
-_FUSED_INT4_DEBUG_PATH: str = os.environ.get(
-    "VLLM_FUSED_INT4_DEBUG_PATH", "/tmp/fused_int4_debug.json")
-_debug_snapshots: list[dict] = []
-_debug_write_count: int = 0   # how many cache-write dumps we've done
-_debug_decode_count: int = 0  # how many decode dumps we've done
-_DEBUG_MAX_DUMPS: int = 3     # cap per phase to stay bounded
-_debug_forward_count: int = 0  # total forward calls (both prefill and decode)
-_DEBUG_MAX_FWD: int = 200      # cap forward dumps
-
-
-def _debug_flush() -> None:
-    """Write accumulated debug snapshots to JSON file."""
-    if not _debug_snapshots:
-        return
-    import json as _json
-    try:
-        with open(_FUSED_INT4_DEBUG_PATH, "w") as f:
-            _json.dump(_debug_snapshots, f, indent=2)
-        logger.info("[FusedInt4Debug] Wrote %d snapshots to %s",
-                    len(_debug_snapshots), _FUSED_INT4_DEBUG_PATH)
-    except OSError as e:
-        logger.warning("[FusedInt4Debug] Could not write debug file: %s", e)
-
-
-def _debug_dump_cache_write(
-    key: torch.Tensor,
-    value: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    k_scales: torch.Tensor,
-    v_scales: torch.Tensor,
-    slot_mapping: torch.Tensor,
-    num_kv_heads: int,
-    head_size: int,
-    is_decode: bool = False,
-) -> None:
-    """Dump cache-write boundary info for the first token / first head.
-
-    Only called when VLLM_FUSED_INT4_DEBUG=1.  Bounded to first few calls.
-    """
-    global _debug_write_count
-    if _debug_write_count >= _DEBUG_MAX_DUMPS:
-        return
-    _debug_write_count += 1
-
-    block_size = key_cache.shape[1]
-    slot0 = slot_mapping[0].item()
-    block_idx = slot0 // block_size
-    block_offset = slot0 % block_size
-
-    # Original FP16 K/V for token 0, head 0
-    k_orig = key[0, 0, :16].detach().cpu().float().tolist()
-    v_orig = value[0, 0, :16].detach().cpu().float().tolist()
-
-    # After the cache write has happened, read back packed bytes + scales
-    torch.cuda.synchronize()
-    k_packed_bytes = key_cache[block_idx, block_offset, 0, :8] \
-        .detach().cpu().tolist()
-    v_packed_bytes = value_cache[block_idx, block_offset, 0, :8] \
-        .detach().cpu().tolist()
-    k_scale_vals = k_scales[block_idx, block_offset, 0] \
-        .detach().cpu().float().tolist()
-    v_scale_vals = v_scales[block_idx, block_offset, 0] \
-        .detach().cpu().float().tolist()
-
-    # CPU-side reference dequant of the first 16 K/V values
-    k_recon = _cpu_dequant_slot(key_cache, k_scales,
-                                block_idx, block_offset, head_idx=0,
-                                head_size=head_size, n_values=16)
-    v_recon = _cpu_dequant_slot(value_cache, v_scales,
-                                block_idx, block_offset, head_idx=0,
-                                head_size=head_size, n_values=16)
-
-    k_mae = max(abs(a - b) for a, b in zip(k_orig, k_recon))
-    v_mae = max(abs(a - b) for a, b in zip(v_orig, v_recon))
-
-    snapshot = {
-        "phase": "cache_write",
-        "is_decode": is_decode,
-        "call_index": _debug_write_count,
-        "slot": slot0,
-        "block_idx": block_idx,
-        "block_offset": block_offset,
-        "block_size": block_size,
-        "num_tokens": key.shape[0],
-        "slot_mapping_first8": slot_mapping[:min(8, slot_mapping.shape[0])]
-            .detach().cpu().tolist(),
-        "K_orig_16": k_orig,
-        "V_orig_16": v_orig,
-        "K_packed_8": k_packed_bytes,
-        "V_packed_8": v_packed_bytes,
-        "K_scales": k_scale_vals,
-        "V_scales": v_scale_vals,
-        "K_recon_16": k_recon,
-        "V_recon_16": v_recon,
-        "K_max_abs_err": k_mae,
-        "V_max_abs_err": v_mae,
-    }
-    _debug_snapshots.append(snapshot)
-
-    logger.info(
-        "[FusedInt4Debug] cache_write(#%d, decode=%s): "
-        "slot=%d block_idx=%d block_offset=%d num_tokens=%d | "
-        "K_mae=%.6f V_mae=%.6f",
-        _debug_write_count, is_decode,
-        slot0, block_idx, block_offset, key.shape[0],
-        k_mae, v_mae,
-    )
-
-
-def _debug_dump_decode(
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    k_scales: torch.Tensor,
-    v_scales: torch.Tensor,
-    block_table: torch.Tensor,
-    seq_lens: torch.Tensor,
-    num_kv_heads: int,
-    head_size: int,
-) -> None:
-    """Dump decode-launch boundary info for first sequence / first head.
-
-    Only called when VLLM_FUSED_INT4_DEBUG=1.  Bounded to first few calls.
-    Includes dequantized reconstruction of the first cached slot for
-    cross-checking cache-read correctness.
-    """
-    global _debug_decode_count
-    if _debug_decode_count >= _DEBUG_MAX_DUMPS:
-        return
-    _debug_decode_count += 1
-
-    seq_len = seq_lens[0].item()
-    bt_row = block_table[0].detach().cpu().tolist()
-    q_slice = query[0, 0, :16].detach().cpu().float().tolist()
-
-    # First physical block used by this sequence
-    phys0 = bt_row[0] if bt_row else -1
-    block_size = key_cache.shape[1]
-
-    torch.cuda.synchronize()
-
-    k_bytes = v_bytes = []
-    k_sc = v_sc = []
-    k_recon = v_recon = []
-    if phys0 >= 0:
-        k_bytes = key_cache[phys0, 0, 0, :8].detach().cpu().tolist()
-        v_bytes = value_cache[phys0, 0, 0, :8].detach().cpu().tolist()
-        k_sc = k_scales[phys0, 0, 0].detach().cpu().float().tolist()
-        v_sc = v_scales[phys0, 0, 0].detach().cpu().float().tolist()
-        # Reconstruct the first slot to verify decode-side read
-        k_recon = _cpu_dequant_slot(key_cache, k_scales,
-                                    phys0, 0, head_idx=0,
-                                    head_size=head_size, n_values=16)
-        v_recon = _cpu_dequant_slot(value_cache, v_scales,
-                                    phys0, 0, head_idx=0,
-                                    head_size=head_size, n_values=16)
-
-    # Also dump the last slot in the sequence (the decode-written token)
-    last_slot_idx = seq_len - 1
-    last_logical_block = last_slot_idx // block_size
-    last_block_offset = last_slot_idx % block_size
-    last_phys = bt_row[last_logical_block] if last_logical_block < len(
-        bt_row) else -1
-    last_k_recon = last_v_recon = []
-    last_k_bytes = last_v_bytes = []
-    if last_phys >= 0:
-        last_k_bytes = key_cache[last_phys, last_block_offset, 0, :8] \
-            .detach().cpu().tolist()
-        last_v_bytes = value_cache[last_phys, last_block_offset, 0, :8] \
-            .detach().cpu().tolist()
-        last_k_recon = _cpu_dequant_slot(
-            key_cache, k_scales, last_phys, last_block_offset,
-            head_idx=0, head_size=head_size, n_values=16)
-        last_v_recon = _cpu_dequant_slot(
-            value_cache, v_scales, last_phys, last_block_offset,
-            head_idx=0, head_size=head_size, n_values=16)
-
-    snapshot = {
-        "phase": "decode_launch",
-        "call_index": _debug_decode_count,
-        "seq_len": seq_len,
-        "block_table_first8": bt_row[:8],
-        "block_size": block_size,
-        "query_0_0_16": q_slice,
-        "slot0_K_packed_8": k_bytes,
-        "slot0_V_packed_8": v_bytes,
-        "slot0_K_scales": k_sc,
-        "slot0_V_scales": v_sc,
-        "slot0_K_recon_16": k_recon,
-        "slot0_V_recon_16": v_recon,
-        "last_slot_idx": last_slot_idx,
-        "last_phys_block": last_phys,
-        "last_block_offset": last_block_offset,
-        "last_K_packed_8": last_k_bytes,
-        "last_V_packed_8": last_v_bytes,
-        "last_K_recon_16": last_k_recon,
-        "last_V_recon_16": last_v_recon,
-    }
-    _debug_snapshots.append(snapshot)
-
-    logger.info(
-        "[FusedInt4Debug] decode_launch(#%d): "
-        "seq_len=%d block_table[0]=%s last_slot=%d",
-        _debug_decode_count, seq_len, bt_row[:4], last_slot_idx,
-    )
-
-    # Flush after each decode dump so we don't lose data on crash
-    _debug_flush()
-
 
 def _cpu_dequant_slot(
     cache: torch.Tensor,
@@ -288,6 +73,7 @@ def _cpu_dequant_slot(
     head_idx: int,
     head_size: int,
     n_values: int = 16,
+    zeros: torch.Tensor | None = None,
 ) -> list[float]:
     """CPU-side dequant of packed INT4 bytes for one slot/head.
 
@@ -298,8 +84,17 @@ def _cpu_dequant_slot(
     group_size = GROUP_SIZE
 
     # Unpack: low nibble = even index, high nibble = odd index
-    low = (packed & 0x0F).to(torch.int8) - 8
-    high = ((packed >> 4) & 0x0F).to(torch.int8) - 8
+    low = (packed & 0x0F).to(torch.int8)
+    high = ((packed >> 4) & 0x0F).to(torch.int8)
+
+    if zeros is not None:
+        # Asymmetric: unsigned values, dequant = q * scale + zero_point
+        zp = zeros[block_idx, block_offset, head_idx].detach().cpu().float()
+    else:
+        # Symmetric: signed offset, dequant = (q - 8) * scale
+        low = low - 8
+        high = high - 8
+        zp = None
 
     # Interleave back to full head_size
     hd = packed.shape[0] * 2
@@ -307,18 +102,15 @@ def _cpu_dequant_slot(
     full[0::2] = low.float()
     full[1::2] = high.float()
 
-    # Apply per-group scales
+    # Apply per-group scales (and zero_points for asymmetric)
     num_groups = hd // group_size
     full = full.reshape(num_groups, group_size)
     full = full * sc[:num_groups].unsqueeze(1)
+    if zp is not None:
+        full = full + zp[:num_groups].unsqueeze(1)
     full = full.reshape(hd)
 
     return full[:n_values].tolist()
-
-
-def _fmt(vals: list[float], precision: int = 5) -> str:
-    """Format a list of floats compactly for log lines."""
-    return "[" + ", ".join(f"{v:.{precision}f}" for v in vals) + "]"
 
 
 # Portable rounding helper that works on both CUDA and ROCm Triton
@@ -344,6 +136,9 @@ def _reshape_and_cache_int4_kernel(
     # Destination scale cache (float16)
     k_scales_ptr,  # [num_blocks, block_size, num_heads, num_groups]
     v_scales_ptr,  # [num_blocks, block_size, num_heads, num_groups]
+    # Destination zero-point cache (float16) — only used in asymmetric mode
+    k_zeros_ptr,  # [num_blocks, block_size, num_heads, num_groups] or dummy
+    v_zeros_ptr,
     # Slot mapping
     slot_mapping_ptr,  # [num_tokens]
     # Strides — source
@@ -365,6 +160,13 @@ def _reshape_and_cache_int4_kernel(
     vs_stride_block: tl.int64,
     vs_stride_page: tl.int64,
     vs_stride_head: tl.int64,
+    # Strides — zeros (same shape as scales)
+    kz_stride_block: tl.int64,
+    kz_stride_page: tl.int64,
+    kz_stride_head: tl.int64,
+    vz_stride_block: tl.int64,
+    vz_stride_page: tl.int64,
+    vz_stride_head: tl.int64,
     # Dims (constexpr for compile-time specialisation)
     num_heads: tl.constexpr,
     head_size: tl.constexpr,
@@ -372,6 +174,7 @@ def _reshape_and_cache_int4_kernel(
     GROUP_SIZE: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
     HALF_HD: tl.constexpr,
+    IS_ASYMMETRIC: tl.constexpr,
 ):
     """One program instance handles one (token, head) pair."""
     token_idx = tl.program_id(0)
@@ -401,45 +204,66 @@ def _reshape_and_cache_int4_kernel(
     dst_vs_base = (block_idx * vs_stride_block
                    + block_offset * vs_stride_page
                    + head_idx * vs_stride_head)
+    dst_kz_base = (block_idx * kz_stride_block
+                   + block_offset * kz_stride_page
+                   + head_idx * kz_stride_head)
+    dst_vz_base = (block_idx * vz_stride_block
+                   + block_offset * vz_stride_page
+                   + head_idx * vz_stride_head)
 
     # Process each group
     for g in tl.static_range(0, NUM_GROUPS):
         g_start = g * GROUP_SIZE
-        offs = tl.arange(0, GROUP_SIZE)
-        elem_idx = g_start + offs
+        half_offs = tl.arange(0, GROUP_SIZE // 2)
 
         # ---- Key group ----
-        k_vals = tl.load(key_ptr + src_k_base + elem_idx,
-                         mask=elem_idx < head_size).to(tl.float32)
-        k_amax = tl.max(tl.abs(k_vals))
-        k_amax = tl.maximum(k_amax, 1e-8)
-        k_scale = k_amax / 7.0
-        k_q = _triton_round(k_vals / k_scale)
-        k_q = tl.maximum(tl.minimum(k_q, 7.0), -8.0)
-        k_unsigned = (k_q + 8.0).to(tl.uint8)
-
-        # Pack pairs: low nibble = even index, high nibble = odd index
-        half_offs = tl.arange(0, GROUP_SIZE // 2)
         k_low = tl.load(key_ptr + src_k_base + g_start + half_offs * 2,
                          mask=(g_start + half_offs * 2) < head_size).to(tl.float32)
         k_high = tl.load(key_ptr + src_k_base + g_start + half_offs * 2 + 1,
                           mask=(g_start + half_offs * 2 + 1) < head_size).to(tl.float32)
 
-        k_low_q = _triton_round(k_low / k_scale)
-        k_low_q = tl.maximum(tl.minimum(k_low_q, 7.0), -8.0)
-        k_low_u = (k_low_q + 8.0).to(tl.uint8)
+        if IS_ASYMMETRIC:
+            # Asymmetric: map [min, max] -> [0, 15]
+            offs = tl.arange(0, GROUP_SIZE)
+            k_vals = tl.load(key_ptr + src_k_base + g_start + offs,
+                             mask=(g_start + offs) < head_size).to(tl.float32)
+            k_min = tl.min(k_vals)
+            k_max = tl.max(k_vals)
+            k_range = tl.maximum(k_max - k_min, 1e-8)
+            k_scale = k_range / 15.0
+            k_zero = k_min
 
-        k_high_q = _triton_round(k_high / k_scale)
-        k_high_q = tl.maximum(tl.minimum(k_high_q, 7.0), -8.0)
-        k_high_u = (k_high_q + 8.0).to(tl.uint8)
+            k_low_q = _triton_round((k_low - k_zero) / k_scale)
+            k_low_q = tl.maximum(tl.minimum(k_low_q, 15.0), 0.0)
+            k_low_u = k_low_q.to(tl.uint8)
+
+            k_high_q = _triton_round((k_high - k_zero) / k_scale)
+            k_high_q = tl.maximum(tl.minimum(k_high_q, 15.0), 0.0)
+            k_high_u = k_high_q.to(tl.uint8)
+
+            tl.store(k_zeros_ptr + dst_kz_base + g, k_zero.to(tl.float16))
+        else:
+            # Symmetric: map [-amax, +amax] -> [-8, 7] stored as [0, 15]
+            offs = tl.arange(0, GROUP_SIZE)
+            k_vals = tl.load(key_ptr + src_k_base + g_start + offs,
+                             mask=(g_start + offs) < head_size).to(tl.float32)
+            k_amax = tl.max(tl.abs(k_vals))
+            k_amax = tl.maximum(k_amax, 1e-8)
+            k_scale = k_amax / 7.0
+            k_zero = 0.0  # unused but keeps code uniform
+
+            k_low_q = _triton_round(k_low / k_scale)
+            k_low_q = tl.maximum(tl.minimum(k_low_q, 7.0), -8.0)
+            k_low_u = (k_low_q + 8.0).to(tl.uint8)
+
+            k_high_q = _triton_round(k_high / k_scale)
+            k_high_q = tl.maximum(tl.minimum(k_high_q, 7.0), -8.0)
+            k_high_u = (k_high_q + 8.0).to(tl.uint8)
 
         k_packed = k_low_u | (k_high_u << 4)
-
         packed_offs = g * (GROUP_SIZE // 2) + half_offs
         tl.store(key_cache_ptr + dst_kc_base + packed_offs,
                  k_packed, mask=packed_offs < HALF_HD)
-
-        # Store key scale for this group
         tl.store(k_scales_ptr + dst_ks_base + g, k_scale.to(tl.float16))
 
         # ---- Value group ----
@@ -448,26 +272,42 @@ def _reshape_and_cache_int4_kernel(
         v_high = tl.load(value_ptr + src_v_base + g_start + half_offs * 2 + 1,
                           mask=(g_start + half_offs * 2 + 1) < head_size).to(tl.float32)
 
-        # Compute scale from all elements in group
-        v_vals = tl.load(value_ptr + src_v_base + elem_idx,
-                         mask=elem_idx < head_size).to(tl.float32)
-        v_amax = tl.max(tl.abs(v_vals))
-        v_amax = tl.maximum(v_amax, 1e-8)
-        v_scale = v_amax / 7.0
+        if IS_ASYMMETRIC:
+            v_vals = tl.load(value_ptr + src_v_base + g_start + offs,
+                             mask=(g_start + offs) < head_size).to(tl.float32)
+            v_min = tl.min(v_vals)
+            v_max = tl.max(v_vals)
+            v_range = tl.maximum(v_max - v_min, 1e-8)
+            v_scale = v_range / 15.0
+            v_zero = v_min
 
-        v_low_q = _triton_round(v_low / v_scale)
-        v_low_q = tl.maximum(tl.minimum(v_low_q, 7.0), -8.0)
-        v_low_u = (v_low_q + 8.0).to(tl.uint8)
+            v_low_q = _triton_round((v_low - v_zero) / v_scale)
+            v_low_q = tl.maximum(tl.minimum(v_low_q, 15.0), 0.0)
+            v_low_u = v_low_q.to(tl.uint8)
 
-        v_high_q = _triton_round(v_high / v_scale)
-        v_high_q = tl.maximum(tl.minimum(v_high_q, 7.0), -8.0)
-        v_high_u = (v_high_q + 8.0).to(tl.uint8)
+            v_high_q = _triton_round((v_high - v_zero) / v_scale)
+            v_high_q = tl.maximum(tl.minimum(v_high_q, 15.0), 0.0)
+            v_high_u = v_high_q.to(tl.uint8)
+
+            tl.store(v_zeros_ptr + dst_vz_base + g, v_zero.to(tl.float16))
+        else:
+            v_vals = tl.load(value_ptr + src_v_base + g_start + offs,
+                             mask=(g_start + offs) < head_size).to(tl.float32)
+            v_amax = tl.max(tl.abs(v_vals))
+            v_amax = tl.maximum(v_amax, 1e-8)
+            v_scale = v_amax / 7.0
+
+            v_low_q = _triton_round(v_low / v_scale)
+            v_low_q = tl.maximum(tl.minimum(v_low_q, 7.0), -8.0)
+            v_low_u = (v_low_q + 8.0).to(tl.uint8)
+
+            v_high_q = _triton_round(v_high / v_scale)
+            v_high_q = tl.maximum(tl.minimum(v_high_q, 7.0), -8.0)
+            v_high_u = (v_high_q + 8.0).to(tl.uint8)
 
         v_packed = v_low_u | (v_high_u << 4)
-
         tl.store(value_cache_ptr + dst_vc_base + packed_offs,
                  v_packed, mask=packed_offs < HALF_HD)
-
         tl.store(v_scales_ptr + dst_vs_base + g, v_scale.to(tl.float16))
 
 
@@ -479,6 +319,9 @@ def reshape_and_cache_int4(
     k_scales: torch.Tensor,  # [num_blocks, block_size, num_heads, num_groups]
     v_scales: torch.Tensor,
     slot_mapping: torch.Tensor,  # [num_tokens]
+    k_zeros: torch.Tensor | None = None,
+    v_zeros: torch.Tensor | None = None,
+    asymmetric: bool = False,
 ) -> None:
     """Quantize FP16/BF16 K/V to INT4 and write into paged cache."""
     num_tokens = key.shape[0]
@@ -488,11 +331,18 @@ def reshape_and_cache_int4(
     num_groups = head_size // GROUP_SIZE
     half_hd = head_size // 2
 
+    # Dummy zero tensors when symmetric (Triton needs valid pointers)
+    if k_zeros is None:
+        k_zeros = k_scales  # won't be written in symmetric mode
+    if v_zeros is None:
+        v_zeros = v_scales
+
     grid = (num_tokens, num_heads)
     _reshape_and_cache_int4_kernel[grid](
         key, value,
         key_cache, value_cache,
         k_scales, v_scales,
+        k_zeros, v_zeros,
         slot_mapping,
         # Source strides
         key.stride(0), key.stride(1),
@@ -503,6 +353,9 @@ def reshape_and_cache_int4(
         # Scale strides
         k_scales.stride(0), k_scales.stride(1), k_scales.stride(2),
         v_scales.stride(0), v_scales.stride(1), v_scales.stride(2),
+        # Zero strides
+        k_zeros.stride(0), k_zeros.stride(1), k_zeros.stride(2),
+        v_zeros.stride(0), v_zeros.stride(1), v_zeros.stride(2),
         # Dims
         num_heads=num_heads,
         head_size=head_size,
@@ -510,6 +363,7 @@ def reshape_and_cache_int4(
         GROUP_SIZE=GROUP_SIZE,
         NUM_GROUPS=num_groups,
         HALF_HD=half_hd,
+        IS_ASYMMETRIC=asymmetric,
     )
 
 
@@ -529,6 +383,9 @@ def _fused_int4_decode_kernel(
     # Scales
     K_scales_ptr,  # [num_blocks, block_size, num_kv_heads, num_groups]
     V_scales_ptr,
+    # Zero-points (asymmetric mode only)
+    K_zeros_ptr,
+    V_zeros_ptr,
     # Output
     Out_ptr,  # [num_seqs, num_heads, head_size]
     # Block table for paged KV
@@ -552,6 +409,13 @@ def _fused_int4_decode_kernel(
     vs_stride_block: tl.int64,
     vs_stride_page: tl.int64,
     vs_stride_head: tl.int64,
+    # Strides — zeros
+    kz_stride_block: tl.int64,
+    kz_stride_page: tl.int64,
+    kz_stride_head: tl.int64,
+    vz_stride_block: tl.int64,
+    vz_stride_page: tl.int64,
+    vz_stride_head: tl.int64,
     # Strides — output
     o_stride_seq: tl.int64,
     o_stride_head: tl.int64,
@@ -568,6 +432,7 @@ def _fused_int4_decode_kernel(
     BLOCK_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,  # context tile size
     N_REP: tl.constexpr,  # num_heads // num_kv_heads (GQA ratio)
+    IS_ASYMMETRIC: tl.constexpr,
 ):
     pid_sh = tl.program_id(0)
     # Decompose program id into (seq, head)
@@ -616,25 +481,42 @@ def _fused_int4_decode_kernel(
             mask=n_mask[:, None], other=0,
         ).to(tl.uint8)
 
-        k_low = ((k_packed & 0x0F).to(tl.int8) - 8).to(tl.float32)
-        k_high = (((k_packed >> 4) & 0x0F).to(tl.int8) - 8).to(tl.float32)
+        if IS_ASYMMETRIC:
+            k_low = (k_packed & 0x0F).to(tl.float32)
+            k_high = ((k_packed >> 4) & 0x0F).to(tl.float32)
+        else:
+            k_low = ((k_packed & 0x0F).to(tl.int8) - 8).to(tl.float32)
+            k_high = (((k_packed >> 4) & 0x0F).to(tl.int8) - 8).to(tl.float32)
 
         # Load K scales and broadcast to packed dimension
         ks_base = (phys_block[:, None] * ks_stride_block
                    + block_offset[:, None] * ks_stride_page
                    + kv_head_idx * ks_stride_head)
         scale_k_expanded = tl.zeros([BLOCK_N, HALF_HD], dtype=tl.float32)
+        zero_k_expanded = tl.zeros([BLOCK_N, HALF_HD], dtype=tl.float32)
+        if IS_ASYMMETRIC:
+            kz_base = (phys_block[:, None] * kz_stride_block
+                       + block_offset[:, None] * kz_stride_page
+                       + kv_head_idx * kz_stride_head)
         for g in tl.static_range(0, NUM_GROUPS):
             g_mask = (group_idx == g).to(tl.float32)
             sk_g = tl.load(
                 K_scales_ptr + ks_base + g,
                 mask=n_mask[:, None], other=1.0,
             ).to(tl.float32)
-            # sk_g is [BLOCK_N, 1] after squeeze; broadcast to half_hd
             scale_k_expanded += sk_g * g_mask[None, :]
+            if IS_ASYMMETRIC:
+                zk_g = tl.load(
+                    K_zeros_ptr + kz_base + g,
+                    mask=n_mask[:, None], other=0.0,
+                ).to(tl.float32)
+                zero_k_expanded += zk_g * g_mask[None, :]
 
         k_low = k_low * scale_k_expanded
         k_high = k_high * scale_k_expanded
+        if IS_ASYMMETRIC:
+            k_low = k_low + zero_k_expanded
+            k_high = k_high + zero_k_expanded
 
         # QK^T dot product using even/odd decomposition
         qk = (tl.sum(q_even[None, :] * k_low, axis=1)
@@ -660,13 +542,22 @@ def _fused_int4_decode_kernel(
             mask=n_mask[:, None], other=0,
         ).to(tl.uint8)
 
-        v_low = ((v_packed & 0x0F).to(tl.int8) - 8).to(tl.float32)
-        v_high = (((v_packed >> 4) & 0x0F).to(tl.int8) - 8).to(tl.float32)
+        if IS_ASYMMETRIC:
+            v_low = (v_packed & 0x0F).to(tl.float32)
+            v_high = ((v_packed >> 4) & 0x0F).to(tl.float32)
+        else:
+            v_low = ((v_packed & 0x0F).to(tl.int8) - 8).to(tl.float32)
+            v_high = (((v_packed >> 4) & 0x0F).to(tl.int8) - 8).to(tl.float32)
 
         vs_base = (phys_block[:, None] * vs_stride_block
                    + block_offset[:, None] * vs_stride_page
                    + kv_head_idx * vs_stride_head)
         scale_v_expanded = tl.zeros([BLOCK_N, HALF_HD], dtype=tl.float32)
+        zero_v_expanded = tl.zeros([BLOCK_N, HALF_HD], dtype=tl.float32)
+        if IS_ASYMMETRIC:
+            vz_base = (phys_block[:, None] * vz_stride_block
+                       + block_offset[:, None] * vz_stride_page
+                       + kv_head_idx * vz_stride_head)
         for g in tl.static_range(0, NUM_GROUPS):
             g_mask = (group_idx == g).to(tl.float32)
             sv_g = tl.load(
@@ -674,9 +565,18 @@ def _fused_int4_decode_kernel(
                 mask=n_mask[:, None], other=1.0,
             ).to(tl.float32)
             scale_v_expanded += sv_g * g_mask[None, :]
+            if IS_ASYMMETRIC:
+                zv_g = tl.load(
+                    V_zeros_ptr + vz_base + g,
+                    mask=n_mask[:, None], other=0.0,
+                ).to(tl.float32)
+                zero_v_expanded += zv_g * g_mask[None, :]
 
         v_low = v_low * scale_v_expanded
         v_high = v_high * scale_v_expanded
+        if IS_ASYMMETRIC:
+            v_low = v_low + zero_v_expanded
+            v_high = v_high + zero_v_expanded
 
         # Weighted V accumulation
         acc_even += tl.sum(p[:, None] * v_low, axis=0)
@@ -710,6 +610,9 @@ def fused_int4_decode(
     num_kv_heads: int,
     head_size: int,
     block_n: int = 64,
+    k_zeros: torch.Tensor | None = None,
+    v_zeros: torch.Tensor | None = None,
+    asymmetric: bool = False,
 ) -> torch.Tensor:
     """Launch the fused INT4 decode attention kernel."""
     num_seqs = query.shape[0]
@@ -721,6 +624,12 @@ def fused_int4_decode(
     block_size = key_cache.shape[1]
     scale = 1.0 / (head_size ** 0.5)
 
+    # Dummy tensors when symmetric (Triton needs valid pointers)
+    if k_zeros is None:
+        k_zeros = k_scales
+    if v_zeros is None:
+        v_zeros = v_scales
+
     output = torch.empty_like(query)
 
     grid = (num_seqs * num_heads,)
@@ -728,6 +637,7 @@ def fused_int4_decode(
         query,
         key_cache, value_cache,
         k_scales, v_scales,
+        k_zeros, v_zeros,
         output,
         block_table, seq_lens,
         # Q strides
@@ -738,6 +648,9 @@ def fused_int4_decode(
         # Scale strides
         k_scales.stride(0), k_scales.stride(1), k_scales.stride(2),
         v_scales.stride(0), v_scales.stride(1), v_scales.stride(2),
+        # Zero strides
+        k_zeros.stride(0), k_zeros.stride(1), k_zeros.stride(2),
+        v_zeros.stride(0), v_zeros.stride(1), v_zeros.stride(2),
         # Output strides
         output.stride(0), output.stride(1),
         # Block table stride
@@ -752,6 +665,7 @@ def fused_int4_decode(
         BLOCK_SIZE=block_size,
         BLOCK_N=min(block_n, 128),
         N_REP=n_rep,
+        IS_ASYMMETRIC=asymmetric,
     )
     return output
 
@@ -891,7 +805,7 @@ class FusedInt4AttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_head_size(cls, head_size: int) -> bool:
-        # Head size must be divisible by GROUP_SIZE (32) for clean grouping
+        # Head size must be divisible by GROUP_SIZE for clean grouping
         return head_size % GROUP_SIZE == 0 and head_size > 0
 
     @classmethod
@@ -991,11 +905,10 @@ class FusedInt4AttentionImpl(
         self._int4_value_cache: torch.Tensor | None = None
         self._k_scales: torch.Tensor | None = None
         self._v_scales: torch.Tensor | None = None
+        self._k_zeros: torch.Tensor | None = None
+        self._v_zeros: torch.Tensor | None = None
+        self._asymmetric: bool = ASYMMETRIC
 
-        # Verification counters
-        self._decode_fused_count: int = 0
-        self._decode_sdpa_count: int = 0
-        self._prefill_fallback_count: int = 0
         self._logged_init: bool = False
 
     def _ensure_int4_cache(
@@ -1006,8 +919,10 @@ class FusedInt4AttentionImpl(
             return
         logger.info(
             "[FusedInt4] Allocating dedicated INT4 cache: "
-            "num_blocks=%d, block_size=%d, num_kv_heads=%d, half_hd=%d",
+            "num_blocks=%d, block_size=%d, num_kv_heads=%d, half_hd=%d, "
+            "asymmetric=%s, group_size=%d",
             num_blocks, block_size, self.num_kv_heads, self.half_hd,
+            self._asymmetric, GROUP_SIZE,
         )
         self._int4_key_cache = torch.zeros(
             num_blocks, block_size, self.num_kv_heads, self.half_hd,
@@ -1025,6 +940,15 @@ class FusedInt4AttentionImpl(
             num_blocks, block_size, self.num_kv_heads, self.num_groups,
             dtype=torch.float16, device=device,
         )
+        if self._asymmetric:
+            self._k_zeros = torch.zeros(
+                num_blocks, block_size, self.num_kv_heads, self.num_groups,
+                dtype=torch.float16, device=device,
+            )
+            self._v_zeros = torch.zeros(
+                num_blocks, block_size, self.num_kv_heads, self.num_groups,
+                dtype=torch.float16, device=device,
+            )
 
     def do_kv_cache_update(
         self,
@@ -1098,6 +1022,9 @@ class FusedInt4AttentionImpl(
                 self._int4_key_cache, self._int4_value_cache,
                 self._k_scales, self._v_scales,
                 attn_metadata.slot_mapping,
+                k_zeros=self._k_zeros,
+                v_zeros=self._v_zeros,
+                asymmetric=self._asymmetric,
             )
 
         # ---- Decode path ----
@@ -1116,13 +1043,13 @@ class FusedInt4AttentionImpl(
                     "decode_kernel=fused_int4_triton, "
                     "fallback=fp16_paged_sdpa, "
                     "group_size=%d, num_kv_heads=%d, head_size=%d, "
-                    "min_fused_seq_len=%d",
+                    "min_fused_seq_len=%d, asymmetric=%s",
                     GROUP_SIZE, self.num_kv_heads,
                     self.head_size, MIN_FUSED_SEQ_LEN,
+                    self._asymmetric,
                 )
 
             if use_fused:
-                self._decode_fused_count += 1
                 decode_output = fused_int4_decode(
                     decode_query,
                     self._int4_key_cache, self._int4_value_cache,
@@ -1132,10 +1059,12 @@ class FusedInt4AttentionImpl(
                     num_kv_heads=self.num_kv_heads,
                     head_size=self.head_size,
                     block_n=64,
+                    k_zeros=self._k_zeros,
+                    v_zeros=self._v_zeros,
+                    asymmetric=self._asymmetric,
                 )
             else:
                 # Short sequence: read from FP16 paged cache via SDPA
-                self._decode_sdpa_count += 1
                 decode_output = self._decode_from_paged_fp16(
                     decode_query,
                     key_cache_fp16, value_cache_fp16,
@@ -1152,7 +1081,6 @@ class FusedInt4AttentionImpl(
             return decode_output.view(decode_output.shape[0], -1)
         else:
             # Prefill: use fresh FP16 K/V directly with SDPA
-            self._prefill_fallback_count += 1
             return self._prefill_fallback(
                 query, key, value, kv_cache, attn_metadata, output,
             )
