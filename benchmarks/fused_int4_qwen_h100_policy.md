@@ -19,3 +19,15 @@ Using 48 instead of 64:
 This is not a universal fused-INT4 default for all models.
 It is a model-specific policy outcome derived from the Qwen/H100 sweep.
 Other models should be calibrated separately.
+
+## Next scaling step after the A100/W7900 reconciliation
+The next practical step is to keep scaling on the NVIDIA lane, not to spend more
+time on ROCm/W7900 confusion. Concretely:
+- keep Qwen2.5/H100 `MSL=48` as the current tested policy,
+- run the same strict policy methodology on Qwen2-7B and Mistral-7B,
+- then move from single-GPU policy calibration into bounded decode-throughput
+  checks and API-server / lm-eval validation.
+
+The important testing discipline is to keep correctness strict: exact text/token
+agreement or an explicitly documented semantic rule. Prefix-only correctness is
+not enough.
