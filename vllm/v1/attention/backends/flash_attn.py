@@ -52,6 +52,8 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
 )
+from vllm.v1.attention.routing_state import get_routing_state
+from vllm.v1.attention.routed_attention import forward_routed
 from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     get_kv_cache_layout,
@@ -719,6 +721,47 @@ class FlashAttentionImpl(AttentionImpl):
             q_descale = layer._q_scale.expand(descale_shape)
             k_descale = layer._k_scale.expand(descale_shape)
             v_descale = layer._v_scale.expand(descale_shape)
+
+            # === Cartridge routing hook (phase 1) ===
+            routing_state = get_routing_state()
+            if (routing_state is not None
+                    and routing_state.active
+                    and self.dcp_world_size <= 1):
+                # Extract layer index from the layer name
+                layer_name = getattr(layer, '_layer_name', '')
+                layer_idx = None
+                parts = layer_name.split('.')
+                for i, part in enumerate(parts):
+                    if part == 'layers' and i + 1 < len(parts):
+                        try:
+                            layer_idx = int(parts[i + 1])
+                        except ValueError:
+                            pass
+                if layer_idx is not None and layer_idx < routing_state.block_affinities.shape[0]:
+                    output_routed, metrics = forward_routed(
+                        query=query[:num_actual_tokens],
+                        key_cache=key_cache,
+                        value_cache=value_cache,
+                        block_table=block_table,
+                        routing_prior=routing_state,
+                        layer_idx=layer_idx,
+                        num_heads=self.num_heads,
+                        num_kv_heads=self.num_kv_heads,
+                        head_size=self.head_size,
+                        scale=self.scale,
+                        cu_seqlens_q=cu_seqlens_q,
+                        seqused_k=seqused_k,
+                        max_seqlen_q=max_seqlen_q,
+                        max_seqlen_k=max_seqlen_k,
+                        output=output[:num_actual_tokens],
+                        flash_attn_varlen_func=flash_attn_varlen_func,
+                        fa_version=self.vllm_flash_attn_version,
+                        q_descale=q_descale,
+                        k_descale=k_descale,
+                        v_descale=v_descale,
+                    )
+                    return output
+            # === End routing hook ===
 
             if self.dcp_world_size > 1:
                 self._forward_with_dcp(

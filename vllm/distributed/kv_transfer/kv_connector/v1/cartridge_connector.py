@@ -35,6 +35,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
 )
 from vllm.logger import init_logger
+from vllm.v1.attention.routing_state import RoutingPrior, set_routing_state, clear_routing_state
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
 
@@ -205,6 +206,46 @@ class CartridgeConnector(KVConnectorBase_V1):
         # Free original kv_data to save memory
         del self._cartridge["kv_data"]
 
+        # === Routing prior support (phase 1) ===
+        routing_prior_path = self._kv_transfer_config.get_from_extra_config(
+            "routing_prior_path", None
+        )
+        self._routing_mode = self._kv_transfer_config.get_from_extra_config(
+            "routing_mode", "full"
+        )
+        self._routing_K = int(self._kv_transfer_config.get_from_extra_config(
+            "routing_K", 4
+        ))
+        self._routing_prior = None
+        self._first_decode_request_ids: set[str] = set()
+
+        if routing_prior_path is not None and self._routing_mode != "full":
+            logger.info("Loading routing prior from %s", routing_prior_path)
+            prior = torch.load(routing_prior_path, map_location="cpu", weights_only=False)
+            # Validate
+            assert prior["version"] == 1, f"Unsupported routing prior version: {prior['version']}"
+            assert prior["num_layers"] == self._cartridge["num_layers"], (
+                f"Layer count mismatch: prior={prior['num_layers']} vs cartridge={self._cartridge['num_layers']}"
+            )
+            assert prior["block_size"] == self._block_size, (
+                f"Block size mismatch: prior={prior['block_size']} vs vllm={self._block_size}"
+            )
+            self._routing_prior = prior
+            logger.info(
+                "Routing prior loaded: mode=%s, K=%d, %d layers, %d kv_heads, %d blocks",
+                self._routing_mode,
+                self._routing_K,
+                prior["num_layers"],
+                prior["num_kv_heads"],
+                prior["num_blocks"],
+            )
+        elif self._routing_mode != "full":
+            logger.warning(
+                "routing_mode=%s but no routing_prior_path set, falling back to full",
+                self._routing_mode,
+            )
+            self._routing_mode = "full"
+
     # ==============================
     # Scheduler-side methods
     # ==============================
@@ -302,6 +343,23 @@ class CartridgeConnector(KVConnectorBase_V1):
         assert isinstance(metadata, CartridgeConnectorMetadata)
 
         if not metadata.requests:
+            # Check if we should activate routing for first-token decode
+            if self._routing_mode != "full" and self._routing_prior is not None:
+                # Activate routing state for the attention layers
+                routing_state = RoutingPrior(
+                    block_affinities=self._routing_prior["block_affinities"],
+                    K=self._routing_K,
+                    mode=self._routing_mode,
+                    num_prefix_blocks=self._num_cartridge_blocks,
+                    block_size=self._block_size,
+                    request_id="phase1-single",
+                    active=True,
+                )
+                set_routing_state(routing_state)
+                logger.info(
+                    "Routing state activated: mode=%s, K=%d, prefix_blocks=%d",
+                    self._routing_mode, self._routing_K, self._num_cartridge_blocks,
+                )
             return
 
         for request in metadata.requests:
@@ -361,7 +419,8 @@ class CartridgeConnector(KVConnectorBase_V1):
         return
 
     def wait_for_save(self):
-        """No-op."""
+        """Clear routing state after forward pass."""
+        clear_routing_state()
         return
 
     # ==============================
