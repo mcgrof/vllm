@@ -35,6 +35,14 @@ class KVCacheSpec:
         """
         raise NotImplementedError
 
+    @property
+    def shadow_size_per_block(self) -> int:
+        """Extra memory per block consumed outside the main KV cache
+        tensor.  Used by backends like fused INT4 that allocate shadow
+        caches alongside planner-managed KV cache tensors.
+        """
+        return 0
+
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         """
         The maximum possible memory usage of this KV cache in bytes.
@@ -67,6 +75,12 @@ class AttentionSpec(KVCacheSpec):
     head_size: int
     dtype: torch.dtype
     page_size_padded: int | None = None
+    shadow_bytes_per_block: int = 0
+    num_kv_planes: int = 2  # 2 = K+V (default), 1 = K-only (V in shadow)
+
+    @property
+    def shadow_size_per_block(self) -> int:
+        return self.shadow_bytes_per_block
 
     @property
     def page_size_bytes(self) -> int:
@@ -79,7 +93,7 @@ class AttentionSpec(KVCacheSpec):
     @property
     def real_page_size_bytes(self) -> int:
         return (
-            2
+            self.num_kv_planes
             * self.block_size
             * self.num_kv_heads
             * self.head_size
@@ -160,6 +174,8 @@ class FullAttentionSpec(AttentionSpec):
             head_size_v=specs[0].head_size_v,
             dtype=specs[0].dtype,
             page_size_padded=specs[0].page_size_padded,
+            shadow_bytes_per_block=specs[0].shadow_bytes_per_block,
+            num_kv_planes=specs[0].num_kv_planes,
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
         )
@@ -179,10 +195,15 @@ class FullAttentionSpec(AttentionSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
+        if self.num_kv_planes == 1:
+            # K-only paged cache (V in quantized shadow cache)
+            kv_size = self.head_size
+        else:
+            kv_size = self.head_size + self.head_size_v
         return (
             self.block_size
             * self.num_kv_heads
-            * (self.head_size + self.head_size_v)
+            * kv_size
             * get_dtype_size(self.dtype)
         )
 
@@ -385,6 +406,11 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
     @property
     def page_size_bytes(self) -> int:
         return sum(spec.page_size_bytes for spec in self.kv_cache_specs.values())
+
+    @property
+    def shadow_size_per_block(self) -> int:
+        return sum(spec.shadow_size_per_block
+                   for spec in self.kv_cache_specs.values())
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_num_pages = max(
