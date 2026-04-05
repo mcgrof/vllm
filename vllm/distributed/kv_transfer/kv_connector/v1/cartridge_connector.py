@@ -318,7 +318,8 @@ class CartridgeConnector(KVConnectorBase_V1):
                 if kv_cache_attr is None:
                     continue
 
-                kv_cache_layer = kv_cache_attr[forward_context.virtual_engine]
+                # V1: kv_cache is a direct tensor, not indexed by virtual_engine
+                kv_cache_layer = kv_cache_attr
 
                 layer_idx = self._extract_layer_idx(layer_name)
                 if layer_idx is None or layer_idx >= len(self._kv_stacked):
