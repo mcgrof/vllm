@@ -35,6 +35,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
 )
 from vllm.logger import init_logger
+from vllm.v1.attention.ops.paged_attn import PagedAttention
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
 
@@ -331,21 +332,27 @@ class CartridgeConnector(KVConnectorBase_V1):
                     dtype=kv_cache_layer.dtype,
                 )
 
-                cache_shape = kv_cache_layer.shape
-                if len(cache_shape) == 5:
-                    # Standard: (2, num_blocks, block_size, H, D)
-                    num_pages = cache_shape[1]
-                    page_size = cache_shape[2]
-                    flat_cache = kv_cache_layer.reshape(
-                        2, num_pages * page_size, -1
-                    )
-                    src_flat = src_kv.reshape(2, request.num_tokens, -1)
-                    flat_cache[:, slot_mapping, :] = src_flat
-                else:
-                    logger.warning(
-                        "Unexpected KV cache shape: %s for layer %s",
-                        cache_shape, layer_name
-                    )
+                # Use reshape_and_cache to write in the correct paged
+                # attention layout (key_cache is transposed, not flat).
+                src_key = src_kv[0]    # (T, num_kv_heads, head_dim)
+                src_value = src_kv[1]  # (T, num_kv_heads, head_dim)
+
+                key_cache, value_cache = PagedAttention.split_kv_cache(
+                    kv_cache_layer,
+                    self._cartridge["num_kv_heads"],
+                    self._cartridge["head_dim"],
+                )
+
+                PagedAttention.write_to_paged_cache(
+                    src_key,
+                    src_value,
+                    key_cache,
+                    value_cache,
+                    slot_mapping,
+                    "auto",
+                    torch.tensor(1.0, device=kv_cache_layer.device),
+                    torch.tensor(1.0, device=kv_cache_layer.device),
+                )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """No-op — synchronous load."""
