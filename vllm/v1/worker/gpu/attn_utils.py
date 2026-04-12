@@ -113,6 +113,7 @@ def _reshape_kv_cache(
     attn_backends: dict[str, AttentionBackend],
     cache_dtype: str,
 ) -> dict[str, torch.Tensor]:
+    from vllm.utils.torch_utils import get_dtype_size
     kv_caches: dict[str, torch.Tensor] = {}
     for kv_cache_group_spec in kv_cache_config.kv_cache_groups:
         for layer_name in kv_cache_group_spec.layer_names:
@@ -124,6 +125,30 @@ def _reshape_kv_cache(
             raw_tensor = kv_cache_raw_tensors[layer_name]
             assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
             num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
+
+            # Asymmetric K/V: split the raw int8 tensor into
+            # separate K and V tensors with different dtypes.
+            if (kv_cache_spec.v_dtype is not None
+                    and kv_cache_spec.v_dtype != kv_cache_spec.dtype):
+                k_dtype = kv_cache_spec.dtype
+                v_dtype = kv_cache_spec.v_dtype
+                bs = kv_cache_spec.block_size
+                nh = kv_cache_spec.num_kv_heads
+                hd = kv_cache_spec.head_size
+                k_page_bytes = bs * nh * hd * get_dtype_size(k_dtype)
+                v_page_bytes = bs * nh * hd * get_dtype_size(v_dtype)
+                page_bytes = k_page_bytes + v_page_bytes
+                # Split raw bytes into K and V per page
+                raw_pages = raw_tensor.view(num_blocks, page_bytes)
+                k_raw = raw_pages[:, :k_page_bytes].contiguous()
+                v_raw = raw_pages[:, k_page_bytes:].contiguous()
+                k_cache = k_raw.view(k_dtype).view(
+                    num_blocks, bs, nh, hd)
+                v_cache = v_raw.view(v_dtype).view(
+                    num_blocks, bs, nh, hd)
+                # Store as tuple — FlashInfer backend handles this
+                kv_caches[layer_name] = (k_cache, v_cache)
+                continue
 
             attn_backend = attn_backends[layer_name]
             kv_cache_shape = attn_backend.get_kv_cache_shape(
