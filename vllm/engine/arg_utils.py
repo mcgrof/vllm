@@ -392,7 +392,7 @@ class EngineArgs:
     load_format: str | LoadFormats = LoadConfig.load_format
     config_format: str = ModelConfig.config_format
     dtype: ModelDType = ModelConfig.dtype
-    kv_cache_dtype: CacheDType = CacheConfig.cache_dtype
+    kv_cache_dtype: str = "auto"  # parsed to CacheDTypeSpec later
     seed: int = ModelConfig.seed
     max_model_len: int = ModelConfig.max_model_len
     cudagraph_capture_sizes: list[int] | None = (
@@ -1552,10 +1552,20 @@ class EngineArgs:
             # global layers in interleaved sliding window models.
             sliding_window = model_config.get_sliding_window()
 
-        # Resolve "auto" kv_cache_dtype to actual value from model config
-        resolved_cache_dtype = resolve_kv_cache_dtype_string(
-            self.kv_cache_dtype, model_config
-        )
+        # Resolve kv_cache_dtype: handle comma-separated asymmetric
+        # syntax (e.g. "float16,fp8_e4m3") and "auto" resolution.
+        from vllm.config.cache import parse_cache_dtype_spec
+        raw_spec = parse_cache_dtype_spec(self.kv_cache_dtype)
+        if isinstance(raw_spec, tuple):
+            k_dt = resolve_kv_cache_dtype_string(
+                raw_spec[0], model_config)
+            v_dt = resolve_kv_cache_dtype_string(
+                raw_spec[1], model_config)
+            resolved_cache_dtype = (k_dt, v_dt)
+        else:
+            resolved_cache_dtype = resolve_kv_cache_dtype_string(
+                raw_spec, model_config
+            )
 
         assert self.enable_prefix_caching is not None, (
             "enable_prefix_caching must be set by this point"
