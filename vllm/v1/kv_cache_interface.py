@@ -74,6 +74,7 @@ class AttentionSpec(KVCacheSpec):
     num_kv_heads: int
     head_size: int
     dtype: torch.dtype
+    v_dtype: torch.dtype | None = None  # asymmetric K/V: V dtype if different from K
     page_size_padded: int | None = None
     shadow_bytes_per_block: int = 0
     num_kv_planes: int = 2  # 2 = K+V (default), 1 = K-only (V in shadow)
@@ -92,6 +93,16 @@ class AttentionSpec(KVCacheSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
+        # Asymmetric K/V: when v_dtype differs from dtype (K dtype),
+        # the page holds K bytes + V bytes instead of 2 × same bytes.
+        if self.v_dtype is not None and self.v_dtype != self.dtype:
+            k_bytes = (self.block_size * self.num_kv_heads
+                       * self.head_size
+                       * get_dtype_size(self.dtype))
+            v_bytes = (self.block_size * self.num_kv_heads
+                       * self.head_size
+                       * get_dtype_size(self.v_dtype))
+            return k_bytes + v_bytes
         return (
             self.num_kv_planes
             * self.block_size
