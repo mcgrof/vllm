@@ -1135,8 +1135,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         logits_soft_cap=self.logits_soft_cap,
                         q_data_type=self.q_data_type,
                         kv_data_type=self.k_cache_dtype,
-                k_data_type=self.k_cache_dtype,
-                v_data_type=self.v_cache_dtype,
                         o_data_type=self.model_config.dtype,
                         fixed_split_size=self.prefill_fixed_split_size,
                         disable_split_kv=self.disable_split_kv,
@@ -1189,8 +1187,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     logits_soft_cap=self.logits_soft_cap,
                     q_data_type=self.q_data_type,
                     kv_data_type=self.k_cache_dtype,
-                k_data_type=self.k_cache_dtype,
-                v_data_type=self.v_cache_dtype,
                     o_data_type=self.model_config.dtype,
                     fixed_split_size=self.decode_fixed_split_size,
                     disable_split_kv=self.disable_split_kv,
@@ -1239,7 +1235,11 @@ class FlashInferImpl(AttentionImpl):
         self.window_left = (
             self.sliding_window[0] if self.sliding_window is not None else -1
         )
-        self.kv_cache_dtype = kv_cache_dtype
+        # Asymmetric: extract K dtype string for FP8 checks
+        if isinstance(kv_cache_dtype, tuple):
+            self.kv_cache_dtype = kv_cache_dtype[0]
+        else:
+            self.kv_cache_dtype = kv_cache_dtype
         self.logits_soft_cap = logits_soft_cap
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
 
