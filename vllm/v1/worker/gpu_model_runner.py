@@ -413,8 +413,14 @@ class GPUModelRunner(
         self.pin_memory = is_pin_memory_available()
         self.dtype = self.model_config.dtype
 
+        # Asymmetric K/V: resolve to K dtype for the model runner.
+        # The full (k_dtype, v_dtype) pair is in cache_config and
+        # flows to the FlashInfer backend via AttentionSpec.v_dtype.
+        from vllm.config.cache import cache_dtype_k
+        _cache_spec = cache_config.cache_dtype
+        _k_str = cache_dtype_k(_cache_spec)
         self.kv_cache_dtype = kv_cache_dtype_str_to_dtype(
-            cache_config.cache_dtype, self.model_config
+            _k_str, self.model_config
         )
 
         self.is_pooling_model = model_config.runner_type == "pooling"
@@ -892,7 +898,8 @@ class GPUModelRunner(
           If these are left at 0.0 (default after wake_up), all KV cache values
           become effectively zero, causing gibberish output.
         """
-        if not self.cache_config.cache_dtype.startswith("fp8"):
+        from vllm.utils.torch_utils import cache_dtype_is_fp8
+        if not cache_dtype_is_fp8(self.cache_config.cache_dtype):
             return
 
         kv_caches = getattr(self, "kv_caches", [])
