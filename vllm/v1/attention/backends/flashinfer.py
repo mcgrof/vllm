@@ -602,13 +602,25 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.page_size = self.kv_cache_spec.block_size
 
         self.cache_dtype = self.cache_config.cache_dtype
-        if self.cache_dtype.startswith("fp8"):
-            self.kv_cache_dtype = FlashInferBackend.get_fp8_dtype_for_flashinfer(
-                self.cache_dtype
-            )
-        else:
-            assert self.kv_cache_spec.dtype == self.model_config.dtype
-            self.kv_cache_dtype = self.kv_cache_spec.dtype
+        # Asymmetric K/V: resolve separate K and V dtypes.
+        from vllm.config.cache import (
+            cache_dtype_k, cache_dtype_v, is_asymmetric_kv,
+        )
+        self._is_asymmetric = is_asymmetric_kv(self.cache_dtype)
+        k_dtype_str = cache_dtype_k(self.cache_dtype)
+        v_dtype_str = cache_dtype_v(self.cache_dtype)
+
+        def _resolve_one(dt_str):
+            if isinstance(dt_str, str) and dt_str.startswith("fp8"):
+                return FlashInferBackend.get_fp8_dtype_for_flashinfer(
+                    dt_str)
+            return self.kv_cache_spec.dtype
+
+        self.k_cache_dtype = _resolve_one(k_dtype_str)
+        self.v_cache_dtype = _resolve_one(v_dtype_str)
+        # Backward compat: kv_cache_dtype stays as the K dtype
+        # for downstream code that reads it (e.g., q_data_type logic)
+        self.kv_cache_dtype = self.k_cache_dtype
 
         # Use model dtype as q dtype when TRTLLM attn is not supported, or
         # --attention-config.disable_flashinfer_q_quantization is set to 1. Otherwise,
@@ -1035,7 +1047,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 window_left=self.window_left,
                 logits_soft_cap=self.logits_soft_cap,
                 q_data_type=self.q_data_type,
-                kv_data_type=self.kv_cache_dtype,
+                kv_data_type=self.k_cache_dtype,
+                k_data_type=self.k_cache_dtype,
+                v_data_type=self.v_cache_dtype,
             )
             return attn_metadata
 
@@ -1120,7 +1134,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         window_left=self.window_left,
                         logits_soft_cap=self.logits_soft_cap,
                         q_data_type=self.q_data_type,
-                        kv_data_type=self.kv_cache_dtype,
+                        kv_data_type=self.k_cache_dtype,
+                k_data_type=self.k_cache_dtype,
+                v_data_type=self.v_cache_dtype,
                         o_data_type=self.model_config.dtype,
                         fixed_split_size=self.prefill_fixed_split_size,
                         disable_split_kv=self.disable_split_kv,
@@ -1172,7 +1188,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     window_left=self.window_left,
                     logits_soft_cap=self.logits_soft_cap,
                     q_data_type=self.q_data_type,
-                    kv_data_type=self.kv_cache_dtype,
+                    kv_data_type=self.k_cache_dtype,
+                k_data_type=self.k_cache_dtype,
+                v_data_type=self.v_cache_dtype,
                     o_data_type=self.model_config.dtype,
                     fixed_split_size=self.decode_fixed_split_size,
                     disable_split_kv=self.disable_split_kv,
