@@ -60,11 +60,20 @@ def get_attn_backend(
     """Selects which attention backend to use and lazily imports it."""
 
     if kv_cache_dtype is not None:
-        valid_cache_dtypes = get_args(CacheDType)
-        assert kv_cache_dtype in valid_cache_dtypes, (
-            f"Invalid kv_cache_dtype: {kv_cache_dtype}. "
-            f"Valid values are: {valid_cache_dtypes}"
-        )
+        # Asymmetric K/V: if the spec is a tuple, validate each
+        # element and reduce to the K dtype for selector purposes.
+        if isinstance(kv_cache_dtype, tuple):
+            valid = get_args(CacheDType)
+            for dt in kv_cache_dtype:
+                assert dt in valid, (
+                    f"Invalid dtype in asymmetric spec: {dt}")
+            kv_cache_dtype = kv_cache_dtype[0]  # K dtype
+        else:
+            valid_cache_dtypes = get_args(CacheDType)
+            assert kv_cache_dtype in valid_cache_dtypes, (
+                f"Invalid kv_cache_dtype: {kv_cache_dtype}. "
+                f"Valid values are: {valid_cache_dtypes}"
+            )
 
     from vllm.config import get_current_vllm_config
 
