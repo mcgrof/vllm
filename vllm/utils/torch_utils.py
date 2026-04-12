@@ -371,6 +371,30 @@ def set_random_seed(seed: int | None) -> None:
             torch.cuda.manual_seed_all(seed)
 
 
+def kv_cache_dtype_spec_to_dtypes(
+    spec, model_config,
+) -> tuple:
+    """Convert a CacheDTypeSpec to (k_torch_dtype, v_torch_dtype).
+
+    Symmetric: both dtypes are the same.
+    Asymmetric tuple: each half resolved independently.
+    """
+    if isinstance(spec, tuple):
+        k_dt = kv_cache_dtype_str_to_dtype(spec[0], model_config)
+        v_dt = kv_cache_dtype_str_to_dtype(spec[1], model_config)
+        return (k_dt, v_dt)
+    dt = kv_cache_dtype_str_to_dtype(spec, model_config)
+    return (dt, dt)
+
+
+def cache_dtype_is_fp8(spec) -> bool:
+    """Check if any part of the cache dtype spec is FP8."""
+    if isinstance(spec, tuple):
+        return (spec[0].startswith("fp8")
+                or spec[1].startswith("fp8"))
+    return isinstance(spec, str) and spec.startswith("fp8")
+
+
 def create_kv_caches_with_random_flash(
     num_blocks: int,
     block_size: int,
