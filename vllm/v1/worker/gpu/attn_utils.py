@@ -26,6 +26,18 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
         # Skip modules that don't need KV cache (eg encoder-only attention)
         if spec := attn_module.get_kv_cache_spec(vllm_config):
             kv_cache_spec[layer_name] = spec
+
+    # Asymmetric K/V: inject v_dtype from cache_config
+    v_cache_str = getattr(vllm_config.cache_config, "v_cache_dtype", None)
+    if v_cache_str and v_cache_str.startswith("fp8"):
+        from vllm.v1.attention.backends.flashinfer import FlashInferBackend
+        v_torch_dtype = FlashInferBackend.get_fp8_dtype_for_flashinfer(v_cache_str)
+        for name, spec in kv_cache_spec.items():
+            if isinstance(spec, AttentionSpec) and not getattr(spec, "v_dtype", None):
+                # Frozen dataclass — need to reconstruct
+                import dataclasses
+                kv_cache_spec[name] = dataclasses.replace(spec, v_dtype=v_torch_dtype)
+
     return kv_cache_spec
 
 
