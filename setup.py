@@ -984,7 +984,20 @@ def get_requirements() -> list[str]:
 
 ext_modules = []
 
-if _is_cuda() or _is_hip():
+VLLM_BUILD_PROFILE = os.environ.get("VLLM_BUILD_PROFILE", "")
+
+if VLLM_BUILD_PROFILE == "cartridges_rocm":
+    # Minimal ROCm build profile for CartridgeConnector on AMD GPUs (e.g.
+    # W7900/gfx1100). Builds only the extensions needed to load a
+    # pre-trained cartridge, inject KV via triton_reshape_and_cache_flash,
+    # and serve with the rocm_attn backend.
+    ext_modules.append(CMakeExtension(name="vllm._C"))
+    if _is_hip():
+        ext_modules.append(CMakeExtension(name="vllm._rocm_C"))
+    ext_modules.append(CMakeExtension(name="vllm.cumem_allocator"))
+    ext_modules.append(
+        CMakeExtension(name="vllm.triton_kernels", optional=True))
+elif _is_cuda() or _is_hip():
     ext_modules.append(CMakeExtension(name="vllm._moe_C"))
     ext_modules.append(CMakeExtension(name="vllm.cumem_allocator"))
     # Optional since this doesn't get built (produce an .so file). This is just

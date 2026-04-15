@@ -167,9 +167,16 @@ def rocm_unquantized_gemm_impl(
 
         return gemm_a16w16(x, weight, bias)
 
+    # NOTE: gfx1x (RDNA3, e.g. W7900) requires wave32 dispatch in the C++
+    # skinny_gemm kernels. The installed _rocm_C.so must be built from a
+    # source that includes the wave32 path (WVSPLIT_TILE_CFG with THRDS=32).
+    # If the .so was built without wave32 support, launching with THRDS=64
+    # produces silently-wrong matmul output and the model emits gibberish.
+    # Fall back to torch.nn.functional.linear on gfx1x until a rebuilt .so
+    # is in place. (Workaround ported from vllm-spf.)
     use_skinny = (
         envs.VLLM_ROCM_USE_SKINNY_GEMM
-        and (on_gfx9() or on_gfx1x())
+        and on_gfx9()
         and x.dtype in [torch.float16, torch.bfloat16]
         and k % 8 == 0
     )
