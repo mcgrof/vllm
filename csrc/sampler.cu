@@ -703,7 +703,14 @@ void top_k_per_row_decode(const torch::Tensor& logits, int64_t next_n,
             static_cast<int>(next_n), seqLensIs2D,
             outLogitsAux.data_ptr<float>());
 
+#ifdef USE_ROCM
+    // gfx1100 (W7900) local memory limit is 65536 bytes; the 1024-thread
+    // merge specialization with kNumBins=2048 overflows by ~500 bytes.
+    // Use 512 threads to halve register pressure on RDNA3.
+    constexpr int kNumThreadsPerBlockMerge = 512;
+#else
     constexpr int kNumThreadsPerBlockMerge = 1024;
+#endif
     vllm::topKPerRowDecode<kNumThreadsPerBlockMerge, true, false, true>
         <<<numRows, kNumThreadsPerBlockMerge, topK * sizeof(int32_t), stream>>>(
             outLogitsAux.data_ptr<float>(), seqLens.data_ptr<int>(),
