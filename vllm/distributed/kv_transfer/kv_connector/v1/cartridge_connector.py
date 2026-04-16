@@ -27,18 +27,28 @@ trainable_keys, trainable_values, and optionally frozen_keys /
 frozen_values for the BOS/system prefix that was held fixed during
 Self-Study training.
 
-Every incoming request gets the cartridge KV injected into its first
-N positions, skipping prefill for those tokens. The connector reports
-num_cartridge_tokens as externally computed to the scheduler, which
-allocates blocks and skips prefill accordingly.
+The connector supports two modes:
 
-This base connector loads one cartridge at init and serves it to all
-requests. Multi-cartridge serving (cartridge registry, on-demand
-loading, eviction) is future work; see docs/design/cartridge_connector.md.
+1. Singleton (``cartridge_path`` in extra_config): loads one cartridge
+   at init and serves it to every request. Backward compatible with
+   earlier single-cartridge deployments.
+
+2. Multi-cartridge (``cartridges`` + ``router`` in extra_config): loads
+   a fixed set of cartridges at init and dispatches per request via a
+   ``CartridgeRouter`` (explicit id from request extras, label lookup
+   against a CartridgeRegistry, or a composite chain). Per-request
+   cartridge identity is carried end-to-end through connector
+   metadata to the worker, so two concurrent requests can inject
+   different cartridges into different allocated blocks without
+   cross-contamination.
+
+In both modes the connector reports per-request num_cartridge_tokens
+as externally computed to the scheduler, which allocates blocks and
+skips prefill accordingly.
 """
 import json
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -46,6 +56,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.cartridge_router import (
+    CartridgeRouter,
+    StaticCartridgeRouter,
+    build_router_from_config,
 )
 from vllm.logger import init_logger
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
@@ -252,7 +267,14 @@ def inject_kv_into_paged_cache(
 
 @dataclass
 class CartridgeReqMeta:
-    """Metadata for a single request needing cartridge KV injection."""
+    """Metadata for a single request needing cartridge KV injection.
+
+    Carries the per-request ``cartridge_id`` so the worker can fetch
+    the correct cartridge chunks from the store. Without this, two
+    concurrent requests would all receive the same (singleton)
+    cartridge regardless of how the scheduler resolved them.
+    """
+    cartridge_id: str
     slot_mapping: torch.Tensor
     num_tokens: int
 
@@ -268,16 +290,22 @@ class CartridgeConnectorMetadata(KVConnectorMetadata):
 # ---------------------------------------------------------------------------
 
 class CartridgeConnector(KVConnectorBase_V1):
-    """KV connector that injects a pre-trained cartridge KV cache into
+    """KV connector that injects pre-trained cartridge KV caches into
     vLLM's paged attention system.
 
-    Loads one cartridge at init. Every incoming request gets the
-    cartridge KV injected into its first N positions, where N is the
-    cartridge's token count aligned to block boundaries. The scheduler
-    skips prefill for those N tokens.
+    Supports two configurations:
 
-    This connector always loads the full cartridge. Block-level routing
-    (loading K < N blocks) is handled by a separate routing layer.
+    * **Singleton** (``cartridge_path``): one cartridge, injected into
+      every request. Backward-compatible with earlier deployments.
+
+    * **Multi-cartridge** (``cartridges`` + ``router``): multiple
+      cartridges loaded at init, per-request dispatch via a
+      ``CartridgeRouter``. The chosen ``cartridge_id`` is carried
+      through scheduler-side state into per-request connector
+      metadata, and the worker dispatches to the right cartridge for
+      each request. Two concurrent requests with different cartridge
+      IDs inject into different allocated blocks with no
+      cross-contamination.
     """
 
     def __init__(
@@ -292,35 +320,123 @@ class CartridgeConnector(KVConnectorBase_V1):
             kv_cache_config=kv_cache_config,
         )
         self._block_size = vllm_config.cache_config.block_size
-        self._requests_need_load: dict[str, "Request"] = {}
 
-        # Load cartridge via CartridgeStore
+        # Scheduler-side per-request state: request_id -> cartridge_id
+        # resolved by the router at get_num_new_matched_tokens() time
+        # and consumed by build_connector_meta().
+        self._request_cartridge_ids: dict[str, str] = {}
+        # request_id -> aligned token count for the chosen cartridge.
+        self._request_num_tokens: dict[str, int] = {}
+        # Set of request_ids that have been committed by
+        # update_state_after_alloc(); cleared each tick in
+        # build_connector_meta().
+        self._requests_need_load: set[str] = set()
+
+        self._vllm_config = vllm_config
+        self._load_cartridges_from_config()
+        self._router: CartridgeRouter = self._build_router_from_config()
+
+        logger.info(
+            "CartridgeConnector ready: %d cartridge(s) loaded, "
+            "router=%s",
+            len(self._cartridge_meta),
+            type(self._router).__name__,
+        )
+
+    # ------------------------------------------------------------------
+    # Init helpers: cartridge loading + router construction
+    # ------------------------------------------------------------------
+
+    def _load_cartridges_from_config(self) -> None:
+        """Populate self._store and self._cartridge_meta.
+
+        Accepts either ``cartridge_path`` (singleton) or ``cartridges``
+        (a list of ``{cartridge_id, path, manifest_path?}`` dicts). At
+        least one of the two must be set.
+        """
         from vllm.distributed.kv_transfer.kv_connector.v1.cartridge_store import (
             CartridgeStore,
         )
 
-        cartridge_path = self._kv_transfer_config.get_from_extra_config(
+        singleton_path = self._kv_transfer_config.get_from_extra_config(
             "cartridge_path", None
         )
-        if cartridge_path is None:
+        cartridges_list = self._kv_transfer_config.get_from_extra_config(
+            "cartridges", None
+        )
+        if singleton_path is None and not cartridges_list:
             raise ValueError(
-                "CartridgeConnector requires 'cartridge_path' in "
-                "--kv-connector-extra-config"
+                "CartridgeConnector requires either 'cartridge_path' "
+                "(singleton mode) or 'cartridges' (multi-cartridge "
+                "mode) in --kv-connector-extra-config"
             )
 
-        # Optional manifest path for compatibility validation
-        manifest_path = self._kv_transfer_config.get_from_extra_config(
-            "manifest_path", None
+        self._store = CartridgeStore(block_size=self._block_size)
+        # cartridge_id -> {"num_tokens": int, "num_blocks": int,
+        #                  "num_layers": int}
+        self._cartridge_meta: dict[str, dict] = {}
+        # For singleton/default fallback when the router returns None
+        # but we need a cartridge_id anyway (legacy behaviour).
+        self._default_cartridge_id: Optional[str] = None
+
+        if singleton_path is not None:
+            manifest_path = (
+                self._kv_transfer_config.get_from_extra_config(
+                    "manifest_path", None
+                )
+            )
+            cart_id = self._load_one(
+                cartridge_path=singleton_path,
+                manifest_path=manifest_path,
+                explicit_cartridge_id=None,
+            )
+            self._default_cartridge_id = cart_id
+
+        if cartridges_list:
+            if not isinstance(cartridges_list, list):
+                raise ValueError(
+                    "'cartridges' must be a list of entries")
+            for entry in cartridges_list:
+                if not isinstance(entry, dict):
+                    raise ValueError(
+                        "each 'cartridges' entry must be a dict")
+                path = entry.get("path")
+                if not path:
+                    raise ValueError(
+                        "each 'cartridges' entry requires 'path'")
+                self._load_one(
+                    cartridge_path=path,
+                    manifest_path=entry.get("manifest_path"),
+                    explicit_cartridge_id=entry.get("cartridge_id"),
+                )
+            # First listed cartridge is the default fallback if no
+            # singleton was provided.
+            if self._default_cartridge_id is None:
+                first_entry = cartridges_list[0]
+                self._default_cartridge_id = (
+                    first_entry.get("cartridge_id")
+                    or next(iter(self._cartridge_meta))
+                )
+
+    def _load_one(
+        self,
+        cartridge_path: str,
+        manifest_path: Optional[str],
+        explicit_cartridge_id: Optional[str],
+    ) -> str:
+        """Load a single cartridge, register it in the store, and
+        record its per-cartridge sizing in self._cartridge_meta.
+
+        Returns the cartridge_id that was registered.
+        """
+        from vllm.distributed.kv_transfer.kv_connector.v1.cartridge_manifest import (
+            CartridgeManifest,
         )
 
-        # Build or load manifest
-        manifest = None
+        manifest: Optional[CartridgeManifest] = None
         if manifest_path is not None:
-            from vllm.distributed.kv_transfer.kv_connector.v1.cartridge_manifest import (
-                CartridgeManifest,
-            )
             manifest = CartridgeManifest.from_json(manifest_path)
-            model_cfg = vllm_config.model_config.hf_config
+            model_cfg = self._vllm_config.model_config.hf_config
             num_layers = getattr(model_cfg, "num_hidden_layers", 0)
             num_kv_heads = getattr(
                 model_cfg, "num_key_value_heads",
@@ -331,73 +447,130 @@ class CartridgeConnector(KVConnectorBase_V1):
                 getattr(model_cfg, "hidden_size", 0)
                 // max(getattr(model_cfg, "num_attention_heads", 1), 1),
             )
-
             errors = manifest.validate_against_model(
-                model_id=vllm_config.model_config.model,
+                model_id=self._vllm_config.model_config.model,
                 num_layers=num_layers,
                 num_kv_heads=num_kv_heads,
                 head_dim=head_dim,
             )
-            errors.extend(manifest.validate_against_block_size(
-                self._block_size
-            ))
+            errors.extend(
+                manifest.validate_against_block_size(self._block_size)
+            )
             if errors:
                 raise ValueError(
-                    f"Cartridge manifest validation failed:\n"
+                    "Cartridge manifest validation failed:\n"
                     + "\n".join(f"  - {e}" for e in errors)
                 )
             logger.info("Cartridge manifest validated: %s",
                         manifest.cartridge_id)
+            if (explicit_cartridge_id is not None
+                    and explicit_cartridge_id != manifest.cartridge_id):
+                raise ValueError(
+                    f"cartridge_id mismatch: config says "
+                    f"{explicit_cartridge_id!r} but manifest says "
+                    f"{manifest.cartridge_id!r}"
+                )
 
-        # Create a minimal manifest if none provided (for backward compat)
         if manifest is None:
-            from vllm.distributed.kv_transfer.kv_connector.v1.cartridge_manifest import (
-                CartridgeManifest,
-            )
-            # Inspect the cartridge to build a minimal manifest
             cartridge_data = load_cartridge(cartridge_path)
+            aligned = align_to_block_size(
+                cartridge_data["num_tokens"], self._block_size)
             manifest = CartridgeManifest(
-                cartridge_id="default",
+                cartridge_id=explicit_cartridge_id or "default",
                 model_id="unknown",
                 num_layers=cartridge_data["num_layers"],
                 num_kv_heads=cartridge_data["num_kv_heads"],
                 head_dim=cartridge_data["head_dim"],
                 dtype="unknown",
                 num_tokens_raw=cartridge_data["num_tokens"],
-                num_tokens_aligned=align_to_block_size(
-                    cartridge_data["num_tokens"], self._block_size),
+                num_tokens_aligned=aligned,
                 block_size=self._block_size,
-                num_blocks=align_to_block_size(
-                    cartridge_data["num_tokens"], self._block_size)
-                // self._block_size,
+                num_blocks=aligned // self._block_size,
                 has_frozen_prefix=False,
             )
             del cartridge_data
 
-        # Initialize store and load the cartridge
-        self._store = CartridgeStore(block_size=self._block_size)
-        self._cartridge_id = manifest.cartridge_id
-        self._store.load(
-            self._cartridge_id, cartridge_path, manifest, device="cpu"
-        )
-        self._store.pin(self._cartridge_id)  # prevent accidental eviction
+        cart_id = manifest.cartridge_id
+        if cart_id in self._cartridge_meta:
+            raise ValueError(
+                f"duplicate cartridge_id: {cart_id!r}")
 
-        residency = self._store.get_residency(self._cartridge_id)
-        self._num_cartridge_tokens = residency.num_tokens
-        self._num_cartridge_blocks = (
-            self._num_cartridge_tokens // self._block_size
-        )
-        self._num_layers = residency.num_layers
+        self._store.load(cart_id, cartridge_path, manifest, device="cpu")
+        self._store.pin(cart_id)  # prevent accidental eviction
 
+        residency = self._store.get_residency(cart_id)
+        num_tokens = residency.num_tokens
+        num_blocks = num_tokens // self._block_size
+        self._cartridge_meta[cart_id] = {
+            "num_tokens": num_tokens,
+            "num_blocks": num_blocks,
+            "num_layers": residency.num_layers,
+        }
         logger.info(
-            "Cartridge loaded via store: id=%s, %d layers, "
-            "%d tokens (%d blocks of %d)",
-            self._cartridge_id,
-            self._num_layers,
-            self._num_cartridge_tokens,
-            self._num_cartridge_blocks,
-            self._block_size,
+            "Cartridge loaded: id=%s, %d layers, %d tokens "
+            "(%d blocks of %d)",
+            cart_id, residency.num_layers,
+            num_tokens, num_blocks, self._block_size,
         )
+        return cart_id
+
+    def _build_router_from_config(self) -> CartridgeRouter:
+        """Build the CartridgeRouter from extra_config.
+
+        If no router config is provided and exactly one cartridge is
+        loaded, defaults to StaticCartridgeRouter bound to that id
+        (singleton semantics). Otherwise raises.
+        """
+        router_cfg = self._kv_transfer_config.get_from_extra_config(
+            "router", None
+        )
+        if router_cfg is None:
+            if len(self._cartridge_meta) == 1:
+                only_id = next(iter(self._cartridge_meta))
+                return StaticCartridgeRouter(only_id)
+            raise ValueError(
+                "Multi-cartridge mode requires 'router' in "
+                "--kv-connector-extra-config when more than one "
+                "cartridge is loaded"
+            )
+        if not isinstance(router_cfg, dict):
+            raise ValueError(
+                "'router' must be a dict describing the router "
+                "configuration")
+        return build_router_from_config(
+            router_cfg,
+            registry=None,  # Registry-based routers must be wired
+                           # externally via set_registry() for now.
+            default_cartridge_id=self._default_cartridge_id,
+        )
+
+    # Backwards-compat accessors. Tests and downstream code may still
+    # reference these from singleton-era APIs. They reflect the first
+    # (or only) loaded cartridge.
+    @property
+    def _cartridge_id(self) -> str:
+        return self._default_cartridge_id or next(
+            iter(self._cartridge_meta))
+
+    @property
+    def _num_cartridge_tokens(self) -> int:
+        return self._cartridge_meta[self._cartridge_id]["num_tokens"]
+
+    @property
+    def _num_cartridge_blocks(self) -> int:
+        return self._cartridge_meta[self._cartridge_id]["num_blocks"]
+
+    @property
+    def _num_layers(self) -> int:
+        return self._cartridge_meta[self._cartridge_id]["num_layers"]
+
+    def set_router(self, router: CartridgeRouter) -> None:
+        """Override the router after construction.
+
+        Useful for test injection and for wiring registry-backed
+        routers that need a live CartridgeRegistry handle.
+        """
+        self._router = router
 
     # ==============================
     # Scheduler-side methods
@@ -408,20 +581,41 @@ class CartridgeConnector(KVConnectorBase_V1):
         request: "Request",
         num_computed_tokens: int,
     ) -> tuple[int | None, bool]:
-        """Report cartridge tokens as externally computed.
+        """Resolve the request to a cartridge and report its token
+        count as externally computed.
 
-        Every request gets the cartridge injected. The number of
-        externally-computed tokens is simply the cartridge's aligned
-        token count, capped to the prompt length.
+        The router decides *which* cartridge this request should use
+        (explicit id in extras, label lookup, static fallback). The
+        resolved ``cartridge_id`` is stashed in per-request state so
+        that ``build_connector_meta()`` and ``start_load_kv()`` can
+        dispatch to the correct cartridge without re-resolving.
+
+        If the router returns None (no cartridge for this request),
+        this connector reports zero matched tokens and the request
+        falls through to normal prefill.
         """
         prompt_ids = request.prompt_token_ids
         if prompt_ids is None:
             return 0, False
 
+        cart_id = self._router.resolve(request)
+        if cart_id is None:
+            # Router explicitly declined: no cartridge injection.
+            return 0, False
+        if cart_id not in self._cartridge_meta:
+            logger.warning(
+                "Router resolved request %s to unknown cartridge_id "
+                "%r; falling through to normal prefill",
+                request.request_id, cart_id,
+            )
+            return 0, False
+
+        cart_info = self._cartridge_meta[cart_id]
         # Cap to prompt length so we never claim more positions than
-        # the request has.
+        # the request has. Per-cartridge token count — different
+        # cartridges can have different sizes.
         matched = align_to_block_size(
-            min(self._num_cartridge_tokens, len(prompt_ids)),
+            min(cart_info["num_tokens"], len(prompt_ids)),
             self._block_size,
         )
 
@@ -429,9 +623,16 @@ class CartridgeConnector(KVConnectorBase_V1):
         if num_new <= 0:
             return 0, False
 
+        # Stash the resolved cartridge_id and the *matched* (aligned,
+        # prompt-capped) token count. build_connector_meta() will use
+        # these to build the slot mapping.
+        self._request_cartridge_ids[request.request_id] = cart_id
+        self._request_num_tokens[request.request_id] = matched
+
         logger.info(
-            "Cartridge: %d tokens externally computed "
-            "(%d new beyond %d already computed)",
+            "Cartridge: request %s routed to %s — %d tokens "
+            "externally computed (%d new beyond %d already computed)",
+            request.request_id, cart_id,
             matched, num_new, num_computed_tokens,
         )
         return num_new, False
@@ -442,42 +643,82 @@ class CartridgeConnector(KVConnectorBase_V1):
         blocks: "KVCacheBlocks",
         num_external_tokens: int,
     ):
-        """Record that this request needs KV loading.
+        """Commit a resolved request for loading.
 
-        Idempotent: if called twice for the same request (which vLLM's
-        connector API permits), the second call is a no-op.
+        vLLM's connector API permits the scheduler to call this twice
+        for the same request; the second call is a no-op because our
+        state is keyed by request_id. If the request was resolved but
+        never allocated (e.g. capacity pressure), its entry is cleared
+        in ``build_connector_meta()``.
         """
         if num_external_tokens > 0:
-            self._requests_need_load[request.request_id] = request
+            # Sanity check: get_num_new_matched_tokens should have
+            # populated our state for this request.
+            if (request.request_id
+                    not in self._request_cartridge_ids):
+                logger.warning(
+                    "update_state_after_alloc: no cartridge_id "
+                    "recorded for request %s; skipping",
+                    request.request_id,
+                )
+                return
+            # Mark as committed for this tick's build_connector_meta.
+            self._requests_need_load.add(request.request_id)
 
     def build_connector_meta(
         self,
         scheduler_output: SchedulerOutput,
     ) -> KVConnectorMetadata:
-        """Build metadata with slot mappings for KV injection."""
+        """Build metadata with per-request cartridge_id + slot mappings."""
         meta = CartridgeConnectorMetadata()
 
         for new_req in scheduler_output.scheduled_new_reqs:
-            if new_req.req_id in self._requests_need_load:
-                block_ids = new_req.block_ids[0]
-                cartridge_block_ids = block_ids[:self._num_cartridge_blocks]
-                block_ids_tensor = torch.tensor(
-                    cartridge_block_ids, dtype=torch.long
-                )
-                block_offsets = torch.arange(
-                    0, self._block_size, dtype=torch.long
-                )
-                slot_mapping = (
-                    block_offsets.reshape(1, self._block_size)
-                    + block_ids_tensor.reshape(-1, 1) * self._block_size
-                ).flatten()
+            if new_req.req_id not in self._requests_need_load:
+                continue
 
-                meta.requests.append(CartridgeReqMeta(
-                    slot_mapping=slot_mapping,
-                    num_tokens=self._num_cartridge_tokens,
-                ))
+            cart_id = self._request_cartridge_ids.get(new_req.req_id)
+            num_tokens = self._request_num_tokens.get(new_req.req_id)
+            if cart_id is None or num_tokens is None:
+                logger.warning(
+                    "build_connector_meta: missing resolved state "
+                    "for request %s; skipping", new_req.req_id,
+                )
+                continue
 
+            num_blocks = num_tokens // self._block_size
+            block_ids = new_req.block_ids[0]
+            cartridge_block_ids = block_ids[:num_blocks]
+            block_ids_tensor = torch.tensor(
+                cartridge_block_ids, dtype=torch.long
+            )
+            block_offsets = torch.arange(
+                0, self._block_size, dtype=torch.long
+            )
+            slot_mapping = (
+                block_offsets.reshape(1, self._block_size)
+                + block_ids_tensor.reshape(-1, 1) * self._block_size
+            ).flatten()
+
+            meta.requests.append(CartridgeReqMeta(
+                cartridge_id=cart_id,
+                slot_mapping=slot_mapping,
+                num_tokens=num_tokens,
+            ))
+
+        # Clear tick-local state for consumed AND any stale resolved
+        # requests that never got committed (e.g. deferred by the
+        # scheduler; they'll be re-resolved next tick).
         self._requests_need_load.clear()
+        # Only clear state for requests scheduled this tick — requests
+        # that were resolved but not yet scheduled may still be pending.
+        # In practice resolved+not-scheduled cleans up on reschedule.
+        scheduled_ids = {r.req_id
+                         for r in scheduler_output.scheduled_new_reqs}
+        for req_id in list(self._request_cartridge_ids.keys()):
+            if req_id in scheduled_ids:
+                self._request_cartridge_ids.pop(req_id, None)
+                self._request_num_tokens.pop(req_id, None)
+
         return meta
 
     # ==============================
@@ -487,7 +728,16 @@ class CartridgeConnector(KVConnectorBase_V1):
     def start_load_kv(
         self, forward_context: "ForwardContext", **kwargs: Any
     ) -> None:
-        """Inject cartridge KV into allocated GPU blocks."""
+        """Inject cartridge KV into allocated GPU blocks, dispatching
+        per request to the cartridge chosen by the scheduler-side
+        router.
+
+        Different requests in the same batch may have different
+        ``cartridge_id`` values; each is loaded from the store and
+        written into that request's slot mapping independently. No
+        shared state across requests other than the store and the
+        paged KV cache.
+        """
         from vllm.distributed.kv_transfer.kv_connector.v1.cartridge_store import (
             ChunkKey,
         )
@@ -498,16 +748,28 @@ class CartridgeConnector(KVConnectorBase_V1):
         if not metadata.requests:
             return
 
-        # Acquire a ref on the cartridge for this batch of requests
-        self._store.acquire(self._cartridge_id)
+        # Acquire a ref per unique cartridge used in this batch so
+        # that none of them can be evicted mid-injection.
+        unique_ids = {r.cartridge_id for r in metadata.requests}
+        for cart_id in unique_ids:
+            self._store.acquire(cart_id)
 
         try:
             for request in metadata.requests:
-                slot_mapping = request.slot_mapping.cuda()
+                cart_id = request.cartridge_id
+                num_layers = self._cartridge_meta.get(
+                    cart_id, {}).get("num_layers")
+                if num_layers is None:
+                    logger.error(
+                        "start_load_kv: unknown cartridge_id %r; "
+                        "skipping request", cart_id,
+                    )
+                    continue
 
+                slot_mapping = request.slot_mapping.cuda()
                 logger.info(
-                    "Injecting cartridge KV (%d tokens) into GPU cache",
-                    request.num_tokens,
+                    "Injecting cartridge %s KV (%d tokens) into "
+                    "GPU cache", cart_id, request.num_tokens,
                 )
 
                 for layer_name in forward_context.no_compile_layers:
@@ -519,16 +781,15 @@ class CartridgeConnector(KVConnectorBase_V1):
                     kv_cache_layer = kv_cache_attr[0]
 
                     layer_idx = self._extract_layer_idx(layer_name)
-                    if layer_idx is None or layer_idx >= self._num_layers:
+                    if layer_idx is None or layer_idx >= num_layers:
                         continue
 
-                    # Read chunk from the store
-                    chunk_key = ChunkKey(self._cartridge_id, layer_idx)
+                    chunk_key = ChunkKey(cart_id, layer_idx)
                     src_kv = self._store.get(chunk_key)
                     if src_kv is None:
                         logger.error(
                             "Cartridge chunk missing: %s layer %d",
-                            self._cartridge_id, layer_idx,
+                            cart_id, layer_idx,
                         )
                         continue
 
@@ -544,7 +805,8 @@ class CartridgeConnector(KVConnectorBase_V1):
                         slot_mapping=slot_mapping,
                     )
         finally:
-            self._store.release(self._cartridge_id)
+            for cart_id in unique_ids:
+                self._store.release(cart_id)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """No-op — synchronous load."""
