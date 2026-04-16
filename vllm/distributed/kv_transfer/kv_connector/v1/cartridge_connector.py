@@ -294,7 +294,11 @@ class CartridgeConnector(KVConnectorBase_V1):
         self._block_size = vllm_config.cache_config.block_size
         self._requests_need_load: dict[str, "Request"] = {}
 
-        # Load cartridge
+        # Load cartridge via CartridgeStore
+        from vllm.distributed.kv_transfer.kv_connector.v1.cartridge_store import (
+            CartridgeStore,
+        )
+
         cartridge_path = self._kv_transfer_config.get_from_extra_config(
             "cartridge_path", None
         )
@@ -309,10 +313,8 @@ class CartridgeConnector(KVConnectorBase_V1):
             "manifest_path", None
         )
 
-        logger.info("Loading cartridge from %s", cartridge_path)
-        self._cartridge = load_cartridge(cartridge_path)
-
-        # Validate manifest against the running model if provided
+        # Build or load manifest
+        manifest = None
         if manifest_path is not None:
             from vllm.distributed.kv_transfer.kv_connector.v1.cartridge_manifest import (
                 CartridgeManifest,
@@ -347,38 +349,55 @@ class CartridgeConnector(KVConnectorBase_V1):
             logger.info("Cartridge manifest validated: %s",
                         manifest.cartridge_id)
 
-        # Align to block size
-        raw_tokens = self._cartridge["num_tokens"]
-        self._num_cartridge_tokens = align_to_block_size(
-            raw_tokens, self._block_size
+        # Create a minimal manifest if none provided (for backward compat)
+        if manifest is None:
+            from vllm.distributed.kv_transfer.kv_connector.v1.cartridge_manifest import (
+                CartridgeManifest,
+            )
+            # Inspect the cartridge to build a minimal manifest
+            cartridge_data = load_cartridge(cartridge_path)
+            manifest = CartridgeManifest(
+                cartridge_id="default",
+                model_id="unknown",
+                num_layers=cartridge_data["num_layers"],
+                num_kv_heads=cartridge_data["num_kv_heads"],
+                head_dim=cartridge_data["head_dim"],
+                dtype="unknown",
+                num_tokens_raw=cartridge_data["num_tokens"],
+                num_tokens_aligned=align_to_block_size(
+                    cartridge_data["num_tokens"], self._block_size),
+                block_size=self._block_size,
+                num_blocks=align_to_block_size(
+                    cartridge_data["num_tokens"], self._block_size)
+                // self._block_size,
+                has_frozen_prefix=False,
+            )
+            del cartridge_data
+
+        # Initialize store and load the cartridge
+        self._store = CartridgeStore(block_size=self._block_size)
+        self._cartridge_id = manifest.cartridge_id
+        self._store.load(
+            self._cartridge_id, cartridge_path, manifest, device="cpu"
         )
+        self._store.pin(self._cartridge_id)  # prevent accidental eviction
+
+        residency = self._store.get_residency(self._cartridge_id)
+        self._num_cartridge_tokens = residency.num_tokens
         self._num_cartridge_blocks = (
             self._num_cartridge_tokens // self._block_size
         )
+        self._num_layers = residency.num_layers
 
         logger.info(
-            "Cartridge loaded: %d layers, %d tokens (%d blocks of %d), "
-            "%d kv_heads, %d head_dim",
-            self._cartridge["num_layers"],
+            "Cartridge loaded via store: id=%s, %d layers, "
+            "%d tokens (%d blocks of %d)",
+            self._cartridge_id,
+            self._num_layers,
             self._num_cartridge_tokens,
             self._num_cartridge_blocks,
             self._block_size,
-            self._cartridge["num_kv_heads"],
-            self._cartridge["head_dim"],
         )
-
-        # Pre-stack KV data for efficient injection.
-        # Shape per layer: (2, num_tokens, num_heads, head_dim)
-        self._kv_stacked = []
-        for layer_idx in range(self._cartridge["num_layers"]):
-            k, v = self._cartridge["kv_data"][layer_idx]
-            k = k[:self._num_cartridge_tokens]
-            v = v[:self._num_cartridge_tokens]
-            stacked = torch.stack([k, v], dim=0)
-            self._kv_stacked.append(stacked)
-
-        # Free original kv_data to save memory
-        del self._cartridge["kv_data"]
 
     # ==============================
     # Scheduler-side methods
@@ -469,43 +488,63 @@ class CartridgeConnector(KVConnectorBase_V1):
         self, forward_context: "ForwardContext", **kwargs: Any
     ) -> None:
         """Inject cartridge KV into allocated GPU blocks."""
+        from vllm.distributed.kv_transfer.kv_connector.v1.cartridge_store import (
+            ChunkKey,
+        )
+
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, CartridgeConnectorMetadata)
 
         if not metadata.requests:
             return
 
-        for request in metadata.requests:
-            slot_mapping = request.slot_mapping.cuda()
+        # Acquire a ref on the cartridge for this batch of requests
+        self._store.acquire(self._cartridge_id)
 
-            logger.info(
-                "Injecting cartridge KV (%d tokens) into GPU cache",
-                request.num_tokens,
-            )
+        try:
+            for request in metadata.requests:
+                slot_mapping = request.slot_mapping.cuda()
 
-            for layer_name in forward_context.no_compile_layers:
-                layer = forward_context.no_compile_layers[layer_name]
-                kv_cache_attr = getattr(layer, "kv_cache", None)
-                if kv_cache_attr is None:
-                    continue
-
-                kv_cache_layer = kv_cache_attr[0]
-
-                layer_idx = self._extract_layer_idx(layer_name)
-                if layer_idx is None or layer_idx >= len(self._kv_stacked):
-                    continue
-
-                src_kv = self._kv_stacked[layer_idx].to(
-                    device=kv_cache_layer.device,
-                    dtype=kv_cache_layer.dtype,
+                logger.info(
+                    "Injecting cartridge KV (%d tokens) into GPU cache",
+                    request.num_tokens,
                 )
 
-                inject_kv_into_paged_cache(
-                    src_key=src_kv[0],
-                    src_value=src_kv[1],
-                    kv_cache_layer=kv_cache_layer,
-                    slot_mapping=slot_mapping,
-                )
+                for layer_name in forward_context.no_compile_layers:
+                    layer = forward_context.no_compile_layers[layer_name]
+                    kv_cache_attr = getattr(layer, "kv_cache", None)
+                    if kv_cache_attr is None:
+                        continue
+
+                    kv_cache_layer = kv_cache_attr[0]
+
+                    layer_idx = self._extract_layer_idx(layer_name)
+                    if layer_idx is None or layer_idx >= self._num_layers:
+                        continue
+
+                    # Read chunk from the store
+                    chunk_key = ChunkKey(self._cartridge_id, layer_idx)
+                    src_kv = self._store.get(chunk_key)
+                    if src_kv is None:
+                        logger.error(
+                            "Cartridge chunk missing: %s layer %d",
+                            self._cartridge_id, layer_idx,
+                        )
+                        continue
+
+                    src_kv = src_kv.to(
+                        device=kv_cache_layer.device,
+                        dtype=kv_cache_layer.dtype,
+                    )
+
+                    inject_kv_into_paged_cache(
+                        src_key=src_kv[0],
+                        src_value=src_kv[1],
+                        kv_cache_layer=kv_cache_layer,
+                        slot_mapping=slot_mapping,
+                    )
+        finally:
+            self._store.release(self._cartridge_id)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """No-op — synchronous load."""
