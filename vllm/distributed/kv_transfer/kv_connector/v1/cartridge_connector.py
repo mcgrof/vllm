@@ -289,8 +289,48 @@ class CartridgeConnector(KVConnectorBase_V1):
                 "--kv-connector-extra-config"
             )
 
+        # Optional manifest path for compatibility validation
+        manifest_path = self._kv_transfer_config.get_from_extra_config(
+            "manifest_path", None
+        )
+
         logger.info("Loading cartridge from %s", cartridge_path)
         self._cartridge = load_cartridge(cartridge_path)
+
+        # Validate manifest against the running model if provided
+        if manifest_path is not None:
+            from vllm.distributed.kv_transfer.kv_connector.v1.cartridge_manifest import (
+                CartridgeManifest,
+            )
+            manifest = CartridgeManifest.from_json(manifest_path)
+            model_cfg = vllm_config.model_config.hf_config
+            num_layers = getattr(model_cfg, "num_hidden_layers", 0)
+            num_kv_heads = getattr(
+                model_cfg, "num_key_value_heads",
+                getattr(model_cfg, "num_attention_heads", 0),
+            )
+            head_dim = getattr(
+                model_cfg, "head_dim",
+                getattr(model_cfg, "hidden_size", 0)
+                // max(getattr(model_cfg, "num_attention_heads", 1), 1),
+            )
+
+            errors = manifest.validate_against_model(
+                model_id=vllm_config.model_config.model,
+                num_layers=num_layers,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+            )
+            errors.extend(manifest.validate_against_block_size(
+                self._block_size
+            ))
+            if errors:
+                raise ValueError(
+                    f"Cartridge manifest validation failed:\n"
+                    + "\n".join(f"  - {e}" for e in errors)
+                )
+            logger.info("Cartridge manifest validated: %s",
+                        manifest.cartridge_id)
 
         # Align to block size
         raw_tokens = self._cartridge["num_tokens"]
