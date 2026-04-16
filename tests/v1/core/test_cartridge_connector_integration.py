@@ -72,33 +72,50 @@ def _make_connector(cartridge_path, block_size=16):
 
 
 def _make_patched_init(vllm_config, cartridge_path, block_size):
-    """Build a patched __init__ that skips the base class."""
+    """Build a patched __init__ that skips the base class.
+
+    Uses CartridgeStore internally, matching the real connector.
+    """
     def patched_init(self, vllm_config_arg, role, kv_cache_config=None):
+        from vllm.distributed.kv_transfer.kv_connector.v1.cartridge_store import (
+            CartridgeStore,
+        )
+        from vllm.distributed.kv_transfer.kv_connector.v1.cartridge_manifest import (
+            CartridgeManifest,
+        )
+
         self._block_size = block_size
         self._requests_need_load = {}
-
-        # Replicate the real init logic without base class
         self._kv_transfer_config = vllm_config.kv_transfer_config
-        cartridge = load_cartridge(cartridge_path)
 
-        raw_tokens = cartridge["num_tokens"]
-        self._num_cartridge_tokens = align_to_block_size(
-            raw_tokens, self._block_size
+        cartridge = load_cartridge(cartridge_path)
+        manifest = CartridgeManifest(
+            cartridge_id="test",
+            model_id="test/model",
+            num_layers=cartridge["num_layers"],
+            num_kv_heads=cartridge["num_kv_heads"],
+            head_dim=cartridge["head_dim"],
+            dtype="float32",
+            num_tokens_raw=cartridge["num_tokens"],
+            num_tokens_aligned=align_to_block_size(
+                cartridge["num_tokens"], block_size),
+            block_size=block_size,
+            num_blocks=align_to_block_size(
+                cartridge["num_tokens"], block_size) // block_size,
+            has_frozen_prefix=False,
         )
+        del cartridge
+
+        self._store = CartridgeStore(block_size=block_size)
+        self._cartridge_id = "test"
+        self._store.load("test", cartridge_path, manifest, device="cpu")
+
+        residency = self._store.get_residency("test")
+        self._num_cartridge_tokens = residency.num_tokens
         self._num_cartridge_blocks = (
             self._num_cartridge_tokens // self._block_size
         )
-
-        self._kv_stacked = []
-        for layer_idx in range(cartridge["num_layers"]):
-            k, v = cartridge["kv_data"][layer_idx]
-            k = k[:self._num_cartridge_tokens]
-            v = v[:self._num_cartridge_tokens]
-            self._kv_stacked.append(torch.stack([k, v], dim=0))
-
-        self._cartridge = {
-            k: v for k, v in cartridge.items() if k != "kv_data"
-        }
+        self._num_layers = residency.num_layers
     return patched_init
 
 
