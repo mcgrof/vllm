@@ -36,13 +36,14 @@ CacheDTypeSpec = Union[CacheDType, tuple[CacheDType, CacheDType]]
 def parse_cache_dtype_spec(raw: str) -> CacheDTypeSpec:
     """Parse a cache dtype spec from a CLI string.
 
-    Accepts either a single token ("fp8_e4m3") or a comma-separated
+    Accepts either a single token ("fp8_e4m3") or a comma-separated or pipe-separated
     pair ("float16,fp8_e4m3"). Returns either a CacheDType string
     or a (k_dtype, v_dtype) tuple.
     """
-    if "," in raw:
-        parts = [p.strip() for p in raw.split(",", 1)]
-        return (parts[0], parts[1])  # type: ignore[return-value]
+    for sep in (",", "|"):
+        if sep in raw:
+            parts = [p.strip() for p in raw.split(sep, 1)]
+            return (parts[0], parts[1])  # type: ignore[return-value]
     return raw  # type: ignore[return-value]
 
 
@@ -93,7 +94,7 @@ class CacheConfig:
     Some models (namely DeepSeekV3.2) default to fp8, set to bfloat16 to use
     bfloat16 instead, this is an invalid option for models that do not default
     to fp8.
-    For asymmetric K/V, pass a comma-separated pair via CLI:
+    For asymmetric K/V, pass a comma-separated or pipe-separated pair via CLI:
     --kv-cache-dtype float16,fp8_e4m3 (FP16 keys, FP8 values).
     """
     is_attention_free: bool = False
