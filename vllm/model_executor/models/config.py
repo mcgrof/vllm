@@ -139,10 +139,20 @@ class HybridAttentionMambaModelConfig(VerifyAndUpdateConfig):
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
 
-        if cache_config.cache_dtype == "auto":
+        # Asymmetric (K_dtype, V_dtype) tuple from the
+        # asymmetric-kv-plumbing branch: linear-attention layers in
+        # hybrid Mamba-style models don't carry a true KV cache the
+        # same way as full-attention layers do; fall back to the K
+        # dtype (typically FP16) for them.  The full-attention
+        # layers retain the asymmetric treatment via the standard
+        # attention path's calc_kv_scales / bmm2_scale gating.
+        ct = cache_config.cache_dtype
+        if isinstance(ct, tuple):
+            ct = ct[0]
+        if ct == "auto":
             kv_cache_dtype = model_config.dtype
         else:
-            kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
+            kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[ct]
 
         # get attention page size (for 1 token)
         # Attention backend constraints:
