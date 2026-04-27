@@ -138,8 +138,15 @@ def _reshape_kv_cache(
             assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
             num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
 
-            # Asymmetric K/V: split the raw int8 tensor into
-            # separate K and V tensors with different dtypes.
+            # Asymmetric K/V: split the raw int8 tensor into separate
+            # K and V tensors with different dtypes.  Both must be
+            # views into `raw_tensor`'s storage — no copies — so the
+            # block manager's occupancy bookkeeping against the raw
+            # tensor stays consistent with what the kernel reads.
+            #
+            # The earlier implementation used `.contiguous()` on
+            # non-contiguous slices, which silently allocated fresh
+            # storage and broke that invariant.
             if (kv_cache_spec.v_dtype is not None
                     and kv_cache_spec.v_dtype != kv_cache_spec.dtype):
                 k_dtype = kv_cache_spec.dtype
@@ -147,17 +154,34 @@ def _reshape_kv_cache(
                 bs = kv_cache_spec.block_size
                 nh = kv_cache_spec.num_kv_heads
                 hd = kv_cache_spec.head_size
-                k_page_bytes = bs * nh * hd * get_dtype_size(k_dtype)
-                v_page_bytes = bs * nh * hd * get_dtype_size(v_dtype)
+                k_elem = get_dtype_size(k_dtype)
+                v_elem = get_dtype_size(v_dtype)
+                k_page_bytes = bs * nh * hd * k_elem
+                v_page_bytes = bs * nh * hd * v_elem
                 page_bytes = k_page_bytes + v_page_bytes
-                # Split raw bytes into K and V per page
-                raw_pages = raw_tensor.view(num_blocks, page_bytes)
-                k_raw = raw_pages[:, :k_page_bytes].contiguous()
-                v_raw = raw_pages[:, k_page_bytes:].contiguous()
-                k_cache = k_raw.view(k_dtype).view(
-                    num_blocks, bs, nh, hd)
-                v_cache = v_raw.view(v_dtype).view(
-                    num_blocks, bs, nh, hd)
+                assert raw_tensor.numel() == num_blocks * page_bytes
+                # Reinterpret the raw int8 storage as the typed
+                # dtypes.  K-half starts at offset 0 in each page;
+                # V-half starts `k_page_bytes` after that.  Stride
+                # along the block dim is the full page size measured
+                # in *elements* of each typed view.
+                k_typed = raw_tensor.view(k_dtype)
+                v_typed = raw_tensor.view(v_dtype)
+                k_page_stride = page_bytes // k_elem
+                v_page_stride = page_bytes // v_elem
+                v_offset_elems = k_page_bytes // v_elem
+                k_cache = torch.as_strided(
+                    k_typed,
+                    size=(num_blocks, bs, nh, hd),
+                    stride=(k_page_stride, nh * hd, hd, 1),
+                    storage_offset=0,
+                )
+                v_cache = torch.as_strided(
+                    v_typed,
+                    size=(num_blocks, bs, nh, hd),
+                    stride=(v_page_stride, nh * hd, hd, 1),
+                    storage_offset=v_offset_elems,
+                )
                 # Store as tuple — FlashInfer backend handles this
                 kv_caches[layer_name] = (k_cache, v_cache)
                 continue
