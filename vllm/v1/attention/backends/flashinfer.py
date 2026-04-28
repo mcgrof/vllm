@@ -1406,6 +1406,17 @@ class FlashInferImpl(AttentionImpl):
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # FI-asym Path B telemetry: confirm the attention READ path is
+        # FlashInfer (vs FlashAttn that handled the writer).
+        try:
+            _kvt = type(kv_cache).__name__
+            logger.info_once(
+                "ASYM_FORWARD impl=%s kv_cache_type=%s kv_cache_dtype=%r",
+                type(self).__qualname__, _kvt, self.kv_cache_dtype,
+                scope="local",
+            )
+        except Exception:
+            pass
         """Forward pass with FlashInfer.
 
         Args:

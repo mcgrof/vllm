@@ -360,9 +360,14 @@ class Attention(nn.Module, AttentionLayerBase):
 
         # for attn backends supporting query quantization
         self.query_quant = None
-        if self.impl.supports_quant_query_input and self.kv_cache_dtype.startswith(
-            "fp8"
-        ):
+        # Asymmetric K/V: kv_cache_dtype may be a tuple
+        # ("auto", "fp8_e4m3").  Use cache_dtype_k to extract the K
+        # dtype string for the fp8 prefix check.
+        from vllm.config.cache import cache_dtype_k as _cdk
+        _k_str = _cdk(self.kv_cache_dtype)
+        if self.impl.supports_quant_query_input and isinstance(
+            _k_str, str
+        ) and _k_str.startswith("fp8"):
             is_per_head = (
                 hasattr(self, "q_scale") and self.q_scale.numel() == self.num_kv_heads
             )
@@ -726,6 +731,26 @@ def unified_kv_cache_update(
         assert hasattr(attn_layer.impl, "do_kv_cache_update"), (
             f"{attn_layer.impl.__class__.__name__} does not support kv cache update"
         )
+        # FI-asym Path B telemetry: tell which impl handles the cache
+        # write and what shape the kv_cache has.  This settles whether
+        # vLLM is dispatching the writer to FlashAttn even when the
+        # read-side backend is FlashInfer.
+        from vllm.logger import init_logger as _init_logger
+        _diag_logger = _init_logger("asym.kv_diag")
+        try:
+            _kv_type = type(kv_cache).__name__
+            _kvd = getattr(attn_layer.impl, "kv_cache_dtype", None)
+            _diag_logger.info(
+                "ASYM_KV_UPDATE layer=%s impl=%s.%s kv_cache_type=%s "
+                "kv_cache_dtype=%r",
+                layer_name,
+                type(attn_layer.impl).__module__,
+                type(attn_layer.impl).__qualname__,
+                _kv_type,
+                _kvd,
+            )
+        except Exception:
+            pass
         attn_layer.impl.do_kv_cache_update(
             attn_layer,
             key,
