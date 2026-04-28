@@ -40,7 +40,12 @@ from vllm.config import (
     get_current_vllm_config_or_none,
     get_layers_from_vllm_config,
 )
-from vllm.config.cache import CacheDType
+from vllm.config.cache import (
+    CacheDType,
+    cache_dtype_k as _cdk,
+    cache_dtype_v as _cdv,
+    is_asymmetric_kv as _is_asym_kv,
+)
 from vllm.distributed.parallel_state import get_dcp_group
 from vllm.logger import init_logger
 from vllm.platforms.interface import DeviceCapability
@@ -579,7 +584,18 @@ class FlashAttentionImpl(AttentionImpl):
             self.sliding_window = (sliding_window - 1, sliding_window - 1)
         else:
             self.sliding_window = (sliding_window - 1, 0)
+        # Asymmetric K/V: kv_cache_dtype may be a tuple ("auto", "fp8_e4m3").
+        # Cache the side-specific dtype strings for the writer path.
+        # The full spec is preserved on self.kv_cache_dtype so existing
+        # legacy code paths see the original value (the FI-asym tree
+        # already tolerates this on most sites).
         self.kv_cache_dtype = kv_cache_dtype
+        if _is_asym_kv(kv_cache_dtype):
+            self._k_cache_dtype_str = _cdk(kv_cache_dtype)
+            self._v_cache_dtype_str = _cdv(kv_cache_dtype)
+        else:
+            self._k_cache_dtype_str = kv_cache_dtype
+            self._v_cache_dtype_str = kv_cache_dtype
         if logits_soft_cap is None:
             # In flash-attn, setting logits_soft_cap as 0 means no soft cap.
             logits_soft_cap = 0
@@ -601,7 +617,11 @@ class FlashAttentionImpl(AttentionImpl):
         # Cache the batch invariant result for use in forward passes
         self.batch_invariant_enabled = envs.VLLM_BATCH_INVARIANT
 
-        if is_quantized_kv_cache(self.kv_cache_dtype) and not flash_attn_supports_fp8():
+        # Asymmetric: check the V dtype side for FP8 support; K side is native.
+        _quant_check_dtype = self._v_cache_dtype_str if _is_asym_kv(
+            self.kv_cache_dtype
+        ) else self.kv_cache_dtype
+        if is_quantized_kv_cache(_quant_check_dtype) and not flash_attn_supports_fp8():
             raise NotImplementedError(
                 "FlashAttention does not support fp8 kv-cache on this device."
             )
@@ -696,7 +716,11 @@ class FlashAttentionImpl(AttentionImpl):
         # For decoder and cross-attention, use KV cache as before
         key_cache, value_cache = kv_cache.unbind(0)
 
-        if self.kv_cache_dtype.startswith("fp8"):
+        # Asymmetric: V side determines FP8 path on the writer.
+        _kvd_str = self._v_cache_dtype_str if _is_asym_kv(
+            self.kv_cache_dtype
+        ) else self.kv_cache_dtype
+        if isinstance(_kvd_str, str) and _kvd_str.startswith("fp8"):
             # queries are quantized in the attention layer
             dtype = FlashAttentionBackend.get_fp8_dtype_for_flashattn(
                 self.kv_cache_dtype
@@ -804,6 +828,58 @@ class FlashAttentionImpl(AttentionImpl):
             # For encoder attention,
             # we use direct Q, K, V tensors without caching
             return
+
+        # FI-asym Path A: handle tuple kv_cache for asymmetric K16/V8.
+        # vLLM v1's unified_kv_cache_update path may dispatch to this
+        # FlashAttentionImpl method even when the read-side backend is
+        # FlashInfer (writer is shared).  When the cache is a (k_cache,
+        # v_cache) tuple the dtypes can differ, so we issue two
+        # reshape_and_cache_flash calls with the appropriate per-side
+        # dtype string -- never the tuple, never V dtype for K.
+        if isinstance(kv_cache, tuple):
+            assert _is_asym_kv(self.kv_cache_dtype), (
+                "tuple kv_cache requires asymmetric kv_cache_dtype; got "
+                f"{self.kv_cache_dtype!r}"
+            )
+            k_cache, v_cache = kv_cache
+            assert k_cache.ndim == 4, (
+                f"asym k_cache must be 4-D; got shape {tuple(k_cache.shape)}"
+            )
+            assert v_cache.ndim == 4, (
+                f"asym v_cache must be 4-D; got shape {tuple(v_cache.shape)}"
+            )
+            k_dtype = self._k_cache_dtype_str or "auto"
+            v_dtype = self._v_cache_dtype_str
+            assert v_dtype is not None, (
+                "asymmetric KV tuple requires a V cache dtype string"
+            )
+            logger.info(
+                "ASYM_KV_WRITE flash_attn impl=%s k_dtype=%s v_dtype=%s "
+                "k_shape=%s v_shape=%s",
+                type(self).__qualname__, k_dtype, v_dtype,
+                tuple(k_cache.shape), tuple(v_cache.shape),
+            )
+            # K stays native: no quantization.  Pass the same tensor as
+            # both key_cache and value_cache so the kernel's idempotent
+            # double-write writes K to k_cache only.
+            torch.ops._C_cache_ops.reshape_and_cache_flash(
+                key, key, k_cache, k_cache, slot_mapping,
+                k_dtype, layer._k_scale, layer._k_scale,
+            )
+            # V is quantized at v_dtype.
+            torch.ops._C_cache_ops.reshape_and_cache_flash(
+                value, value, v_cache, v_cache, slot_mapping,
+                v_dtype, layer._k_scale, layer._v_scale,
+            )
+            return
+
+        # Fail-closed: asym dtype with non-tuple cache should never happen
+        # and would silently quantize K through the symmetric writer below.
+        if _is_asym_kv(self.kv_cache_dtype):
+            raise RuntimeError(
+                "asymmetric kv_cache_dtype requires tuple(k_cache, v_cache); "
+                f"got non-tuple kv_cache type={type(kv_cache).__name__}"
+            )
 
         key_cache, value_cache = kv_cache.unbind(0)
 
@@ -938,7 +1014,11 @@ class FlashAttentionImpl(AttentionImpl):
         )
 
         # For encoder attention, process FP8 quantization if needed
-        if self.kv_cache_dtype.startswith("fp8"):
+        # Asymmetric: V side determines FP8 path on the writer.
+        _kvd_str = self._v_cache_dtype_str if _is_asym_kv(
+            self.kv_cache_dtype
+        ) else self.kv_cache_dtype
+        if isinstance(_kvd_str, str) and _kvd_str.startswith("fp8"):
             raise NotImplementedError(
                 "quantization is not supported for encoder attention"
             )
