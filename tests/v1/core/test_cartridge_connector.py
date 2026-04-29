@@ -192,7 +192,7 @@ class TestLoadCartridgeErrors:
 def _fake_inject_kv(src_key, src_value, kv_cache_layer, slot_mapping):
     """CPU-only fake for inject_kv_into_paged_cache.
 
-    Instead of calling triton_reshape_and_cache_flash, directly writes
+    Instead of calling ops.reshape_and_cache_flash, directly writes
     KV into flat cache slots. This tests that the slot mapping puts the
     right tokens in the right positions.
     """
