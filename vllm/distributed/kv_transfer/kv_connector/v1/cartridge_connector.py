@@ -714,10 +714,13 @@ class CartridgeConnector(KVConnectorBase_V1):
 
         cart_info = self._cartridge_meta[cart_id]
         # Cap to prompt length so we never claim more positions than
-        # the request has. Per-cartridge token count — different
-        # cartridges can have different sizes.
+        # the request has.  Also ensure at least one token remains for
+        # the scheduler to process (it asserts num_new_tokens > 0).
+        max_claim = len(prompt_ids) - 1
+        if max_claim <= 0:
+            return 0, False
         matched = align_to_block_size(
-            min(cart_info["num_tokens"], len(prompt_ids)),
+            min(cart_info["num_tokens"], max_claim),
             self._block_size,
         )
 
