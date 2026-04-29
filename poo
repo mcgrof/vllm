@@ -1,0 +1,33 @@
+commit fc3537d458d577f4e05dc74e612131c542a8f43e
+Author: Luis Chamberlain <mcgrof@do-not-panic.com>
+Date:   Thu Apr 16 09:21:22 2026 -0700
+
+    [Connector] Add 8xH100 validation handoff document
+    
+    Targets an 8xH100 node at a partner. Documents what's in the branch,
+    what needs to be written for Phase 3, and known limitations. Gives
+    a clear execution plan with tiered node-hour estimates and success
+    criteria.
+    
+    Audits all 115 unit tests plus 4 phase harnesses as ready-to-run.
+    Identifies specific code gaps: TP smoke test, benchmark data
+    loaders (Musique, HotPotQA), training scripts, eval harnesses,
+    and cross-GPU residency manager for the production pressure test.
+    
+    Flags known limitations: RoPE position bug in routing layer (out
+    of scope for this branch), single-cartridge-per-instance startup,
+    LMCache plugin is read-only by design, no GPU residency manager.
+    
+    Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+    Signed-off-by: Luis Chamberlain <mcgrof@do-not-panic.com>
+
+diff --git a/tools/cartridge_phase2_perf.py b/tools/cartridge_phase2_perf.py
+index 39dd30b08..d798ccf89 100644
+--- a/tools/cartridge_phase2_perf.py
++++ b/tools/cartridge_phase2_perf.py
+@@ -1,4 +1,5 @@
+ #!/usr/bin/env python3
++# SPDX-License-Identifier: Apache-2.0
+ """Phase 2: TTFT performance benchmark at scale.
+ 
+ Phase 0 measured TTFT on 3 patients x 1 query each. This was enough

@@ -74,7 +74,9 @@ def _make_connector(cartridge_path, block_size=16):
 def _make_patched_init(vllm_config, cartridge_path, block_size):
     """Build a patched __init__ that skips the base class.
 
-    Uses CartridgeStore internally, matching the real connector.
+    Matches the current multi-cartridge-aware CartridgeConnector
+    state shape (``_cartridge_meta`` dict, ``_request_cartridge_ids``,
+    ``_requests_need_load`` as a set of committed request_ids).
     """
     def patched_init(self, vllm_config_arg, role, kv_cache_config=None):
         from vllm.distributed.kv_transfer.kv_connector.v1.cartridge_store import (
@@ -83,10 +85,16 @@ def _make_patched_init(vllm_config, cartridge_path, block_size):
         from vllm.distributed.kv_transfer.kv_connector.v1.cartridge_manifest import (
             CartridgeManifest,
         )
+        from vllm.distributed.kv_transfer.kv_connector.v1.cartridge_router import (
+            StaticCartridgeRouter,
+        )
 
         self._block_size = block_size
-        self._requests_need_load = {}
+        self._request_cartridge_ids = {}
+        self._request_num_tokens = {}
+        self._requests_need_load = set()
         self._kv_transfer_config = vllm_config.kv_transfer_config
+        self._vllm_config = vllm_config
 
         cartridge = load_cartridge(cartridge_path)
         manifest = CartridgeManifest(
@@ -107,23 +115,35 @@ def _make_patched_init(vllm_config, cartridge_path, block_size):
         del cartridge
 
         self._store = CartridgeStore(block_size=block_size)
-        self._cartridge_id = "test"
         self._store.load("test", cartridge_path, manifest, device="cpu")
-
         residency = self._store.get_residency("test")
-        self._num_cartridge_tokens = residency.num_tokens
-        self._num_cartridge_blocks = (
-            self._num_cartridge_tokens // self._block_size
-        )
-        self._num_layers = residency.num_layers
+
+        self._cartridge_meta = {
+            "test": {
+                "num_tokens": residency.num_tokens,
+                "num_blocks": (residency.num_tokens
+                               // block_size),
+                "num_layers": residency.num_layers,
+            }
+        }
+        self._default_cartridge_id = "test"
+        # Integration tests target the singleton dispatch path.
+        self._router = StaticCartridgeRouter("test")
+
     return patched_init
 
 
 def _make_mock_request(request_id, prompt_len):
-    """Create a mock Request with prompt_token_ids."""
+    """Create a mock Request with prompt_token_ids + extras.
+
+    The mock carries ``sampling_params.extra_args`` so the router can
+    resolve a cartridge_id. Tests that exercise StaticCartridgeRouter
+    don't actually need this, but explicit routing tests do.
+    """
     req = MagicMock()
     req.request_id = request_id
     req.prompt_token_ids = list(range(prompt_len))
+    req.sampling_params.extra_args = {"cartridge_id": "test"}
     return req
 
 
@@ -188,14 +208,21 @@ class TestUpdateStateAfterAlloc:
     def teardown_method(self):
         Path(self._tmpfile.name).unlink()
 
+    def _prime_resolved(self, req_id: str):
+        """Simulate get_num_new_matched_tokens having resolved this id."""
+        self.connector._request_cartridge_ids[req_id] = "test"
+        self.connector._request_num_tokens[req_id] = 32
+
     def test_records_request(self):
         req = _make_mock_request("r1", 64)
+        self._prime_resolved("r1")
         self.connector.update_state_after_alloc(req, MagicMock(), 32)
         assert "r1" in self.connector._requests_need_load
 
     def test_idempotent_double_call(self):
         """vLLM's API may call this twice for the same request."""
         req = _make_mock_request("r1", 64)
+        self._prime_resolved("r1")
         self.connector.update_state_after_alloc(req, MagicMock(), 32)
         self.connector.update_state_after_alloc(req, MagicMock(), 32)
         # Should still have exactly one entry, not break
@@ -204,6 +231,7 @@ class TestUpdateStateAfterAlloc:
 
     def test_zero_external_tokens_not_recorded(self):
         req = _make_mock_request("r1", 64)
+        self._prime_resolved("r1")
         self.connector.update_state_after_alloc(req, MagicMock(), 0)
         assert "r1" not in self.connector._requests_need_load
 
@@ -222,9 +250,21 @@ class TestBuildConnectorMeta:
     def teardown_method(self):
         Path(self._tmpfile.name).unlink()
 
+    def _commit(self, req_id: str, num_tokens: int = 32,
+                cartridge_id: str = "test"):
+        """Simulate get_num_new_matched_tokens → update_state_after_alloc.
+
+        Pre-populates the per-request dicts that build_connector_meta
+        consumes. This is what the real scheduler→connector flow would
+        produce; the tests below exercise build_connector_meta in
+        isolation.
+        """
+        self.connector._request_cartridge_ids[req_id] = cartridge_id
+        self.connector._request_num_tokens[req_id] = num_tokens
+        self.connector._requests_need_load.add(req_id)
+
     def test_single_request_slot_mapping(self):
-        req = _make_mock_request("r1", 64)
-        self.connector._requests_need_load["r1"] = req
+        self._commit("r1")
 
         # Mock scheduler output
         sched_out = MagicMock()
@@ -237,6 +277,7 @@ class TestBuildConnectorMeta:
 
         assert isinstance(meta, CartridgeConnectorMetadata)
         assert len(meta.requests) == 1
+        assert meta.requests[0].cartridge_id == "test"
         assert meta.requests[0].num_tokens == 32
 
         # Slot mapping should cover blocks 0,1 (cartridge needs 2 blocks)
@@ -248,8 +289,7 @@ class TestBuildConnectorMeta:
         assert sm[31].item() == 31  # block 1, offset 15
 
     def test_clears_requests_after_build(self):
-        req = _make_mock_request("r1", 64)
-        self.connector._requests_need_load["r1"] = req
+        self._commit("r1")
 
         sched_out = MagicMock()
         new_req = MagicMock()
@@ -259,6 +299,9 @@ class TestBuildConnectorMeta:
 
         self.connector.build_connector_meta(sched_out)
         assert len(self.connector._requests_need_load) == 0
+        # Per-request resolution state for scheduled reqs is cleared too.
+        assert "r1" not in self.connector._request_cartridge_ids
+        assert "r1" not in self.connector._request_num_tokens
 
     def test_unrelated_request_ignored(self):
         """Requests not in _requests_need_load produce no metadata."""
@@ -273,8 +316,7 @@ class TestBuildConnectorMeta:
 
     def test_non_contiguous_block_ids(self):
         """Slot mapping works when scheduler allocates non-contiguous blocks."""
-        req = _make_mock_request("r1", 64)
-        self.connector._requests_need_load["r1"] = req
+        self._commit("r1")
 
         sched_out = MagicMock()
         new_req = MagicMock()
