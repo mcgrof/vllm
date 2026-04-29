@@ -74,7 +74,7 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-    from vllm.v1.kv_cache_interface import KVCacheConfig
+    pass  # KVCacheConfig not needed on this fork point
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -313,13 +313,14 @@ class CartridgeConnector(KVConnectorBase_V1):
         self,
         vllm_config: "VllmConfig",
         role: KVConnectorRole,
-        kv_cache_config: "KVCacheConfig | None" = None,
     ):
         super().__init__(
             vllm_config=vllm_config,
             role=role,
-            kv_cache_config=kv_cache_config,
         )
+        # The base class on this fork point does not store
+        # _kv_transfer_config; set it ourselves for get_from_extra_config.
+        self._kv_transfer_config = vllm_config.kv_transfer_config
         self._block_size = vllm_config.cache_config.block_size
 
         # Scheduler-side per-request state: request_id -> cartridge_id
