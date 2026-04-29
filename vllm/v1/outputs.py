@@ -48,14 +48,21 @@ class LogprobsTensors(NamedTuple):
     @staticmethod
     def empty_cpu(num_positions: int,
                   num_tokens_per_position: int) -> "LogprobsTensors":
-        """Create empty LogprobsTensors on CPU."""
+        """Create zero-initialized LogprobsTensors on CPU.
 
-        logprob_token_ids = torch.empty(
+        Uses zeros instead of uninitialized memory so that positions
+        that are never filled (e.g. externally-computed KV connector
+        tokens) have valid token IDs and sentinel logprobs rather than
+        garbage values that crash the tokenizer.
+        """
+
+        logprob_token_ids = torch.zeros(
             (num_positions, num_tokens_per_position),
             dtype=torch.int32,
             device="cpu")
-        logprobs = torch.empty_like(logprob_token_ids, dtype=torch.float32)
-        selected_token_ranks = torch.empty(num_positions,
+        logprobs = torch.full_like(logprob_token_ids, float("-inf"),
+                                   dtype=torch.float32)
+        selected_token_ranks = torch.zeros(num_positions,
                                            dtype=torch.int32,
                                            device="cpu")
         return LogprobsTensors(
