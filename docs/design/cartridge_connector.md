@@ -193,21 +193,24 @@ seen by ref counting. Tests exercise this end-to-end without a GPU.
   Production architecture below).
 - KV injection is synchronous at prefill time.
 
-## Production architecture (future work)
+## Production architecture
 
-The in-tree connector covers four of the five production components.
-Remaining work is the GPU residency manager:
+All five components are in tree:
 
-1. **CartridgeManifest** — in tree.
-2. **CartridgeRegistry** — in tree (SQLite index, label lookup).
-3. **CartridgeStore** — in tree (chunked, ref-counted, thread-safe).
-4. **RoutedCartridgeConnector** — in tree as the multi-cartridge
-   mode of this connector (Explicit / Label / Composite routers).
-5. **GPUResidencyManager** — not yet. Cartridges are currently
-   pinned in CPU memory at init. A GPU-resident tier with LRU/LFU
-   eviction under memory pressure is the next piece, and will plug
-   in as an LMCache backend via the existing
-   `CartridgeLMCachePlugin`.
+1. **CartridgeManifest** — per-cartridge metadata + manifest
+   validation.
+2. **CartridgeRegistry** — SQLite index, label lookup.
+3. **CartridgeStore** — chunked, ref-counted, thread-safe CPU/disk
+   source of truth.
+4. **RoutedCartridgeConnector** — multi-cartridge mode of this
+   connector (Explicit / Label / Composite routers; per-request
+   cartridge_id through metadata).
+5. **GPUResidencyManager** — bounded GPU tier with LRU eviction
+   and refcount pinning. See `docs/design/cartridge_gpu_residency.md`
+   for the lifecycle, ownership boundaries, metrics, and tests.
+   Hot cartridges stay GPU-resident; cold cartridges evict under
+   pressure; no unconditional per-request PCIe copy on the hot
+   path.
 
 ## LMCache integration
 

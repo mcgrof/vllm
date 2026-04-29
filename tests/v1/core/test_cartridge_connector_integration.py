@@ -129,6 +129,18 @@ def _make_patched_init(vllm_config, cartridge_path, block_size):
         self._default_cartridge_id = "test"
         # Integration tests target the singleton dispatch path.
         self._router = StaticCartridgeRouter("test")
+        # Wire a minimal GPUResidencyManager — these tests focus on
+        # the scheduler-side plumbing, not the GPU tier. Capacity is
+        # huge so eviction never kicks in; device is CPU for
+        # host-only testing.
+        from vllm.distributed.kv_transfer.kv_connector.v1.cartridge_gpu_residency import (
+            GPUResidencyManager,
+        )
+        self._residency = GPUResidencyManager(
+            store=self._store,
+            capacity_bytes=1 << 40,  # 1 TiB (effectively unbounded)
+            device="cpu",
+        )
 
     return patched_init
 
