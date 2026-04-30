@@ -322,6 +322,11 @@ class CartridgeConnector(KVConnectorBase_V1):
         # _kv_transfer_config; set it ourselves for get_from_extra_config.
         self._kv_transfer_config = vllm_config.kv_transfer_config
         self._block_size = vllm_config.cache_config.block_size
+        self._tp_size = vllm_config.parallel_config.tensor_parallel_size
+        # tp_rank is resolved lazily on the worker side (not available
+        # at scheduler-side init). Set to 0 as default; overridden in
+        # start_load_kv when the distributed runtime is initialized.
+        self._tp_rank = 0
 
         # Scheduler-side per-request state: request_id -> cartridge_id
         # resolved by the router at get_num_new_matched_tokens() time
@@ -849,6 +854,17 @@ class CartridgeConnector(KVConnectorBase_V1):
         if not metadata.requests:
             return
 
+        # Resolve TP rank on the worker side (distributed runtime is
+        # initialized by the time start_load_kv is called).
+        if self._tp_size > 1 and self._tp_rank == 0:
+            try:
+                from vllm.distributed.parallel_state import (
+                    get_tensor_model_parallel_rank,
+                )
+                self._tp_rank = get_tensor_model_parallel_rank()
+            except Exception:
+                pass  # fallback to rank 0
+
         # Determine target device/dtype from the first real paged-cache
         # layer in the forward context. Cartridges are promoted to the
         # GPU tier at that (device, dtype) once per cartridge per
@@ -967,9 +983,22 @@ class CartridgeConnector(KVConnectorBase_V1):
             if src_kv is None:
                 continue
 
+            src_key, src_value = src_kv[0], src_kv[1]
+
+            # TP sharding: cartridge stores full KV with all heads.
+            # At TP>1, each rank's paged cache has only its share
+            # of KV heads. Slice to this rank's head range.
+            if self._tp_size > 1:
+                n_heads = src_key.shape[-2]  # (T, H, D) or (H, T, D)
+                heads_per_rank = n_heads // self._tp_size
+                h_start = self._tp_rank * heads_per_rank
+                h_end = h_start + heads_per_rank
+                src_key = src_key[..., h_start:h_end, :]
+                src_value = src_value[..., h_start:h_end, :]
+
             inject_kv_into_paged_cache(
-                src_key=src_kv[0],
-                src_value=src_kv[1],
+                src_key=src_key,
+                src_value=src_value,
                 kv_cache_layer=kv_cache_layer,
                 slot_mapping=slot_mapping,
             )
