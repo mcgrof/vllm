@@ -7,10 +7,10 @@ This module provides a simple storage layer for cartridge KV data.
 It loads cartridge checkpoints from disk, splits them into per-layer
 chunks, and serves them to the CartridgeConnector on demand.
 
-In a full LMCache-integrated deployment, CartridgeStore would
-implement LMCache's StoragePluginInterface and participate in the
-multi-tier cache hierarchy. For now, it operates standalone as a
-simple dict-backed store with explicit load/evict operations.
+CartridgeStore operates standalone as a dict-backed store with
+explicit load/evict operations. CartridgeLMCachePlugin (in
+cartridge_lmcache_plugin.py) exposes the same store to LMCache's
+multi-tier cache hierarchy through LMCache's StoragePluginInterface.
 
 Design:
   - Read-only: cartridges are baked offline, never written at serve time.
@@ -21,8 +21,6 @@ Design:
     active cartridges.
 
 Future:
-  - Implement LMCache StoragePluginInterface for multi-tier caching
-    (GPU -> CPU -> disk) with automatic eviction and prefetch.
   - Add CacheGen compression for disk bandwidth optimization.
 """
 
