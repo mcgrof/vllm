@@ -289,13 +289,29 @@ The plugin targets the `StoragePluginInterface` extension point
 still imports cleanly — a stub `StoragePluginInterface` base class
 lets unit tests run without LMCache as a dependency.
 
+## Production architecture
+
+All five components are in tree:
+
+1. **CartridgeManifest** — per-cartridge metadata + manifest
+   validation.
+2. **CartridgeRegistry** — SQLite index, label lookup.
+3. **CartridgeStore** — chunked, ref-counted, thread-safe CPU/disk
+   source of truth.
+4. **CartridgeRouter** — multi-cartridge mode of this connector
+   (Explicit / Label / Composite routers; per-request cartridge_id
+   through metadata).
+5. **GPUResidencyManager** — bounded GPU tier with LRU eviction
+   and refcount pinning. See `docs/design/cartridge_gpu_residency.md`
+   for the lifecycle, ownership boundaries, metrics, and tests.
+   Hot cartridges stay GPU-resident; cold cartridges evict under
+   pressure; no unconditional per-request PCIe copy on the hot
+   path.
+
 ## Current limitations
 
 - Cartridges are loaded synchronously at connector init. On-demand
   lazy loading driven by the registry is future work.
-- GPU residency management (bounded GPU tier, eviction) is future
-  work; cartridge chunks are moved to the paged cache's device at
-  injection time.
 - Block-level routing (loading K < N blocks per cartridge for memory
   savings) is out of scope for this connector.
 - KV injection is synchronous at prefill time.

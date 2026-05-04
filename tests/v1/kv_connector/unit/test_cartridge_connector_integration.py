@@ -58,7 +58,13 @@ def _make_connector(cartridge_path, block_size=16):
     vllm_config.cache_config.block_size = block_size
     vllm_config.parallel_config.tensor_parallel_size = 1
 
-    extra_config = {"cartridge_path": cartridge_path}
+    extra_config = {
+        "cartridge_path": cartridge_path,
+        # Keep the GPU-residency defaults deterministic in tests:
+        # unbounded capacity, CPU tier (no GPU required).
+        "gpu_capacity_bytes": 1 << 40,
+        "gpu_residency_device": "cpu",
+    }
 
     def get_from_extra_config(key, default=None):
         return extra_config.get(key, default)
