@@ -57,6 +57,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorRole,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.cartridge_gpu_residency import (
+    GPUResidencyManager,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.cartridge_router import (
     CartridgeRouter,
     StaticCartridgeRouter,
@@ -316,10 +319,13 @@ class CartridgeConnector(KVConnectorBase_V1):
             role=role,
         )
         # The base class on this fork point does not store
-        # _kv_transfer_config; set it ourselves.
+        # _kv_transfer_config; set it ourselves for get_from_extra_config.
         self._kv_transfer_config = vllm_config.kv_transfer_config
         self._block_size = vllm_config.cache_config.block_size
         self._tp_size = vllm_config.parallel_config.tensor_parallel_size
+        # tp_rank is resolved lazily on the worker side (not available
+        # at scheduler-side init). Set to 0 as default; overridden in
+        # start_load_kv when the distributed runtime is initialized.
         self._tp_rank = 0
 
         # Scheduler-side per-request state: request_id -> cartridge_id
@@ -336,12 +342,15 @@ class CartridgeConnector(KVConnectorBase_V1):
         self._vllm_config = vllm_config
         self._load_cartridges_from_config()
         self._router: CartridgeRouter = self._build_router_from_config()
+        self._residency: GPUResidencyManager = self._build_residency()
+        self._preload_cartridges_if_configured()
 
         logger.info(
-            "CartridgeConnector ready: %d cartridge(s) loaded, "
-            "router=%s",
+            "CartridgeConnector ready: %d cartridge(s) registered, "
+            "router=%s, gpu_residency=%s",
             len(self._cartridge_meta),
             type(self._router).__name__,
+            self._residency is not None,
         )
 
     # ------------------------------------------------------------------
@@ -497,7 +506,10 @@ class CartridgeConnector(KVConnectorBase_V1):
                 f"duplicate cartridge_id: {cart_id!r}")
 
         self._store.load(cart_id, cartridge_path, manifest, device="cpu")
-        self._store.pin(cart_id)  # prevent accidental eviction
+        # Intentionally NOT calling store.pin() here. GPU residency
+        # is owned by GPUResidencyManager; the CPU store holds the
+        # cartridge for the lifetime of the connector, but the GPU
+        # tier is bounded/LRU/refcounted by the residency manager.
 
         residency = self._store.get_residency(cart_id)
         num_tokens = residency.num_tokens
@@ -514,6 +526,100 @@ class CartridgeConnector(KVConnectorBase_V1):
             num_tokens, num_blocks, self._block_size,
         )
         return cart_id
+
+    def _build_residency(self) -> GPUResidencyManager:
+        """Build the GPU residency manager.
+
+        Reads ``gpu_capacity_bytes`` from extra_config. Defaults to
+        a conservative value sized to hold ~8 cartridges of the
+        largest loaded size, which keeps memory pressure
+        unsurprising on the first deployment. Operators who want
+        different policy pass an explicit capacity.
+
+        Device defaults to ``cuda`` when CUDA is available, else
+        ``cpu`` (the tests exercise the CPU path explicitly).
+        """
+        explicit = self._kv_transfer_config.get_from_extra_config(
+            "gpu_capacity_bytes", None
+        )
+        if explicit is not None:
+            capacity = int(explicit)
+        else:
+            # Default: 8 × largest-loaded-cartridge bytes, or 1 GiB,
+            # whichever is larger. Callers should set explicitly in
+            # production.
+            max_cart_bytes = 0
+            for cart_id in self._cartridge_meta:
+                res = self._store.get_residency(cart_id)
+                if res is None:
+                    continue
+                # Approximate bytes: layers × (2 K+V) × tokens × heads ×
+                # dim × 2 (bfloat16). We don't yet know the dtype at
+                # connector-init time, use 4 bytes to be conservative.
+                model_cfg = self._vllm_config.model_config.hf_config
+                heads = getattr(
+                    model_cfg, "num_key_value_heads",
+                    getattr(model_cfg, "num_attention_heads", 1),
+                )
+                dim = getattr(
+                    model_cfg, "head_dim",
+                    getattr(model_cfg, "hidden_size", 0)
+                    // max(getattr(model_cfg, "num_attention_heads", 1), 1),
+                )
+                bytes_est = (
+                    res.num_layers * 2 * res.num_tokens
+                    * heads * dim * 4
+                )
+                max_cart_bytes = max(max_cart_bytes, bytes_est)
+            capacity = max(8 * max_cart_bytes, 1 << 30)
+
+        device = self._kv_transfer_config.get_from_extra_config(
+            "gpu_residency_device", None
+        )
+        if device is None:
+            try:
+                import torch as _torch  # noqa: F401 (reuse outer import)
+                device = ("cuda" if torch.cuda.is_available()
+                          else "cpu")
+            except Exception:
+                device = "cpu"
+
+        return GPUResidencyManager(
+            store=self._store,
+            capacity_bytes=capacity,
+            device=device,
+            eviction_policy="lru",
+        )
+
+    def _preload_cartridges_if_configured(self) -> None:
+        """Optional eager preload for controlled experiments.
+
+        ``preload`` in extra_config is a list of cartridge_ids to
+        promote to the GPU tier at init (without pinning). This is
+        useful for benchmarks where the first-request latency would
+        skew results, but defaults to empty — production paths
+        lazily promote on first use, which is the whole point of
+        having a residency manager.
+        """
+        preload = self._kv_transfer_config.get_from_extra_config(
+            "preload", None
+        )
+        if not preload:
+            return
+        if not isinstance(preload, list):
+            raise ValueError(
+                "'preload' must be a list of cartridge_ids")
+        for cart_id in preload:
+            if cart_id not in self._cartridge_meta:
+                logger.warning(
+                    "preload: cartridge %s not registered, skipping",
+                    cart_id,
+                )
+                continue
+            ok = self._residency.prefetch(str(cart_id))
+            logger.info(
+                "preload: cartridge=%s resident=%s", cart_id, ok,
+            )
 
     def _build_router_from_config(self) -> CartridgeRouter:
         """Build the CartridgeRouter from extra_config.
@@ -613,8 +719,11 @@ class CartridgeConnector(KVConnectorBase_V1):
 
         cart_info = self._cartridge_meta[cart_id]
         # Cap to prompt length so we never claim more positions than
-        # the request has. Per-cartridge token count — different
-        # cartridges can have different sizes.
+        # the request has.  Also ensure at least one token remains for
+        # the scheduler to process (it asserts num_new_tokens > 0).
+        max_claim = len(prompt_ids) - 1
+        if max_claim <= 0:
+            return 0, False
         matched = align_to_block_size(
             min(cart_info["num_tokens"], max_claim),
             self._block_size,
@@ -739,25 +848,53 @@ class CartridgeConnector(KVConnectorBase_V1):
         shared state across requests other than the store and the
         paged KV cache.
         """
-        from vllm.distributed.kv_transfer.kv_connector.v1.cartridge_store import (
-            ChunkKey,
-        )
-
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, CartridgeConnectorMetadata)
 
         if not metadata.requests:
             return
 
-        # Acquire a ref per unique cartridge used in this batch so
-        # that none of them can be evicted mid-injection.
+        # Resolve TP rank on the worker side (distributed runtime is
+        # initialized by the time start_load_kv is called).
+        if self._tp_size > 1 and self._tp_rank == 0:
+            try:
+                from vllm.distributed.parallel_state import (
+                    get_tensor_model_parallel_rank,
+                )
+                self._tp_rank = get_tensor_model_parallel_rank()
+            except Exception:
+                pass  # fallback to rank 0
+
+        # Determine target device/dtype from the first real paged-cache
+        # layer in the forward context. Cartridges are promoted to the
+        # GPU tier at that (device, dtype) once per cartridge per
+        # promotion; from then on all requests for that cartridge hit
+        # the tier without re-converting.
+        target_device, target_dtype = self._peek_target_device_dtype(
+            forward_context)
+
+        # Acquire GPU residency per unique cartridge — this is the
+        # pin. Promotion happens here on first use; subsequent
+        # requests for the same cartridge are GPU hits.
         unique_ids = {r.cartridge_id for r in metadata.requests}
+        acquired_ids: list[str] = []
         for cart_id in unique_ids:
-            self._store.acquire(cart_id)
+            try:
+                self._residency.acquire(cart_id, dtype=target_dtype)
+                acquired_ids.append(cart_id)
+            except Exception as e:
+                logger.error(
+                    "start_load_kv: cannot acquire cartridge %r "
+                    "on GPU tier: %s", cart_id, e,
+                )
+                # Continue — releasing what we already acquired in
+                # the finally block; request will fall through.
 
         try:
             for request in metadata.requests:
                 cart_id = request.cartridge_id
+                if cart_id not in acquired_ids:
+                    continue
                 num_layers = self._cartridge_meta.get(
                     cart_id, {}).get("num_layers")
                 if num_layers is None:
@@ -767,47 +904,123 @@ class CartridgeConnector(KVConnectorBase_V1):
                     )
                     continue
 
-                slot_mapping = request.slot_mapping.cuda()
-                logger.info(
-                    "Injecting cartridge %s KV (%d tokens) into "
-                    "GPU cache", cart_id, request.num_tokens,
+                self._inject_request(
+                    request=request,
+                    num_layers=num_layers,
+                    forward_context=forward_context,
+                    target_device=target_device,
                 )
-
-                for layer_name in forward_context.no_compile_layers:
-                    layer = forward_context.no_compile_layers[layer_name]
-                    kv_cache_attr = getattr(layer, "kv_cache", None)
-                    if kv_cache_attr is None:
-                        continue
-
-                    kv_cache_layer = kv_cache_attr[0]
-
-                    layer_idx = self._extract_layer_idx(layer_name)
-                    if layer_idx is None or layer_idx >= num_layers:
-                        continue
-
-                    chunk_key = ChunkKey(cart_id, layer_idx)
-                    src_kv = self._store.get(chunk_key)
-                    if src_kv is None:
-                        logger.error(
-                            "Cartridge chunk missing: %s layer %d",
-                            cart_id, layer_idx,
-                        )
-                        continue
-
-                    src_kv = src_kv.to(
-                        device=kv_cache_layer.device,
-                        dtype=kv_cache_layer.dtype,
-                    )
-
-                    inject_kv_into_paged_cache(
-                        src_key=src_kv[0],
-                        src_value=src_kv[1],
-                        kv_cache_layer=kv_cache_layer,
-                        slot_mapping=slot_mapping,
-                    )
         finally:
-            for cart_id in unique_ids:
-                self._store.release(cart_id)
+            for cart_id in acquired_ids:
+                self._residency.release(cart_id)
+
+    # ------------------------------------------------------------------
+    # Injection helpers (separated so the fetch tier can evolve
+    # without touching the slot-mapping/write path)
+    # ------------------------------------------------------------------
+
+    def _peek_target_device_dtype(
+        self, forward_context: "ForwardContext",
+    ) -> tuple[Any, Any]:
+        """Infer the paged-cache device + dtype from the first layer
+        in the forward context.
+
+        Returns ``(device, dtype)``; both may be None if no layer
+        has a populated ``kv_cache``. The residency manager tolerates
+        ``dtype=None`` (means "keep store dtype").
+        """
+        for layer_name in forward_context.no_compile_layers:
+            layer = forward_context.no_compile_layers[layer_name]
+            kv_cache_attr = getattr(layer, "kv_cache", None)
+            if kv_cache_attr is None:
+                continue
+            kv = kv_cache_attr[0]
+            return kv.device, kv.dtype
+        return None, None
+
+    def _inject_request(
+        self,
+        request: CartridgeReqMeta,
+        num_layers: int,
+        forward_context: "ForwardContext",
+        target_device: Any,
+    ) -> None:
+        """Write all layers of one request's cartridge into the
+        paged cache at the request's slot mapping.
+
+        Source tensors come from the residency manager (GPU-resident
+        after acquire). This function only moves the slot mapping to
+        device and calls the injection kernel; it does not do any
+        CPU->GPU tensor copy on the hot path.
+        """
+        cart_id = request.cartridge_id
+        # Slot mapping needs to be on the same device as the paged
+        # cache. The tensor is small (int64, length ~= num_tokens),
+        # so this copy is cheap and unrelated to the cartridge bulk.
+        slot_mapping = request.slot_mapping
+        if target_device is not None:
+            slot_mapping = slot_mapping.to(target_device)
+        else:
+            slot_mapping = slot_mapping.cuda()
+
+        logger.info(
+            "Injecting cartridge %s KV (%d tokens) into GPU cache",
+            cart_id, request.num_tokens,
+        )
+
+        for layer_name in forward_context.no_compile_layers:
+            layer = forward_context.no_compile_layers[layer_name]
+            kv_cache_attr = getattr(layer, "kv_cache", None)
+            if kv_cache_attr is None:
+                continue
+
+            kv_cache_layer = kv_cache_attr[0]
+            layer_idx = self._extract_layer_idx(layer_name)
+            if layer_idx is None or layer_idx >= num_layers:
+                continue
+
+            src_kv = self._fetch_source_kv(cart_id, layer_idx)
+            if src_kv is None:
+                continue
+
+            src_key, src_value = src_kv[0], src_kv[1]
+
+            # TP sharding: cartridge stores full KV with all heads.
+            # At TP>1, each rank's paged cache has only its share
+            # of KV heads. Slice to this rank's head range.
+            if self._tp_size > 1:
+                n_heads = src_key.shape[-2]  # (T, H, D) or (H, T, D)
+                heads_per_rank = n_heads // self._tp_size
+                h_start = self._tp_rank * heads_per_rank
+                h_end = h_start + heads_per_rank
+                src_key = src_key[..., h_start:h_end, :]
+                src_value = src_value[..., h_start:h_end, :]
+
+            inject_kv_into_paged_cache(
+                src_key=src_key,
+                src_value=src_value,
+                kv_cache_layer=kv_cache_layer,
+                slot_mapping=slot_mapping,
+            )
+
+    def _fetch_source_kv(
+        self, cartridge_id: str, layer_idx: int,
+    ) -> "torch.Tensor | None":
+        """Return the device-correct (K,V) stacked tensor for one
+        layer.
+
+        Delegates to the residency manager. No CPU->GPU copy on the
+        hot path: promotion happened at acquire() time and every
+        subsequent call is a cached GPU-side tensor lookup.
+        """
+        try:
+            return self._residency.get_chunk(cartridge_id, layer_idx)
+        except Exception as e:
+            logger.error(
+                "fetch_source_kv: %s layer %d missing: %s",
+                cartridge_id, layer_idx, e,
+            )
+            return None
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """No-op — synchronous load."""
