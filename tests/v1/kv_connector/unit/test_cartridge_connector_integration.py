@@ -71,10 +71,13 @@ def _make_connector(cartridge_path, block_size=16):
 
 
 def _make_mock_request(request_id, prompt_len):
-    """Create a mock Request with prompt_token_ids."""
+    """Create a mock Request with prompt_token_ids and empty extras
+    (so no MagicMock leaks into the router's extras handling)."""
     req = MagicMock()
     req.request_id = request_id
     req.prompt_token_ids = list(range(prompt_len))
+    req.kv_transfer_params = None
+    req.sampling_params.extra_args = {}
     return req
 
 
@@ -145,14 +148,21 @@ class TestUpdateStateAfterAlloc:
     def teardown_method(self):
         Path(self._tmppath).unlink()
 
+    def _prime_resolved(self, req_id: str):
+        """Simulate get_num_new_matched_tokens having resolved this id."""
+        self.connector._request_cartridge_ids[req_id] = "default"
+        self.connector._request_num_tokens[req_id] = 32
+
     def test_records_request(self):
         req = _make_mock_request("r1", 64)
+        self._prime_resolved("r1")
         self.connector.update_state_after_alloc(req, MagicMock(), 32)
         assert "r1" in self.connector._requests_need_load
 
     def test_idempotent_double_call(self):
         """vLLM's API may call this twice for the same request."""
         req = _make_mock_request("r1", 64)
+        self._prime_resolved("r1")
         self.connector.update_state_after_alloc(req, MagicMock(), 32)
         self.connector.update_state_after_alloc(req, MagicMock(), 32)
         # Should still have exactly one entry, not break
@@ -161,8 +171,16 @@ class TestUpdateStateAfterAlloc:
 
     def test_zero_external_tokens_not_recorded(self):
         req = _make_mock_request("r1", 64)
+        self._prime_resolved("r1")
         self.connector.update_state_after_alloc(req, MagicMock(), 0)
         assert "r1" not in self.connector._requests_need_load
+
+    def test_unresolved_request_not_recorded(self):
+        """A request that was never resolved by the router must not
+        be committed for loading."""
+        req = _make_mock_request("r_unresolved", 64)
+        self.connector.update_state_after_alloc(req, MagicMock(), 32)
+        assert "r_unresolved" not in self.connector._requests_need_load
 
 
 # ---------------------------------------------------------------------------
@@ -182,9 +200,16 @@ class TestBuildConnectorMeta:
     def teardown_method(self):
         Path(self._tmppath).unlink()
 
-    def _commit(self, req_id: str):
-        """Simulate update_state_after_alloc having committed req_id."""
-        self.connector._requests_need_load[req_id] = _make_mock_request(req_id, 64)
+    def _commit(self, req_id: str, num_tokens: int = 32, cartridge_id: str = "default"):
+        """Simulate get_num_new_matched_tokens + update_state_after_alloc.
+
+        Pre-populates the per-request state that build_connector_meta
+        consumes; this is what the real scheduler-to-connector flow
+        would produce.
+        """
+        self.connector._request_cartridge_ids[req_id] = cartridge_id
+        self.connector._request_num_tokens[req_id] = num_tokens
+        self.connector._requests_need_load.add(req_id)
 
     def test_single_request_slot_mapping(self):
         self._commit("r1")
@@ -200,6 +225,7 @@ class TestBuildConnectorMeta:
 
         assert isinstance(meta, CartridgeConnectorMetadata)
         assert len(meta.requests) == 1
+        assert meta.requests[0].cartridge_id == "default"
         assert meta.requests[0].num_tokens == 32
 
         # Slot mapping should cover blocks 0,1 (cartridge needs 2 blocks)
@@ -221,6 +247,9 @@ class TestBuildConnectorMeta:
 
         self.connector.build_connector_meta(sched_out)
         assert len(self.connector._requests_need_load) == 0
+        # Per-request resolution state for scheduled reqs is cleared too.
+        assert "r1" not in self.connector._request_cartridge_ids
+        assert "r1" not in self.connector._request_num_tokens
 
     def test_unrelated_request_ignored(self):
         """Requests not in _requests_need_load produce no metadata."""
