@@ -14,10 +14,12 @@ Covers:
 4. Shape corruption: wrong head_dim mid-layer, NaN/Inf values.
 5. Manifest checksum mismatch: file changed after manifest creation.
 6. Empty cartridge: zero tokens.
+7. Registry fault: lookup after close / missing DB file.
 """
 
 import os
 import pickle
+import sqlite3
 import tempfile
 import zipfile
 from pathlib import Path
@@ -31,6 +33,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.cartridge_connector import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.cartridge_manifest import (
     CartridgeManifest,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.cartridge_registry import (
+    CartridgeRegistry,
 )
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
@@ -311,3 +316,57 @@ class TestEmptyCartridge:
         except (IndexError, ValueError):
             pass  # also acceptable
         Path(path).unlink()
+
+
+# ---------------------------------------------------------------------------
+# Tests: registry faults
+# ---------------------------------------------------------------------------
+
+
+class TestRegistryFaults:
+    def test_lookup_after_close(self):
+        """Accessing a closed registry should raise."""
+        fd, db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        reg = CartridgeRegistry(db_path)
+        reg.close()
+        with pytest.raises(sqlite3.ProgrammingError):
+            reg.lookup("anything")
+        Path(db_path).unlink()
+
+    def test_missing_db_file_creates_new(self):
+        """Opening a non-existent DB path should create a new database."""
+        db_path = str(Path(tempfile.mkdtemp()) / "registry.db")
+        reg = CartridgeRegistry(db_path)
+        assert reg.count() == 0
+        reg.close()
+        Path(db_path).unlink()
+
+    def test_register_then_delete_db_and_reopen(self):
+        """Deleting the DB file and reopening should give empty registry."""
+        fd, db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        reg = CartridgeRegistry(db_path)
+        m = CartridgeManifest(
+            cartridge_id="cart_01",
+            model_id="test",
+            num_layers=2,
+            num_kv_heads=2,
+            head_dim=8,
+            dtype="bfloat16",
+            num_tokens_raw=32,
+            num_tokens_aligned=32,
+            block_size=16,
+            num_blocks=2,
+            has_frozen_prefix=False,
+        )
+        reg.register(m)
+        assert reg.count() == 1
+        reg.close()
+
+        # Delete and reopen
+        Path(db_path).unlink()
+        reg2 = CartridgeRegistry(db_path)
+        assert reg2.count() == 0
+        reg2.close()
+        Path(db_path).unlink()

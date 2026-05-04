@@ -101,12 +101,25 @@ split among the layouts observed across backends:
 
 The fallback is only correct for flat-layout backends.
 
+## Storage components
+
+- **CartridgeStore** — read-only KV chunk store with acquire/release
+  ref counting. Loads cartridge layers on demand, caches them keyed
+  by `ChunkKey(cartridge_id, layer_idx)`, and tracks per-cartridge
+  residency metadata. The connector holds a ref for the duration of
+  each batch injection so a cartridge cannot be evicted mid-write.
+
+- **CartridgeRegistry** — SQLite-backed index mapping cartridge IDs
+  to manifest paths, labels, and metadata. Supports insert, lookup
+  by ID or label, and listing. The registry is the durable catalog
+  for multi-cartridge deployments; the store is the in-memory data
+  plane.
+
 ## Current limitations
 
 - One cartridge per server: the connector loads a single cartridge at
   init and injects it into every request. Multi-cartridge serving
-  (registry, per-request routing, GPU residency management) is future
-  work.
+  (per-request routing, GPU residency management) is future work.
 - Block-level routing (loading K < N blocks per cartridge for memory
   savings) is out of scope for this connector.
 - KV injection is synchronous at prefill time.
