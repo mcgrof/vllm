@@ -115,11 +115,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.device = device
         self.dtype = self.model_config.dtype
         self.kv_cache_dtype = self.dtype
-        if self.cache_config.cache_dtype != "auto":
-            # Quantized KV cache.
-            self.kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[
-                self.cache_config.cache_dtype
-            ]
+        # Asymmetric K/V: cache_dtype is a (k_dtype, v_dtype) tuple
+        # when the user passed --kv-cache-dtype "<k>,<v>". The K-side
+        # dtype drives the global self.kv_cache_dtype; v_dtype is
+        # injected into per-layer AttentionSpec via attn_utils.py.
+        _cd = self.cache_config.cache_dtype
+        _k_cd = _cd[0] if isinstance(_cd, tuple) else _cd
+        if _k_cd != "auto":
+            # Quantized KV cache (K-side dtype on the asymmetric path).
+            self.kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[_k_cd]
 
         self.vocab_size = self.model_config.get_vocab_size()
         self.max_model_len = self.model_config.max_model_len

@@ -206,6 +206,23 @@ class FullAttentionSpec(AttentionSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
+        # Asymmetric K/V: when v_dtype differs from dtype (K dtype),
+        # bill K bytes and V bytes separately. Matches the per-page
+        # split in vllm/v1/worker/gpu/attn_utils.py:_reshape_kv_cache.
+        if self.v_dtype is not None and self.v_dtype != self.dtype:
+            k_bytes = (
+                self.block_size
+                * self.num_kv_heads
+                * self.head_size
+                * get_dtype_size(self.dtype)
+            )
+            v_bytes = (
+                self.block_size
+                * self.num_kv_heads
+                * self.head_size_v
+                * get_dtype_size(self.v_dtype)
+            )
+            return k_bytes + v_bytes
         if self.num_kv_planes == 1:
             # K-only paged cache (V in quantized shadow cache)
             kv_size = self.head_size
