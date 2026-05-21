@@ -719,7 +719,21 @@ class FlashAttentionImpl(AttentionImpl):
                 layer,
             )
 
-        # For decoder and cross-attention, use KV cache as before
+        # For decoder and cross-attention, use KV cache as before.
+        # Asymmetric (tuple) kv_cache is not supported by this backend.
+        # flash_attn_varlen_func requires K and V to share dtype; the
+        # validated asym path runs on FlashInfer (see backends/flashinfer.py
+        # and vllm.v1.worker.gpu.attn_utils._reshape_kv_cache).  Fail
+        # closed with a clear message rather than mis-viewing K bytes as
+        # FP8 and silently corrupting attention outputs.
+        if isinstance(kv_cache, tuple):
+            raise RuntimeError(
+                "FlashAttentionImpl.forward received a tuple kv_cache "
+                f"(asymmetric K/V, kv_cache_dtype={self.kv_cache_dtype!r}); "
+                "this backend does not support mixed K/V dtypes.  Re-run with "
+                "VLLM_ATTENTION_BACKEND=FLASHINFER for asymmetric KV caches."
+            )
+
         key_cache, value_cache = kv_cache.unbind(0)
 
         # Asymmetric: V side determines FP8 path on the writer.
