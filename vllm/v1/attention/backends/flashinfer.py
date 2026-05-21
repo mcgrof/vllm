@@ -1154,6 +1154,15 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         logits_soft_cap=self.logits_soft_cap,
                         q_data_type=self.q_data_type,
                         kv_data_type=self.k_cache_dtype,
+                        # Asymmetric K/V: pass per-side dtypes so the
+                        # FlashInfer prefill plan picks an asym kernel
+                        # URI (DTypeK != DTypeV) and the run-time dtype
+                        # check inside prefill_wrapper.run accepts our
+                        # fp8 V tensor.  Symmetric callers see
+                        # k_cache_dtype == v_cache_dtype and the URI
+                        # collapses to the existing path.
+                        k_data_type=self.k_cache_dtype,
+                        v_data_type=self.v_cache_dtype,
                         o_data_type=self.model_config.dtype,
                         fixed_split_size=self.prefill_fixed_split_size,
                         disable_split_kv=self.disable_split_kv,
