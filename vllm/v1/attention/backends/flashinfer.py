@@ -1206,6 +1206,14 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     logits_soft_cap=self.logits_soft_cap,
                     q_data_type=self.q_data_type,
                     kv_data_type=self.k_cache_dtype,
+                    # Asymmetric K/V: thread the separate K and V dtypes
+                    # through so flashinfer's JIT compiles an asym kernel
+                    # (DTypeK != DTypeV) and the dtype check inside
+                    # decode_wrapper.run() accepts our fp8 V tensor.
+                    # For symmetric callers k_cache_dtype == v_cache_dtype
+                    # and the kernel URI collapses to the existing path.
+                    k_data_type=self.k_cache_dtype,
+                    v_data_type=self.v_cache_dtype,
                     o_data_type=self.model_config.dtype,
                     fixed_split_size=self.decode_fixed_split_size,
                     disable_split_kv=self.disable_split_kv,
@@ -1905,6 +1913,8 @@ def fast_plan_decode(
     logits_soft_cap: float | None = None,
     q_data_type: str | torch.dtype | None = "float16",
     kv_data_type: str | torch.dtype | None = None,
+    k_data_type: str | torch.dtype | None = None,
+    v_data_type: str | torch.dtype | None = None,
     o_data_type: str | torch.dtype | None = None,
     data_type: str | torch.dtype | None = None,
     sm_scale: float | None = None,
@@ -1944,6 +1954,8 @@ def fast_plan_decode(
             logits_soft_cap=logits_soft_cap,
             q_data_type=q_data_type,
             kv_data_type=kv_data_type,
+            k_data_type=k_data_type,
+            v_data_type=v_data_type,
             o_data_type=o_data_type,
             data_type=data_type,
             sm_scale=sm_scale,
