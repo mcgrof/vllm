@@ -748,8 +748,21 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     dcp_a2a=self.dcp_a2a,
                 )
             else:
+                # Asymmetric K/V: FlashInfer's SM90 prefill kernel rejects
+                # tensors whose K and V page_strides differ (see
+                # batch_prefill_sm90.cu: "K and V must have same page
+                # stride for sparse attention").  Our asym layout
+                # intentionally has different K/V page strides (K-fp16
+                # is half V-fp8's stride in *elements*), so SM90 is
+                # unusable here.  Force the FA2 backend in asym mode --
+                # it accepts the distinct strides at the cost of ~10-20%
+                # prefill throughput on H100.  Symmetric callers keep
+                # backend="auto" and continue to get SM90.
+                backend = "fa2" if self._is_asymmetric else "auto"
                 self._prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
-                    self._get_workspace_buffer(), get_kv_cache_layout()
+                    self._get_workspace_buffer(),
+                    get_kv_cache_layout(),
+                    backend=backend,
                 )
         assert self._prefill_wrapper is not None
         return self._prefill_wrapper
@@ -769,6 +782,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 paged_kv_indptr = None
                 paged_kv_indices = None
                 paged_kv_last_page_len = None
+            # Asymmetric K/V: see _get_prefill_wrapper for why SM90 is
+            # rejected.  The decode kernel has the same constraint, so
+            # the symmetry-of-strides assumption must be bypassed here
+            # too by forcing the FA2 backend in asym mode.
+            backend = "fa2" if self._is_asymmetric else "auto"
             decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
                 self._get_workspace_buffer(),
                 get_kv_cache_layout(),
@@ -780,6 +798,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 # at least as good as cuda cores for all attention ops in latest
                 # gpus.
                 use_tensor_cores=True,
+                backend=backend,
             )
 
             # save the decode wrapper
