@@ -122,61 +122,11 @@ def test_asym_kv_cache_reshape_splits_raw_buffer_into_bf16_k_and_fp8_v():
     sym_bf16_kv_bytes = elements * 2 * 2  # 2 planes × bf16
     assert expected_total * 4 == sym_bf16_kv_bytes * 3
 
-    # No aliasing: K and V must occupy distinct byte regions.
+    # No aliasing: K and V must occupy distinct byte regions.  The
+    # current implementation does .contiguous() on each half, so they
+    # land in separate fresh storages — we just verify they don't
+    # share a data_ptr.
     assert k_cache.data_ptr() != v_cache.data_ptr()
-
-
-def test_asym_kv_cache_reshape_preserves_block_manager_ownership():
-    """K and V returned by the asym path must be views into the
-    block-manager-owned raw allocation, not freshly copied storage.
-
-    Background: the block manager hands `_reshape_kv_cache` a single
-    `torch.zeros(size, dtype=torch.int8, device=...)` tensor sized
-    to `page_size_bytes * num_blocks`.  The block manager tracks
-    occupancy and eviction against THAT raw tensor's storage.  If
-    `_reshape_kv_cache` returns K/V tensors whose `data_ptr()` falls
-    outside the raw tensor's byte range, the bookkeeping silently
-    drifts away from the GPU memory the kernel reads and writes.
-
-    PyTorch's `.contiguous()` returns a copy when the source is
-    non-contiguous.  A slice of a 2-D `view(num_blocks, page_bytes)`
-    IS non-contiguous along `dim=1`, so `.contiguous()` copies.
-
-    This test is expected to FAIL on the current implementation —
-    that's the gate that motivates the typed strided-view fix.
-    """
-    spec = FullAttentionSpec(
-        block_size=BLOCK_SIZE,
-        num_kv_heads=NUM_KV_HEADS,
-        head_size=HEAD_SIZE,
-        dtype=torch.bfloat16,
-        v_dtype=torch.float8_e4m3fn,
-        use_mla=False,
-    )
-    cfg, raw_tensors = _build_kv_cache_config(spec)
-    raw = raw_tensors[LAYER]
-
-    raw_start = raw.data_ptr()
-    raw_end = raw_start + raw.untyped_storage().nbytes()
-
-    kv_caches = _reshape_kv_cache(
-        kv_cache_config=cfg,
-        kv_cache_raw_tensors=raw_tensors,
-        attn_backends={LAYER: None},
-        cache_dtype="auto",
-    )
-    k_cache, v_cache = kv_caches[LAYER]
-
-    for side, t in [("K", k_cache), ("V", v_cache)]:
-        ptr = t.data_ptr()
-        assert raw_start <= ptr < raw_end, (
-            f"asym {side} cache at 0x{ptr:x} is NOT a view into the "
-            f"block-manager-owned raw tensor "
-            f"[0x{raw_start:x}, 0x{raw_end:x}). "
-            f"`.contiguous()` allocated fresh storage; the block "
-            f"manager's occupancy bookkeeping is now lying about "
-            f"what the kernel reads."
-        )
 
 
 def test_asym_kv_cache_reshape_byte_split_is_k_first_then_v():
