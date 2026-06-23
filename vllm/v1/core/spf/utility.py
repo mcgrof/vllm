@@ -43,10 +43,10 @@ from dataclasses import dataclass
 
 from vllm.v1.core.spf.config import MODE_PREFETCH, MODE_RETENTION
 
-
 # ---------------------------------------------------------------------------
 # Constants — defensible defaults, overridable via env for calibration
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class UtilityConstants:
@@ -80,7 +80,8 @@ class UtilityConstants:
     per_feature_cap: float = 0.5
 
     @classmethod
-    def from_env(cls) -> "UtilityConstants":
+    def from_env(cls) -> UtilityConstants:
+
         def _fget(name: str, default: float) -> float:
             raw = os.environ.get(name)
             if raw is None:
@@ -89,25 +90,26 @@ class UtilityConstants:
                 return float(raw)
             except ValueError:
                 return default
+
         return cls(
-            saved_ms_per_block_retention=_fget(
-                "VLLM_SPF_SAVED_MS_RETENTION", 0.08),
-            saved_ms_per_block_prefetch=_fget(
-                "VLLM_SPF_SAVED_MS_PREFETCH", 2.0),
+            saved_ms_per_block_retention=_fget("VLLM_SPF_SAVED_MS_RETENTION",
+                                               0.08),
+            saved_ms_per_block_prefetch=_fget("VLLM_SPF_SAVED_MS_PREFETCH",
+                                              2.0),
             wasted_bytes_penalty_per_gb=_fget(
                 "VLLM_SPF_WASTED_BYTES_PENALTY_PER_GB", 0.5),
-            scheduler_overhead_ms=_fget(
-                "VLLM_SPF_SCHEDULER_OVERHEAD_MS", 0.02),
-            recency_half_life_steps=_fget(
-                "VLLM_SPF_RECENCY_HALF_LIFE_STEPS", 3.0),
-            per_feature_cap=_fget(
-                "VLLM_SPF_PER_FEATURE_CAP", 0.5),
+            scheduler_overhead_ms=_fget("VLLM_SPF_SCHEDULER_OVERHEAD_MS",
+                                        0.02),
+            recency_half_life_steps=_fget("VLLM_SPF_RECENCY_HALF_LIFE_STEPS",
+                                          3.0),
+            per_feature_cap=_fget("VLLM_SPF_PER_FEATURE_CAP", 0.5),
         )
 
 
 # ---------------------------------------------------------------------------
 # Utility features
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class UtilityFeatures:
@@ -165,6 +167,7 @@ class UtilityFeatures:
 # ---------------------------------------------------------------------------
 # Probability heuristic
 # ---------------------------------------------------------------------------
+
 
 def probability_of_use(
     f: UtilityFeatures,
@@ -224,6 +227,7 @@ def probability_of_use(
 # Expected utility
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class UtilityBreakdown:
     """Audit-friendly breakdown of a single utility calculation.
@@ -280,19 +284,12 @@ def expected_utility(
     # insensitive to absolute byte counts as long as the ratio is
     # right.
     wasted_bytes_gb = features.num_bytes / 1e9
-    wasted_bytes_penalty_ms = (
-        (1.0 - p) * wasted_bytes_gb
-        * consts.wasted_bytes_penalty_per_gb
-    )
+    wasted_bytes_penalty_ms = ((1.0 - p) * wasted_bytes_gb *
+                               consts.wasted_bytes_penalty_per_gb)
 
     overhead = consts.scheduler_overhead_ms
 
-    total = (
-        saved_ms
-        - eviction_cost_ms
-        - wasted_bytes_penalty_ms
-        - overhead
-    )
+    total = (saved_ms - eviction_cost_ms - wasted_bytes_penalty_ms - overhead)
     return UtilityBreakdown(
         probability=p,
         saved_ms=saved_ms,

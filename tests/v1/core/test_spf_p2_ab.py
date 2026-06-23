@@ -35,7 +35,6 @@ from typing import Any
 sys.path.insert(0, "/data/knlp")
 
 from tools.spf.trace_schema import TraceEvent, read_trace
-
 from vllm.v1.core.spf.config import SPFConfig
 from vllm.v1.core.spf.controller import SPFController
 
@@ -44,7 +43,7 @@ def tokenize_to_blocks(tokens: list[int], block_size: int) -> list[str]:
     """Split tokens into cumulative-prefix block keys."""
     blocks = []
     for i in range(0, len(tokens), block_size):
-        prefix = tokens[: i + block_size]
+        prefix = tokens[:i + block_size]
         raw = ",".join(str(t) for t in prefix).encode("utf-8")
         key = hashlib.sha256(raw).hexdigest()[:16]
         blocks.append(key)
@@ -91,13 +90,13 @@ class ABResult:
     arm: str
     total_requests: int = 0
     total_blocks: int = 0
-    gpu_hits: int = 0           # Block found in GPU cache (fastest)
-    lmcache_hits: int = 0       # Block found in LMCache, transferred (slower)
-    full_misses: int = 0        # Block not in either tier (recompute)
+    gpu_hits: int = 0  # Block found in GPU cache (fastest)
+    lmcache_hits: int = 0  # Block found in LMCache, transferred (slower)
+    full_misses: int = 0  # Block not in either tier (recompute)
     prefetch_issued: int = 0
     prefetch_promoted: int = 0  # Blocks moved LMCache→GPU by SPF
-    prefetch_hit: int = 0       # Prefetched blocks actually used
-    prefetch_waste: int = 0     # Prefetched blocks evicted before use
+    prefetch_hit: int = 0  # Prefetched blocks actually used
+    prefetch_waste: int = 0  # Prefetched blocks evicted before use
 
     # Block-reuse instrumentation (Stage 1.5).
     # Per-request reuse fraction: what fraction of this request's blocks
@@ -113,28 +112,24 @@ class ABResult:
 
     @property
     def lmcache_hit_rate(self) -> float:
-        return self.lmcache_hits / self.total_blocks if self.total_blocks else 0.0
+        if not self.total_blocks:
+            return 0.0
+        return self.lmcache_hits / self.total_blocks
 
     @property
     def total_hit_rate(self) -> float:
-        return (
-            (self.gpu_hits + self.lmcache_hits) / self.total_blocks
-            if self.total_blocks else 0.0
-        )
+        return ((self.gpu_hits + self.lmcache_hits) /
+                self.total_blocks if self.total_blocks else 0.0)
 
     @property
     def mean_reuse_fraction(self) -> float:
-        return (
-            sum(self.per_request_reuse) / len(self.per_request_reuse)
-            if self.per_request_reuse else 0.0
-        )
+        return (sum(self.per_request_reuse) /
+                len(self.per_request_reuse) if self.per_request_reuse else 0.0)
 
     @property
     def mean_overlap_fraction(self) -> float:
-        return (
-            sum(self.per_request_overlap) / len(self.per_request_overlap)
-            if self.per_request_overlap else 0.0
-        )
+        return (sum(self.per_request_overlap) / len(self.per_request_overlap)
+                if self.per_request_overlap else 0.0)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -155,9 +150,18 @@ class ABResult:
             "mean_reuse_fraction": round(self.mean_reuse_fraction, 4),
             "mean_overlap_fraction": round(self.mean_overlap_fraction, 4),
             "reuse_distribution": {
-                "min": round(min(self.per_request_reuse), 4) if self.per_request_reuse else 0.0,
-                "max": round(max(self.per_request_reuse), 4) if self.per_request_reuse else 0.0,
-                "p50": round(sorted(self.per_request_reuse)[len(self.per_request_reuse) // 2], 4) if self.per_request_reuse else 0.0,
+                "min":
+                round(min(self.per_request_reuse), 4)
+                if self.per_request_reuse else 0.0,
+                "max":
+                round(max(self.per_request_reuse), 4)
+                if self.per_request_reuse else 0.0,
+                "p50":
+                round(
+                    sorted(
+                        self.per_request_reuse)[len(self.per_request_reuse) //
+                                                2], 4)
+                if self.per_request_reuse else 0.0,
             },
         }
 
@@ -236,7 +240,8 @@ def run_arm(
             result.prefetch_issued += len(hints)
 
             for hint in hints:
-                if hint.prefix_hash in lmcache and hint.prefix_hash not in gpu_cache:
+                if (hint.prefix_hash in lmcache
+                        and hint.prefix_hash not in gpu_cache):
                     gpu_cache.insert(hint.prefix_hash)
                     result.prefetch_promoted += 1
                     prefetched_pending.add(hint.prefix_hash)
@@ -265,10 +270,8 @@ def run_arm(
         block_set = set(blocks)
         if blocks:
             reuse_frac = len(block_set & all_seen_blocks) / len(blocks)
-            overlap_frac = (
-                len(block_set & prev_request_blocks) / len(blocks)
-                if prev_request_blocks else 0.0
-            )
+            overlap_frac = (len(block_set & prev_request_blocks) /
+                            len(blocks) if prev_request_blocks else 0.0)
             result.per_request_reuse.append(reuse_frac)
             result.per_request_overlap.append(overlap_frac)
         all_seen_blocks.update(block_set)
@@ -297,13 +300,15 @@ def run_ab_workload(
     events = list(read_trace(trace_path))
 
     baseline = run_arm(
-        events, workload_name,
+        events,
+        workload_name,
         spf_enabled=False,
         gpu_capacity_blocks=gpu_capacity_blocks,
         lmcache_capacity_blocks=lmcache_capacity_blocks,
     )
     spf = run_arm(
-        events, workload_name,
+        events,
+        workload_name,
         spf_enabled=True,
         gpu_capacity_blocks=gpu_capacity_blocks,
         lmcache_capacity_blocks=lmcache_capacity_blocks,
@@ -311,24 +316,28 @@ def run_ab_workload(
 
     # Key metric: GPU hit rate improvement (blocks served without transfer).
     delta_gpu = spf.gpu_hit_rate - baseline.gpu_hit_rate
-    pct_gpu_improvement = (
-        (delta_gpu / baseline.gpu_hit_rate * 100)
-        if baseline.gpu_hit_rate > 0 else 0.0
-    )
+    pct_gpu_improvement = ((delta_gpu / baseline.gpu_hit_rate *
+                            100) if baseline.gpu_hit_rate > 0 else 0.0)
 
     return {
-        "workload": workload_name,
-        "n_events": len(events),
-        "gpu_capacity_blocks": gpu_capacity_blocks,
-        "lmcache_capacity_blocks": lmcache_capacity_blocks,
-        "baseline": baseline.to_dict(),
-        "spf": spf.to_dict(),
-        "delta_gpu_hit_rate": round(delta_gpu, 4),
-        "pct_gpu_improvement": round(pct_gpu_improvement, 2),
-        "verdict": (
-            "IMPROVED" if delta_gpu > 0.001
-            else ("NEUTRAL" if delta_gpu >= -0.001 else "REGRESSED")
-        ),
+        "workload":
+        workload_name,
+        "n_events":
+        len(events),
+        "gpu_capacity_blocks":
+        gpu_capacity_blocks,
+        "lmcache_capacity_blocks":
+        lmcache_capacity_blocks,
+        "baseline":
+        baseline.to_dict(),
+        "spf":
+        spf.to_dict(),
+        "delta_gpu_hit_rate":
+        round(delta_gpu, 4),
+        "pct_gpu_improvement":
+        round(pct_gpu_improvement, 2),
+        "verdict": ("IMPROVED" if delta_gpu > 0.001 else
+                    ("NEUTRAL" if delta_gpu >= -0.001 else "REGRESSED")),
         "reuse_profile": {
             "mean_reuse_fraction": round(baseline.mean_reuse_fraction, 4),
             "mean_overlap_fraction": round(baseline.mean_overlap_fraction, 4),
@@ -338,8 +347,7 @@ def run_ab_workload(
 
 
 TRACE_DIR = Path(
-    "/data/knlp-key-results/spf/spf-p1-offline-20260329T170630Z/traces"
-)
+    "/data/knlp-key-results/spf/spf-p1-offline-20260329T170630Z/traces")
 
 TARGET_WORKLOADS = [
     "conversation_tree",
@@ -360,16 +368,14 @@ def _run_all_ab() -> dict[str, Any]:
             trace_path = TRACE_DIR / f"{wl}.jsonl"
             if not trace_path.exists():
                 continue
-            cap_results[wl] = run_ab_workload(
-                trace_path, wl, gpu_capacity_blocks=gpu_cap
-            )
+            cap_results[wl] = run_ab_workload(trace_path,
+                                              wl,
+                                              gpu_capacity_blocks=gpu_cap)
         all_results[f"gpu_{gpu_cap}"] = cap_results
 
     # Aggregate across smallest GPU size (most realistic for SPF).
     primary = all_results.get("gpu_16", {})
-    improved = sum(
-        1 for r in primary.values() if r["verdict"] == "IMPROVED"
-    )
+    improved = sum(1 for r in primary.values() if r["verdict"] == "IMPROVED")
 
     return {
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -378,64 +384,69 @@ def _run_all_ab() -> dict[str, Any]:
         "sweep_results": all_results,
         "primary_gpu_size": 16,
         "summary": {
-            "total_workloads": len(primary),
-            "improved": improved,
-            "neutral": sum(
-                1 for r in primary.values() if r["verdict"] == "NEUTRAL"
-            ),
-            "regressed": sum(
-                1 for r in primary.values() if r["verdict"] == "REGRESSED"
-            ),
-            "verdict": "GO" if improved >= 2 else "NEEDS_REVIEW",
+            "total_workloads":
+            len(primary),
+            "improved":
+            improved,
+            "neutral":
+            sum(1 for r in primary.values() if r["verdict"] == "NEUTRAL"),
+            "regressed":
+            sum(1 for r in primary.values() if r["verdict"] == "REGRESSED"),
+            "verdict":
+            "GO" if improved >= 2 else "NEEDS_REVIEW",
         },
     }
 
 
 class TestSPFP2AB:
+
     def test_conversation_tree_ab(self):
         trace = TRACE_DIR / "conversation_tree.jsonl"
         if not trace.exists():
-            import pytest; pytest.skip("P1 traces not available")
+            import pytest
+            pytest.skip("P1 traces not available")
         result = run_ab_workload(trace, "conversation_tree")
         assert result["delta_gpu_hit_rate"] >= -0.02
 
     def test_batched_burst_ab(self):
         trace = TRACE_DIR / "batched_burst.jsonl"
         if not trace.exists():
-            import pytest; pytest.skip("P1 traces not available")
+            import pytest
+            pytest.skip("P1 traces not available")
         result = run_ab_workload(trace, "batched_burst")
         assert result["delta_gpu_hit_rate"] >= -0.02
 
     def test_mixed_session_ab(self):
         trace = TRACE_DIR / "mixed_session.jsonl"
         if not trace.exists():
-            import pytest; pytest.skip("P1 traces not available")
+            import pytest
+            pytest.skip("P1 traces not available")
         result = run_ab_workload(trace, "mixed_session")
         assert result["delta_gpu_hit_rate"] >= -0.02
 
     def test_shared_prefix_ab(self):
         trace = TRACE_DIR / "shared_prefix.jsonl"
         if not trace.exists():
-            import pytest; pytest.skip("P1 traces not available")
+            import pytest
+            pytest.skip("P1 traces not available")
         result = run_ab_workload(trace, "shared_prefix")
         assert result["delta_gpu_hit_rate"] >= -0.02
 
     def test_overall_verdict(self):
         if not TRACE_DIR.exists():
-            import pytest; pytest.skip("P1 traces not available")
+            import pytest
+            pytest.skip("P1 traces not available")
         summary = _run_all_ab()
         primary_key = f"gpu_{summary['primary_gpu_size']}"
         primary = summary["sweep_results"].get(primary_key, {})
         for wl, res in primary.items():
-            print(
-                f"  {wl}: gpu_base={res['baseline']['gpu_hit_rate']:.4f} "
-                f"gpu_spf={res['spf']['gpu_hit_rate']:.4f} "
-                f"delta={res['delta_gpu_hit_rate']:+.4f} "
-                f"({res['pct_gpu_improvement']:+.1f}%) "
-                f"prefetch_hit={res['spf']['prefetch_hit']}/"
-                f"{res['spf']['prefetch_issued']} "
-                f"[{res['verdict']}]"
-            )
+            print(f"  {wl}: gpu_base={res['baseline']['gpu_hit_rate']:.4f} "
+                  f"gpu_spf={res['spf']['gpu_hit_rate']:.4f} "
+                  f"delta={res['delta_gpu_hit_rate']:+.4f} "
+                  f"({res['pct_gpu_improvement']:+.1f}%) "
+                  f"prefetch_hit={res['spf']['prefetch_hit']}/"
+                  f"{res['spf']['prefetch_issued']} "
+                  f"[{res['verdict']}]")
         print(f"  Overall: {summary['summary']}")
 
 

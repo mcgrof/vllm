@@ -42,23 +42,16 @@ import logging
 import pytest
 
 from vllm.v1.core.spf.config import SPFConfig
-from vllm.v1.core.spf.controller import (
-    PrefetchCandidate,
-    PrefetchHint,
-    SPFController,
-)
-from vllm.v1.core.spf.manifest import (
-    BlockManifest,
-    BlockManifestProvider,
-    MultiManifestProvider,
-    NullManifestProvider,
-)
-
+from vllm.v1.core.spf.controller import SPFController
+from vllm.v1.core.spf.manifest import (BlockManifest, BlockManifestProvider,
+                                       MultiManifestProvider,
+                                       NullManifestProvider)
 
 # ---------------------------------------------------------------------------
 # Synthetic KRI prior fixtures — match the on-disk shape from the routing
 # branch so the same dict can be loaded by either real or test code.
 # ---------------------------------------------------------------------------
+
 
 def _make_perk_prior(
     num_blocks: int = 258,
@@ -104,6 +97,7 @@ def _make_legacy_only_prior(num_blocks: int = 258) -> dict:
 # ---------------------------------------------------------------------------
 # Synthetic provider implementations
 # ---------------------------------------------------------------------------
+
 
 class SyntheticKRIGProvider:
     """Query-agnostic synthetic provider mirroring the KRI-G contract.
@@ -152,10 +146,8 @@ class SyntheticKRIQProvider:
         K: int,
     ) -> BlockManifest | None:
         if query_hash is None:
-            raise ValueError(
-                "KRI-Q provider requires query_hash; "
-                "caller must extract query region before lookup"
-            )
+            raise ValueError("KRI-Q provider requires query_hash; "
+                             "caller must extract query region before lookup")
         prior = self._store.get((prefix_hash, query_hash))
         if prior is None:
             return None
@@ -171,6 +163,7 @@ class SyntheticKRIQProvider:
 # Provider-level tests (no controller involved)
 # ---------------------------------------------------------------------------
 
+
 class TestBlockManifestFromKRIPrior:
     """Property #1: per-K dispatch parity with the routing-side connector."""
 
@@ -182,8 +175,7 @@ class TestBlockManifestFromKRIPrior:
         # Must come from kmeans_blocks_perK[8], NOT from
         # sorted(kmeans_blocks)[:8] which would be [0, 1, 2, 3, 4, 5, 6, 7].
         assert list(manifest.block_indices) == sorted(
-            prior["kmeans_blocks_perK"][8]
-        )
+            prior["kmeans_blocks_perK"][8])
         assert manifest.block_indices != tuple(range(8))
 
     def test_falls_back_to_legacy_when_per_k_missing(self) -> None:
@@ -193,8 +185,7 @@ class TestBlockManifestFromKRIPrior:
         # Sorted truncation of the legacy list — matches the connector
         # fallback path.
         assert list(manifest.block_indices) == sorted(
-            prior["kmeans_blocks"][:4]
-        )
+            prior["kmeans_blocks"][:4])
         assert manifest.K == 4
 
     def test_returns_none_when_no_blocks(self) -> None:
@@ -208,10 +199,11 @@ class TestBlockManifestFromKRIPrior:
         manifest = BlockManifest.from_kri_prior(prior=prior, K=64)
         assert manifest is not None
         # Falls back to sorted(kmeans_blocks[:64]) — at most len(legacy).
-        assert manifest.K == min(64, len(prior["kmeans_blocks"]))
+        assert min(64, len(prior["kmeans_blocks"])) == manifest.K
 
 
 class TestBlockManifestSavings:
+
     def test_savings_blocks(self) -> None:
         m = BlockManifest(
             block_indices=(0, 1, 2, 3, 4, 5, 6, 7),
@@ -275,16 +267,19 @@ class TestKRIQContractFailures:
 # Multi-provider chain tests
 # ---------------------------------------------------------------------------
 
+
 class TestMultiProviderChain:
     """Verify the chain skips KRI-Q gracefully when no query is present."""
 
     def test_chain_falls_through_kriq_to_krig_without_query(self) -> None:
-        kriq = SyntheticKRIQProvider(store={
-            ("abc123", "qX"): _make_perk_prior(prior_type="kri_q"),
-        })
-        krig = SyntheticKRIGProvider(store={
-            "abc123": _make_perk_prior(prior_type="kri_g"),
-        })
+        kriq = SyntheticKRIQProvider(
+            store={
+                ("abc123", "qX"): _make_perk_prior(prior_type="kri_q"),
+            })
+        krig = SyntheticKRIGProvider(
+            store={
+                "abc123": _make_perk_prior(prior_type="kri_g"),
+            })
         chain = MultiManifestProvider()
         chain.register("kri_q", kriq)
         chain.register("kri_g", krig)
@@ -300,12 +295,14 @@ class TestMultiProviderChain:
         assert manifest.prior_type == "kri_g"
 
     def test_chain_prefers_kriq_when_query_supplied(self) -> None:
-        kriq = SyntheticKRIQProvider(store={
-            ("abc123", "qX"): _make_perk_prior(prior_type="kri_q"),
-        })
-        krig = SyntheticKRIGProvider(store={
-            "abc123": _make_perk_prior(prior_type="kri_g"),
-        })
+        kriq = SyntheticKRIQProvider(
+            store={
+                ("abc123", "qX"): _make_perk_prior(prior_type="kri_q"),
+            })
+        krig = SyntheticKRIGProvider(
+            store={
+                "abc123": _make_perk_prior(prior_type="kri_g"),
+            })
         chain = MultiManifestProvider()
         chain.register("kri_q", kriq)
         chain.register("kri_g", krig)
@@ -322,6 +319,7 @@ class TestMultiProviderChain:
 # ---------------------------------------------------------------------------
 # Controller-level tests — the integration contract
 # ---------------------------------------------------------------------------
+
 
 def _make_controller(
     *,
@@ -411,9 +409,9 @@ class TestControllerWithKRIGProvider:
     def test_kri_dominates_when_legacy_blocks_dominate_budget(self) -> None:
         # Make num_blocks huge in the legacy path so the budget pinches,
         # then verify KRI fits more candidates.
-        provider = SyntheticKRIGProvider(store={
-            f"prefix_{i:02d}": _make_perk_prior() for i in range(20)
-        })
+        provider = SyntheticKRIGProvider(
+            store={f"prefix_{i:02d}": _make_perk_prior()
+                   for i in range(20)})
         kri_controller = _make_controller(
             provider=provider,
             max_prefetch_blocks=64,  # K=8 × 8 = 64 → fits exactly 8
@@ -435,7 +433,8 @@ class TestControllerWithKRIGProvider:
 
         hints = kri_controller.step(
             free_gpu_blocks=1024,
-            resident_prefixes={f"prefix_{i:02d}" for i in range(20)},
+            resident_prefixes={f"prefix_{i:02d}"
+                               for i in range(20)},
         )
 
         # Without KRI: 32 blocks/cand × budget 64 → only 2 fit.
@@ -476,6 +475,7 @@ class TestControllerWithKRIQProvider:
         captured: list[logging.LogRecord] = []
 
         class _Capture(logging.Handler):
+
             def emit(self, record: logging.LogRecord) -> None:
                 captured.append(record)
 
@@ -527,6 +527,7 @@ class TestControllerIsVariantAgnostic:
 
 
 class TestNullProviderIsNoOp:
+
     def test_null_provider_returns_no_manifest(self) -> None:
         provider = NullManifestProvider()
         assert provider.get_manifest(

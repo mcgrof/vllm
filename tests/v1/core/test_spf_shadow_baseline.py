@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Phase-7 shadow-baseline counterfactual tests.
 
 Covers the ``ShadowBaseline`` contract:
@@ -21,10 +22,7 @@ lifetime assertions are deterministic.
 """
 from __future__ import annotations
 
-from vllm.v1.core.spf.shadow_baseline import (
-    ShadowBaseline,
-    ShadowMetrics,
-)
+from vllm.v1.core.spf.shadow_baseline import ShadowBaseline
 
 
 class _Clock:
@@ -44,7 +42,9 @@ class _Clock:
 # Basic shape
 # ---------------------------------------------------------------------------
 
+
 class TestShape:
+
     def test_fresh_shadow_has_zero_metrics(self):
         s = ShadowBaseline(capacity=4)
         snap = s.metrics.snapshot()
@@ -65,7 +65,9 @@ class TestShape:
 # 1. Rescued reuse — the mechanism signal
 # ---------------------------------------------------------------------------
 
+
 class TestRescueMechanism:
+
     def test_rescued_reuse_is_counted(self):
         """SPF hint saves R from LRU; a later reuse of R lands —
         rescued_reuses_count += 1 and retention_lifetime_ms is
@@ -83,8 +85,7 @@ class TestRescueMechanism:
         clock.tick(10)
         # New insertion forces eviction; shadow loses A.
         # would_save_ids tells shadow that SPF saved A.
-        evicted = s.on_insert("C", num_bytes=100,
-                              would_save_ids={"A"})
+        evicted = s.on_insert("C", num_bytes=100, would_save_ids={"A"})
         assert "A" in evicted
         assert "A" in s.pending_rescue_ids()
 
@@ -112,8 +113,7 @@ class TestRescueMechanism:
     def test_multiple_rescues_and_reuses(self):
         clock = _Clock()
         s = ShadowBaseline(capacity=2, now_ms=clock)
-        for rid, size in [("A", 100), ("B", 200), ("C", 50),
-                          ("D", 75)]:
+        for rid, size in [("A", 100), ("B", 200), ("C", 50), ("D", 75)]:
             s.on_insert(rid, num_bytes=size)
             clock.tick(1)
         # Pool now contains {C, D}. Re-hint A (not resident; goes
@@ -134,7 +134,9 @@ class TestRescueMechanism:
 # 2. Harmful evictions — who got it wrong?
 # ---------------------------------------------------------------------------
 
+
 class TestHarmfulEvictions:
+
     def test_baseline_evicts_reused_resource(self):
         """Baseline-LRU evicts R; SPF saves it in real cache; a
         reuse later arrives. Baseline would have missed →
@@ -172,7 +174,7 @@ class TestHarmfulEvictions:
         s.on_insert("A", num_bytes=10)
         s.on_insert("B", num_bytes=10)
         s.on_insert("C", num_bytes=10)  # evicts A from shadow
-        s.on_spf_real_eviction("A")     # SPF also evicts A
+        s.on_spf_real_eviction("A")  # SPF also evicts A
         s.on_reuse("A")  # miss in both
         snap = s.metrics.snapshot()
         assert snap["harmful_evictions_baseline"] == 0
@@ -183,7 +185,9 @@ class TestHarmfulEvictions:
 # 3. Reuse distance accounting
 # ---------------------------------------------------------------------------
 
+
 class TestReuseDistance:
+
     def test_reuse_distance_tracked(self):
         clock = _Clock()
         s = ShadowBaseline(capacity=2, now_ms=clock)
@@ -207,11 +211,13 @@ class TestReuseDistance:
 # 4. Unrelated accesses don't pollute counters
 # ---------------------------------------------------------------------------
 
+
 class TestUnrelatedTraffic:
+
     def test_access_on_nonresident_nonrescued_is_noop(self):
         s = ShadowBaseline(capacity=2)
         s.on_access("never_seen")  # no entry
-        s.on_reuse("never_seen")   # no entry, no pending
+        s.on_reuse("never_seen")  # no entry, no pending
         snap = s.metrics.snapshot()
         assert snap["rescued_reuses_count"] == 0
         assert snap["harmful_evictions_baseline"] == 0
@@ -222,23 +228,24 @@ class TestUnrelatedTraffic:
 # 5. Integration smoke: RetentionIntegration drives the shadow
 # ---------------------------------------------------------------------------
 
+
 class TestRetentionIntegrationWiring:
+
     def test_retention_integration_drives_shadow(self):
-        from vllm.v1.core.spf.config import (
-            MODE_RETENTION, SPFConfig,
-        )
+        from vllm.v1.core.spf.config import MODE_RETENTION, SPFConfig
         from vllm.v1.core.spf.controller import SPFController
-        from vllm.v1.core.spf.integrations import (
-            FakeBlockPool,
-            RetentionIntegration,
-        )
+        from vllm.v1.core.spf.integrations import (FakeBlockPool,
+                                                   RetentionIntegration)
         from vllm.v1.core.spf.resource import ResourceId
 
         clock = _Clock()
-        ctrl = SPFController(SPFConfig(
-            enabled=True, mode=MODE_RETENTION,
-            metrics_interval=0, cooldown_steps=0,
-        ))
+        ctrl = SPFController(
+            SPFConfig(
+                enabled=True,
+                mode=MODE_RETENTION,
+                metrics_interval=0,
+                cooldown_steps=0,
+            ))
         pool = FakeBlockPool(capacity=2)
         shadow = ShadowBaseline(capacity=2, now_ms=clock)
         integ = RetentionIntegration(ctrl, pool, shadow=shadow)
@@ -261,10 +268,11 @@ class TestRetentionIntegrationWiring:
 
         # Later: A is reused.
         r_A = ResourceId(
-            scope=__import__(
-                "vllm.v1.core.spf.resource", fromlist=["ResourceScope"]
-            ).ResourceScope.PREFIX,
-            resource_id="A", num_blocks=1, num_bytes=100,
+            scope=__import__("vllm.v1.core.spf.resource",
+                             fromlist=["ResourceScope"]).ResourceScope.PREFIX,
+            resource_id="A",
+            num_blocks=1,
+            num_bytes=100,
             session_id="s",
         )
         integ.on_request_arrival(r_A, arrival_time=clock() / 1000.0)

@@ -27,10 +27,10 @@ from dataclasses import dataclass, field
 
 logger = logging.getLogger("vllm.spf")
 
-
 # ---------------------------------------------------------------------------
 # Mode-specific counters
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class RetentionMetrics:
@@ -78,6 +78,7 @@ class PrefetchMetrics:
 # ---------------------------------------------------------------------------
 # Per-step snapshot
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class SPFStepMetrics:
@@ -157,6 +158,7 @@ class SPFStepMetrics:
 # Accumulator
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class SPFMetrics:
     """Accumulating metrics across scheduler steps, mode-aware."""
@@ -203,8 +205,7 @@ class SPFMetrics:
     @property
     def _prefetch_issued(self) -> int:
         return (self._retention.hints_issued
-                if self._mode == "retention"
-                else self._prefetch.hints_issued)
+                if self._mode == "retention" else self._prefetch.hints_issued)
 
     @_prefetch_issued.setter
     def _prefetch_issued(self, v: int) -> None:
@@ -216,8 +217,7 @@ class SPFMetrics:
     @property
     def _prefetch_hit(self) -> int:
         return (self._retention.hints_used
-                if self._mode == "retention"
-                else self._prefetch.prefetch_used)
+                if self._mode == "retention" else self._prefetch.prefetch_used)
 
     @_prefetch_hit.setter
     def _prefetch_hit(self, v: int) -> None:
@@ -228,9 +228,8 @@ class SPFMetrics:
 
     @property
     def _prefetch_waste(self) -> int:
-        return (self._retention.hints_wasted
-                if self._mode == "retention"
-                else self._prefetch.prefetch_wasted)
+        return (self._retention.hints_wasted if self._mode == "retention" else
+                self._prefetch.prefetch_wasted)
 
     @_prefetch_waste.setter
     def _prefetch_waste(self, v: int) -> None:
@@ -245,10 +244,8 @@ class SPFMetrics:
         Always includes the mode so consumers never have to guess
         which family of counters is meaningful.
         """
-        avg_util = (
-            self._budget_utilization_sum / self._budget_samples
-            if self._budget_samples > 0 else 0.0
-        )
+        avg_util = (self._budget_utilization_sum /
+                    self._budget_samples if self._budget_samples > 0 else 0.0)
         snap = {
             "mode": self._mode,
             "step": self._step,
@@ -259,22 +256,31 @@ class SPFMetrics:
         }
         if self._mode == "retention":
             snap.update({
-                "hints_issued": self._retention.hints_issued,
-                "hints_retained": self._retention.hints_retained,
-                "hints_used": self._retention.hints_used,
-                "hints_wasted": self._retention.hints_wasted,
+                "hints_issued":
+                self._retention.hints_issued,
+                "hints_retained":
+                self._retention.hints_retained,
+                "hints_used":
+                self._retention.hints_used,
+                "hints_wasted":
+                self._retention.hints_wasted,
                 "harmful_evictions_avoided":
-                    self._retention.harmful_evictions_avoided,
+                self._retention.harmful_evictions_avoided,
             })
         else:
             snap.update({
-                "hints_issued": self._prefetch.hints_issued,
-                "bytes_promoted": self._prefetch.bytes_promoted,
-                "promote_latency_ms": self._prefetch.promote_latency_ms,
-                "prefetch_used": self._prefetch.prefetch_used,
-                "prefetch_wasted": self._prefetch.prefetch_wasted,
+                "hints_issued":
+                self._prefetch.hints_issued,
+                "bytes_promoted":
+                self._prefetch.bytes_promoted,
+                "promote_latency_ms":
+                self._prefetch.promote_latency_ms,
+                "prefetch_used":
+                self._prefetch.prefetch_used,
+                "prefetch_wasted":
+                self._prefetch.prefetch_wasted,
                 "request_wait_on_promotion_count":
-                    self._prefetch.request_wait_on_promotion_count,
+                self._prefetch.request_wait_on_promotion_count,
             })
         # Legacy KRI numbers are always surfaced when non-zero so
         # older experiments that care about them aren't blind.
@@ -324,16 +330,12 @@ class SPFMetrics:
         self._kri_blocks_saved += step_metrics.kri_blocks_saved
 
         if step_metrics.budget_blocks > 0:
-            issued = (
-                self._retention.hints_issued
-                if self._mode == "retention"
-                else self._prefetch.hints_issued
-            )
-            self._budget_utilization_sum += (
-                step_metrics.candidates_scored
-                / step_metrics.budget_blocks
-                if step_metrics.budget_blocks else 0.0
-            )
+            issued = (self._retention.hints_issued if self._mode == "retention"
+                      else self._prefetch.hints_issued)
+            self._budget_utilization_sum += (step_metrics.candidates_scored /
+                                             step_metrics.budget_blocks
+                                             if step_metrics.budget_blocks else
+                                             0.0)
             self._budget_samples += 1
             del issued  # linter shush
 
@@ -403,7 +405,10 @@ class SPFMetrics:
         self._outstanding.add(block_hash)
 
     def record_prefetch_outcome(
-        self, block_hash: str, *, hit: bool,
+        self,
+        block_hash: str,
+        *,
+        hit: bool,
     ) -> None:
         """Legacy alias: route to used/wasted."""
         if hit:

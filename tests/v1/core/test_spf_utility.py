@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for the expected-utility scorer.
 
 Covers the contract from ``utility.py`` and ``scorer.py``:
@@ -23,19 +24,16 @@ import pytest
 
 from vllm.v1.core.spf.config import MODE_PREFETCH, MODE_RETENTION
 from vllm.v1.core.spf.scorer import ExpectedUtilityScorer
-from vllm.v1.core.spf.utility import (
-    UtilityConstants,
-    UtilityFeatures,
-    expected_utility,
-    probability_of_use,
-)
-
+from vllm.v1.core.spf.utility import (UtilityConstants, UtilityFeatures,
+                                      expected_utility, probability_of_use)
 
 # ---------------------------------------------------------------------------
 # probability_of_use
 # ---------------------------------------------------------------------------
 
+
 class TestProbabilityBounds:
+
     def test_default_features_in_unit_interval(self):
         f = UtilityFeatures()
         p = probability_of_use(f, UtilityConstants())
@@ -84,44 +82,40 @@ class TestProbabilityBounds:
 
 
 class TestProbabilityMonotonicity:
+
     def test_lower_recency_is_higher_p(self):
         c = UtilityConstants()
-        p_old = probability_of_use(
-            UtilityFeatures(recency=10.0), c)
-        p_new = probability_of_use(
-            UtilityFeatures(recency=1.0), c)
+        p_old = probability_of_use(UtilityFeatures(recency=10.0), c)
+        p_new = probability_of_use(UtilityFeatures(recency=1.0), c)
         assert p_new > p_old
 
     def test_higher_transition_is_higher_p(self):
         c = UtilityConstants()
         low = probability_of_use(
-            UtilityFeatures(transition_prob=0.1, transition_count=10),
-            c)
+            UtilityFeatures(transition_prob=0.1, transition_count=10), c)
         hi = probability_of_use(
-            UtilityFeatures(transition_prob=0.9, transition_count=10),
-            c)
+            UtilityFeatures(transition_prob=0.9, transition_count=10), c)
         assert hi > low
 
     def test_more_transition_counts_is_more_credible(self):
         c = UtilityConstants()
         few = probability_of_use(
-            UtilityFeatures(transition_prob=0.5, transition_count=2),
-            c)
+            UtilityFeatures(transition_prob=0.5, transition_count=2), c)
         many = probability_of_use(
-            UtilityFeatures(transition_prob=0.5, transition_count=200),
-            c)
+            UtilityFeatures(transition_prob=0.5, transition_count=200), c)
         assert many > few
 
     def test_reuse_distance_reduces_p(self):
         c = UtilityConstants()
         base = probability_of_use(
-            UtilityFeatures(recency=1.0, transition_prob=0.5,
+            UtilityFeatures(recency=1.0,
+                            transition_prob=0.5,
                             transition_count=10), c)
         far = probability_of_use(
-            UtilityFeatures(recency=1.0, transition_prob=0.5,
+            UtilityFeatures(recency=1.0,
+                            transition_prob=0.5,
                             transition_count=10,
-                            reuse_distance=15.0),
-            c)
+                            reuse_distance=15.0), c)
         assert far < base
 
 
@@ -129,19 +123,21 @@ class TestProbabilityMonotonicity:
 # expected_utility breakdown
 # ---------------------------------------------------------------------------
 
+
 class TestUtilityBreakdown:
+
     def test_retention_saved_ms_scales_with_blocks(self):
         c = UtilityConstants()
         one_block = expected_utility(
-            UtilityFeatures(
-                recency=0.0, transition_prob=1.0,
-                transition_count=100, num_blocks=1),
-            MODE_RETENTION, c)
+            UtilityFeatures(recency=0.0,
+                            transition_prob=1.0,
+                            transition_count=100,
+                            num_blocks=1), MODE_RETENTION, c)
         ten_blocks = expected_utility(
-            UtilityFeatures(
-                recency=0.0, transition_prob=1.0,
-                transition_count=100, num_blocks=10),
-            MODE_RETENTION, c)
+            UtilityFeatures(recency=0.0,
+                            transition_prob=1.0,
+                            transition_count=100,
+                            num_blocks=10), MODE_RETENTION, c)
         assert ten_blocks.saved_ms > one_block.saved_ms * 5
 
     def test_prefetch_saved_ms_is_larger_than_retention(self):
@@ -149,9 +145,10 @@ class TestUtilityBreakdown:
         avoids only a CPU→GPU refetch. Prefetch should have a
         higher per-block saved-ms constant."""
         c = UtilityConstants()
-        f = UtilityFeatures(
-            recency=0.0, transition_prob=1.0,
-            transition_count=100, num_blocks=4)
+        f = UtilityFeatures(recency=0.0,
+                            transition_prob=1.0,
+                            transition_count=100,
+                            num_blocks=4)
         r = expected_utility(f, MODE_RETENTION, c)
         p = expected_utility(f, MODE_PREFETCH, c)
         assert p.saved_ms > r.saved_ms
@@ -161,30 +158,30 @@ class TestUtilityBreakdown:
         # Big, low-probability candidate → high wasted-bytes penalty.
         big_cold = expected_utility(
             UtilityFeatures(
-                num_bytes=4 * 10 ** 9,  # 4 GB
+                num_bytes=4 * 10**9,  # 4 GB
                 recency=100.0,  # low recency signal
             ),
-            MODE_RETENTION, c)
+            MODE_RETENTION,
+            c)
         # Small, same uncertainty → smaller penalty.
         small_cold = expected_utility(
             UtilityFeatures(
-                num_bytes=100 * 10 ** 6,  # 100 MB
+                num_bytes=100 * 10**6,  # 100 MB
                 recency=100.0,
             ),
-            MODE_RETENTION, c)
+            MODE_RETENTION,
+            c)
         assert (big_cold.wasted_bytes_penalty_ms
                 > small_cold.wasted_bytes_penalty_ms)
 
     def test_eviction_cost_scales_with_victim_value(self):
         c = UtilityConstants()
         no_victim = expected_utility(
-            UtilityFeatures(
-                recency=10.0, victim_saved_ms=0.0),
-            MODE_RETENTION, c)
+            UtilityFeatures(recency=10.0, victim_saved_ms=0.0), MODE_RETENTION,
+            c)
         with_victim = expected_utility(
-            UtilityFeatures(
-                recency=10.0, victim_saved_ms=5.0),
-            MODE_RETENTION, c)
+            UtilityFeatures(recency=10.0, victim_saved_ms=5.0), MODE_RETENTION,
+            c)
         assert with_victim.eviction_cost_ms > 0.0
         assert no_victim.eviction_cost_ms == 0.0
 
@@ -195,8 +192,7 @@ class TestUtilityBreakdown:
         zero the recency contribution completely; otherwise the
         ``1/(1+r/half_life)`` term leaves a small residual."""
         c = UtilityConstants(scheduler_overhead_ms=0.05)
-        cold = UtilityFeatures(
-            recency=1000.0, reuse_distance=1000.0)
+        cold = UtilityFeatures(recency=1000.0, reuse_distance=1000.0)
         b = expected_utility(cold, MODE_RETENTION, c)
         assert b.scheduler_overhead_ms == 0.05
         assert b.probability == 0.0
@@ -207,16 +203,18 @@ class TestUtilityBreakdown:
 
     def test_total_equals_breakdown(self):
         c = UtilityConstants()
-        f = UtilityFeatures(
-            recency=1.0, log_frequency=3.0,
-            transition_prob=0.7, transition_count=20,
-            num_blocks=4, num_bytes=500 * 10 ** 6,
-            victim_saved_ms=0.1)
+        f = UtilityFeatures(recency=1.0,
+                            log_frequency=3.0,
+                            transition_prob=0.7,
+                            transition_count=20,
+                            num_blocks=4,
+                            num_bytes=500 * 10**6,
+                            victim_saved_ms=0.1)
         b = expected_utility(f, MODE_RETENTION, c)
         assert math.isclose(
             b.total,
-            b.saved_ms - b.eviction_cost_ms
-            - b.wasted_bytes_penalty_ms - b.scheduler_overhead_ms,
+            b.saved_ms - b.eviction_cost_ms - b.wasted_bytes_penalty_ms -
+            b.scheduler_overhead_ms,
         )
 
 
@@ -224,23 +222,28 @@ class TestUtilityBreakdown:
 # Mode selection
 # ---------------------------------------------------------------------------
 
+
 class TestModeSelection:
+
     def test_unknown_mode_raises(self):
         with pytest.raises(ValueError, match="unknown mode"):
-            expected_utility(
-                UtilityFeatures(), "cartridge", UtilityConstants())
+            expected_utility(UtilityFeatures(), "cartridge",
+                             UtilityConstants())
 
 
 # ---------------------------------------------------------------------------
 # ExpectedUtilityScorer wrapper
 # ---------------------------------------------------------------------------
 
+
 class TestExpectedUtilityScorer:
+
     def test_score_returns_total(self):
         s = ExpectedUtilityScorer(MODE_RETENTION)
-        f = UtilityFeatures(
-            recency=0.0, transition_prob=1.0,
-            transition_count=100, num_blocks=5)
+        f = UtilityFeatures(recency=0.0,
+                            transition_prob=1.0,
+                            transition_count=100,
+                            num_blocks=5)
         total = s.score(f)
         breakdown = s.score_with_breakdown(f)
         assert total == breakdown.total
@@ -252,12 +255,16 @@ class TestExpectedUtilityScorer:
         guarantee the controller depends on.
         """
         s = ExpectedUtilityScorer(MODE_RETENTION)
-        weak = UtilityFeatures(
-            recency=20.0, transition_prob=0.1, transition_count=2,
-            num_blocks=4, num_bytes=10 ** 8)
-        strong = UtilityFeatures(
-            recency=1.0, transition_prob=0.9, transition_count=50,
-            num_blocks=4, num_bytes=10 ** 8)
+        weak = UtilityFeatures(recency=20.0,
+                               transition_prob=0.1,
+                               transition_count=2,
+                               num_blocks=4,
+                               num_bytes=10**8)
+        strong = UtilityFeatures(recency=1.0,
+                                 transition_prob=0.9,
+                                 transition_count=50,
+                                 num_blocks=4,
+                                 num_bytes=10**8)
         assert s.score(strong) > s.score(weak)
 
     def test_mode_accessor(self):

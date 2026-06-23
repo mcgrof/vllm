@@ -28,18 +28,17 @@ the artifacts live.
 """
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pytest
 import torch  # noqa: F401  — imported so the skip happens before
-              # CartridgeKRIProvider is instantiated, surfacing missing
-              # torch as an import error rather than a runtime crash
 
 from vllm.v1.core.spf.config import SPFConfig
 from vllm.v1.core.spf.controller import SPFController
 from vllm.v1.core.spf.providers import CartridgeKRIProvider
 
+# CartridgeKRIProvider is instantiated, surfacing missing
+# torch as an import error rather than a runtime crash
 
 GOAL1_DIR = Path("/data/knlp-key-results/routing-w7900-kri-20260406")
 LEGACY_PRIOR = GOAL1_DIR / "routing_prior_kmeans.pt"
@@ -56,7 +55,9 @@ def _require(path: Path) -> Path:
 # Provider registration tests
 # ---------------------------------------------------------------------------
 
+
 class TestCartridgeKRIProviderRegistration:
+
     def test_register_legacy_prior(self) -> None:
         path = _require(LEGACY_PRIOR)
         provider = CartridgeKRIProvider()
@@ -80,7 +81,8 @@ class TestCartridgeKRIProviderRegistration:
             prior_type="kri_g",
         )
         assert "kmeans_blocks_perK" in entry.prior
-        assert sorted(entry.prior["kmeans_blocks_perK"].keys()) == [4, 8, 16, 32]
+        assert sorted(
+            entry.prior["kmeans_blocks_perK"].keys()) == [4, 8, 16, 32]
 
     def test_register_rejects_non_dict(self, tmp_path) -> None:
         bad = tmp_path / "bad.pt"
@@ -101,7 +103,9 @@ class TestCartridgeKRIProviderRegistration:
 # Manifest lookup — the dispatch path that proves the cherry-pick works
 # ---------------------------------------------------------------------------
 
+
 class TestCartridgeKRIManifestLookup:
+
     def test_legacy_prior_returns_truncated_manifest(self) -> None:
         path = _require(LEGACY_PRIOR)
         provider = CartridgeKRIProvider()
@@ -154,9 +158,7 @@ class TestCartridgeKRIManifestLookup:
         assert m is not None
         assert m.K == 8
         # K=8 is the validated KRI regime — distinct from legacy K=8.
-        assert list(m.block_indices) == [
-            10, 57, 77, 102, 159, 174, 221, 246
-        ]
+        assert list(m.block_indices) == [10, 57, 77, 102, 159, 174, 221, 246]
 
     def test_unknown_prefix_returns_none(self) -> None:
         path = _require(PERK_PRIOR)
@@ -229,7 +231,9 @@ class TestCartridgeKRIManifestLookup:
 # Controller integration with the real provider
 # ---------------------------------------------------------------------------
 
+
 class TestCartridgeKRIProviderInController:
+
     def test_controller_emits_perk_bounded_hints(self) -> None:
         path = _require(PERK_PRIOR)
         provider = CartridgeKRIProvider()
@@ -259,9 +263,7 @@ class TestCartridgeKRIProviderInController:
         # Confirm the principled per-K block list is in the hint —
         # this is the cherry-picked dispatch fix flowing end-to-end
         # through the SPF controller.
-        assert list(m.block_indices) == [
-            10, 57, 77, 102, 159, 174, 221, 246
-        ]
+        assert list(m.block_indices) == [10, 57, 77, 102, 159, 174, 221, 246]
 
     def test_controller_falls_back_when_no_prior_registered(self) -> None:
         provider = CartridgeKRIProvider()
@@ -290,7 +292,9 @@ class TestCartridgeKRIProviderInController:
 # Stats / introspection
 # ---------------------------------------------------------------------------
 
+
 class TestProviderStats:
+
     def test_stats_after_registration(self) -> None:
         path = _require(PERK_PRIOR)
         provider = CartridgeKRIProvider()

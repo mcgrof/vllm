@@ -42,13 +42,13 @@ from __future__ import annotations
 
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
-
 
 # ---------------------------------------------------------------------------
 # Metrics
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class ShadowMetrics:
@@ -84,41 +84,46 @@ class ShadowMetrics:
     def retention_lifetime_ms_mean(self) -> float:
         if self._retention_lifetime_samples == 0:
             return 0.0
-        return (self._retention_lifetime_ms_sum
-                / self._retention_lifetime_samples)
+        return (self._retention_lifetime_ms_sum /
+                self._retention_lifetime_samples)
 
     @property
     def rescued_reuse_distance_mean(self) -> float:
         if self._rescued_reuse_distance_samples == 0:
             return 0.0
-        return (self._rescued_reuse_distance_sum
-                / self._rescued_reuse_distance_samples)
+        return (self._rescued_reuse_distance_sum /
+                self._rescued_reuse_distance_samples)
 
     def snapshot(self) -> dict:
         return {
-            "rescued_reuses_count": self.rescued_reuses_count,
-            "rescued_reuses_bytes": self.rescued_reuses_bytes,
+            "rescued_reuses_count":
+            self.rescued_reuses_count,
+            "rescued_reuses_bytes":
+            self.rescued_reuses_bytes,
             "harmful_evictions_baseline":
-                self.harmful_evictions_baseline,
-            "harmful_evictions_spf": self.harmful_evictions_spf,
+            self.harmful_evictions_baseline,
+            "harmful_evictions_spf":
+            self.harmful_evictions_spf,
             "retention_lifetime_ms_mean":
-                round(self.retention_lifetime_ms_mean, 3),
+            round(self.retention_lifetime_ms_mean, 3),
             "rescued_reuse_distance_mean":
-                round(self.rescued_reuse_distance_mean, 2),
-            "shadow_evictions_total": self.shadow_evictions_total,
-            "spf_evictions_total": self.spf_evictions_total,
+            round(self.rescued_reuse_distance_mean, 2),
+            "shadow_evictions_total":
+            self.shadow_evictions_total,
+            "spf_evictions_total":
+            self.spf_evictions_total,
             # Derived convenience field: absolute drop in harmful
             # evictions. A positive value means SPF helped; zero
             # or negative means it hurt or was neutral.
-            "harmful_eviction_delta": (
-                self.harmful_evictions_baseline
-                - self.harmful_evictions_spf),
+            "harmful_eviction_delta":
+            (self.harmful_evictions_baseline - self.harmful_evictions_spf),
         }
 
 
 # ---------------------------------------------------------------------------
 # Shadow baseline
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class _ShadowEntry:
@@ -157,14 +162,12 @@ class ShadowBaseline:
         self,
         capacity: int,
         *,
-        now_ms: "callable[[], float] | None" = None,
+        now_ms: callable[[], float] | None = None,
     ):
         self._capacity = capacity
-        self._order: "OrderedDict[str, _ShadowEntry]" = OrderedDict()
-        self._now_ms = (
-            now_ms if now_ms is not None
-            else lambda: time.perf_counter() * 1000.0
-        )
+        self._order: OrderedDict[str, _ShadowEntry] = OrderedDict()
+        self._now_ms = (now_ms if now_ms is not None else
+                        lambda: time.perf_counter() * 1000.0)
         self._step = 0
         self.metrics = ShadowMetrics()
 
@@ -200,7 +203,7 @@ class ShadowBaseline:
         self,
         resource_id: str,
         num_bytes: int,
-        would_save_ids: "set[str] | None" = None,
+        would_save_ids: set[str] | None = None,
     ) -> list[str]:
         """Baseline sees an insertion that may force eviction.
 
@@ -265,7 +268,7 @@ class ShadowBaseline:
         entry.rescued_at_ms = None
         # We piggy-back on the rescue flag space by setting a
         # dedicated marker.
-        setattr(entry, "_spf_lost", True)
+        entry._spf_lost = True
 
     def mark_rescue(
         self,
@@ -351,7 +354,7 @@ class ShadowBaseline:
             if getattr(entry, "_spf_lost", False):
                 self.metrics.harmful_evictions_spf += 1
                 # Clear flag so we don't double-count.
-                setattr(entry, "_spf_lost", False)
+                entry._spf_lost = False
             if entry.rescued:
                 self._record_rescue_payoff(entry, resource_id)
                 entry.rescued = False
@@ -392,18 +395,17 @@ class ShadowBaseline:
             self.metrics._rescued_reuse_distance_samples += 1
         if entry.rescued_at_ms is not None:
             lifetime = self._now_ms() - entry.rescued_at_ms
-            self.metrics._retention_lifetime_ms_sum += (
-                max(0.0, lifetime))
+            self.metrics._retention_lifetime_ms_sum += (max(0.0, lifetime))
             self.metrics._retention_lifetime_samples += 1
 
     # ------------------------------------------------------------------
     # Introspection
     # ------------------------------------------------------------------
 
-    def shadow_resident_ids(self) -> "set[str]":
+    def shadow_resident_ids(self) -> set[str]:
         return set(self._order.keys())
 
-    def pending_rescue_ids(self) -> "set[str]":
+    def pending_rescue_ids(self) -> set[str]:
         return set(getattr(self, "_pending", {}).keys())
 
     def __len__(self) -> int:

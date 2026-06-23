@@ -17,18 +17,10 @@ import json
 import math
 import tempfile
 
-import pytest
-
 from vllm.v1.core.spf.config import SPFConfig
-from vllm.v1.core.spf.controller import (
-    PrefetchHint,
-    SPFController,
-)
-from vllm.v1.core.spf.scorer import (
-    CandidateFeatures,
-    LearnedScorer,
-    SessionAwareScorer,
-)
+from vllm.v1.core.spf.controller import PrefetchHint, SPFController
+from vllm.v1.core.spf.scorer import (CandidateFeatures, LearnedScorer,
+                                     SessionAwareScorer)
 
 
 def _make_config(**overrides) -> SPFConfig:
@@ -101,13 +93,11 @@ class TestCandidateFiltering:
         )
         prefetched_hashes = {h.prefix_hash for h in hints}
         assert "hash_new" in prefetched_hashes
-        # old_session was active at step 0, now at step 5, lookahead=2 → cutoff=3
+        # old_session active at step 0, now step 5, lookahead=2 → cutoff=3
         assert "hash_old" not in prefetched_hashes
 
     def test_multiple_sessions_generate_candidates(self):
-        ctrl = _make_controller(
-            max_prefetch_blocks=100, prefetch_fraction=1.0
-        )
+        ctrl = _make_controller(max_prefetch_blocks=100, prefetch_fraction=1.0)
         ctrl.observe_request("s1", "hash_A")
         ctrl.observe_request("s2", "hash_B")
         hints = ctrl.step(
@@ -179,7 +169,8 @@ class TestBudgetGating:
 
         hints = ctrl.step(
             free_gpu_blocks=100,
-            resident_prefixes={f"hash_{i}" for i in range(5)},
+            resident_prefixes={f"hash_{i}"
+                               for i in range(5)},
         )
         total_blocks = sum(h.num_blocks for h in hints)
         assert total_blocks <= 2
@@ -195,7 +186,8 @@ class TestBudgetGating:
         # 10 free blocks * 0.10 = 1 block budget.
         hints = ctrl.step(
             free_gpu_blocks=10,
-            resident_prefixes={f"hash_{i}" for i in range(20)},
+            resident_prefixes={f"hash_{i}"
+                               for i in range(20)},
         )
         total_blocks = sum(h.num_blocks for h in hints)
         assert total_blocks <= 1
@@ -208,14 +200,13 @@ class TestBudgetGating:
 
     def test_budget_is_min_of_max_and_fraction(self):
         # max=3, fraction=1.0, free=10 → budget=3
-        ctrl = _make_controller(
-            max_prefetch_blocks=3, prefetch_fraction=1.0
-        )
+        ctrl = _make_controller(max_prefetch_blocks=3, prefetch_fraction=1.0)
         for i in range(10):
             ctrl.observe_request("s1", f"h{i}")
         hints = ctrl.step(
             free_gpu_blocks=10,
-            resident_prefixes={f"h{i}" for i in range(10)},
+            resident_prefixes={f"h{i}"
+                               for i in range(10)},
         )
         assert sum(h.num_blocks for h in hints) <= 3
 
@@ -228,21 +219,17 @@ class TestCausalBehavior:
 
     def test_observe_before_step(self):
         """Observations after step() don't affect current hints."""
-        ctrl = _make_controller(
-            max_prefetch_blocks=100, prefetch_fraction=1.0
-        )
+        ctrl = _make_controller(max_prefetch_blocks=100, prefetch_fraction=1.0)
         ctrl.observe_request("s1", "hash_A")
-        hints_before = ctrl.step(
-            free_gpu_blocks=100, resident_prefixes={"hash_A", "hash_B"}
-        )
+        hints_before = ctrl.step(free_gpu_blocks=100,
+                                 resident_prefixes={"hash_A", "hash_B"})
         # hash_B was never observed, so it should not be in hints.
         assert all(h.prefix_hash != "hash_B" for h in hints_before)
 
         # Now observe hash_B and step again.
         ctrl.observe_request("s1", "hash_B")
-        hints_after = ctrl.step(
-            free_gpu_blocks=100, resident_prefixes={"hash_A", "hash_B"}
-        )
+        hints_after = ctrl.step(free_gpu_blocks=100,
+                                resident_prefixes={"hash_A", "hash_B"})
         assert any(h.prefix_hash == "hash_B" for h in hints_after)
 
     def test_step_count_increments(self):
@@ -275,15 +262,12 @@ class TestCausalBehavior:
 
 
 class TestMetrics:
+
     def test_metrics_record_candidates_and_issued(self):
-        ctrl = _make_controller(
-            max_prefetch_blocks=100, prefetch_fraction=1.0
-        )
+        ctrl = _make_controller(max_prefetch_blocks=100, prefetch_fraction=1.0)
         ctrl.observe_request("s1", "h1")
         ctrl.observe_request("s1", "h2")
-        ctrl.step(
-            free_gpu_blocks=100, resident_prefixes={"h1", "h2"}
-        )
+        ctrl.step(free_gpu_blocks=100, resident_prefixes={"h1", "h2"})
         assert ctrl._metrics._candidates_scored >= 2
         assert ctrl._metrics._prefetch_issued >= 2
 
@@ -305,40 +289,57 @@ class TestMetrics:
 
 
 class TestSessionAwareScorer:
+
     def test_recent_prefix_scores_higher(self):
         scorer = SessionAwareScorer()
         recent = CandidateFeatures(
-            recency=1.0, log_frequency=1.0,
-            session_frequency=1.0, prefix_depth=1.0, last_access_gap=1.0,
+            recency=1.0,
+            log_frequency=1.0,
+            session_frequency=1.0,
+            prefix_depth=1.0,
+            last_access_gap=1.0,
         )
         stale = CandidateFeatures(
-            recency=100.0, log_frequency=1.0,
-            session_frequency=1.0, prefix_depth=1.0, last_access_gap=100.0,
+            recency=100.0,
+            log_frequency=1.0,
+            session_frequency=1.0,
+            prefix_depth=1.0,
+            last_access_gap=100.0,
         )
         assert scorer.score(recent) > scorer.score(stale)
 
     def test_frequent_prefix_scores_higher(self):
         scorer = SessionAwareScorer()
         freq = CandidateFeatures(
-            recency=1.0, log_frequency=math.log1p(100),
-            session_frequency=1.0, prefix_depth=1.0, last_access_gap=1.0,
+            recency=1.0,
+            log_frequency=math.log1p(100),
+            session_frequency=1.0,
+            prefix_depth=1.0,
+            last_access_gap=1.0,
         )
         rare = CandidateFeatures(
-            recency=1.0, log_frequency=math.log1p(1),
-            session_frequency=1.0, prefix_depth=1.0, last_access_gap=1.0,
+            recency=1.0,
+            log_frequency=math.log1p(1),
+            session_frequency=1.0,
+            prefix_depth=1.0,
+            last_access_gap=1.0,
         )
         assert scorer.score(freq) > scorer.score(rare)
 
     def test_score_is_non_negative(self):
         scorer = SessionAwareScorer()
         features = CandidateFeatures(
-            recency=0.0, log_frequency=0.0,
-            session_frequency=0.0, prefix_depth=0.0, last_access_gap=0.0,
+            recency=0.0,
+            log_frequency=0.0,
+            session_frequency=0.0,
+            prefix_depth=0.0,
+            last_access_gap=0.0,
         )
         assert scorer.score(features) >= 0.0
 
 
 class TestLearnedScorer:
+
     def test_loads_and_scores(self):
         weights = {
             "recency": -0.5,
@@ -348,16 +349,19 @@ class TestLearnedScorer:
             "last_access_gap": -0.2,
             "intercept": 0.0,
         }
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".json", delete=False
-        ) as f:
+        with tempfile.NamedTemporaryFile(mode="w",
+                                         suffix=".json",
+                                         delete=False) as f:
             json.dump(weights, f)
             path = f.name
 
         scorer = LearnedScorer(path)
         features = CandidateFeatures(
-            recency=1.0, log_frequency=2.0,
-            session_frequency=3.0, prefix_depth=1.0, last_access_gap=1.0,
+            recency=1.0,
+            log_frequency=2.0,
+            session_frequency=3.0,
+            prefix_depth=1.0,
+            last_access_gap=1.0,
         )
         score = scorer.score(features)
         assert 0.0 <= score <= 1.0  # sigmoid output
@@ -371,16 +375,19 @@ class TestLearnedScorer:
             "last_access_gap": 0.0,
             "intercept": 0.0,
         }
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".json", delete=False
-        ) as f:
+        with tempfile.NamedTemporaryFile(mode="w",
+                                         suffix=".json",
+                                         delete=False) as f:
             json.dump(weights, f)
             path = f.name
 
         scorer = LearnedScorer(path)
         features = CandidateFeatures(
-            recency=0.0, log_frequency=0.0,
-            session_frequency=0.0, prefix_depth=0.0, last_access_gap=0.0,
+            recency=0.0,
+            log_frequency=0.0,
+            session_frequency=0.0,
+            prefix_depth=0.0,
+            last_access_gap=0.0,
         )
         # All zeros → sigmoid(0) = 0.5
         assert abs(scorer.score(features) - 0.5) < 1e-6
@@ -390,6 +397,7 @@ class TestLearnedScorer:
 
 
 class TestConfig:
+
     def test_from_env_defaults(self, monkeypatch):
         # Clear all SPF env vars.
         for key in list(vars(SPFConfig()).keys()):
@@ -416,10 +424,9 @@ class TestConfig:
 
 
 class TestPrefetchHint:
+
     def test_hint_fields(self):
-        hint = PrefetchHint(
-            prefix_hash="abc", session_id="s1", num_blocks=4
-        )
+        hint = PrefetchHint(prefix_hash="abc", session_id="s1", num_blocks=4)
         assert hint.prefix_hash == "abc"
         assert hint.session_id == "s1"
         assert hint.num_blocks == 4
@@ -457,8 +464,10 @@ class TestControllerIntegration:
         hints = ctrl.step(
             free_gpu_blocks=20,
             resident_prefixes={
-                "prefix_A", "prefix_AB",
-                "prefix_D", "prefix_DE",
+                "prefix_A",
+                "prefix_AB",
+                "prefix_D",
+                "prefix_DE",
             },
         )
         # Should include candidates from both sessions.
@@ -470,8 +479,11 @@ class TestControllerIntegration:
         hints = ctrl.step(
             free_gpu_blocks=20,
             resident_prefixes={
-                "prefix_A", "prefix_AB", "prefix_AC",
-                "prefix_D", "prefix_DE",
+                "prefix_A",
+                "prefix_AB",
+                "prefix_AC",
+                "prefix_D",
+                "prefix_DE",
             },
         )
         # Budget = min(10, 20*0.5) = 10 blocks.

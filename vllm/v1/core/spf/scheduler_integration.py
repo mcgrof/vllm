@@ -37,7 +37,7 @@ def _block_hash_to_str(bh: bytes) -> str:
     return bh.hex()
 
 
-def _derive_session_id(request: "Request") -> str:
+def _derive_session_id(request: Request) -> str:
     """Derive a session identifier from a request.
 
     Strategy: hash the first block's worth of prompt tokens.  Requests
@@ -49,7 +49,7 @@ def _derive_session_id(request: "Request") -> str:
     prompt = getattr(request, "prompt_token_ids", None)
     if prompt and len(prompt) >= 16:
         # Use first 128 tokens (or all if shorter) as fingerprint.
-        prefix_tokens = prompt[: min(128, len(prompt))]
+        prefix_tokens = prompt[:min(128, len(prompt))]
         raw = ",".join(str(t) for t in prefix_tokens).encode("utf-8")
         return hashlib.sha256(raw).hexdigest()[:16]
     return request.request_id
@@ -65,7 +65,7 @@ _DEFAULT_QUERY_TAIL_TOKENS = 256
 
 
 def _derive_query_hash(
-    request: "Request",
+    request: Request,
     *,
     tail_tokens: int = _DEFAULT_QUERY_TAIL_TOKENS,
 ) -> str | None:
@@ -113,7 +113,7 @@ class SPFStepResult:
 
 @dataclass
 class SPFIntegrationMetrics:
-    """Accumulated integration-level metrics (separate from controller metrics)."""
+    """Accumulated integration metrics (separate from controller metrics)."""
     total_observe_calls: int = 0
     total_step_calls: int = 0
     total_hints_issued: int = 0
@@ -177,7 +177,7 @@ class SPFSchedulerBridge:
     def enabled(self) -> bool:
         return self.controller is not None
 
-    def observe_request(self, request: "Request") -> None:
+    def observe_request(self, request: Request) -> None:
         """Called when a new request is added to the scheduler."""
         if self.controller is None:
             return
@@ -192,7 +192,8 @@ class SPFSchedulerBridge:
         if request.block_hashes:
             prefix_hash = _block_hash_to_str(request.block_hashes[0])
         elif request.prompt_token_ids:
-            raw = ",".join(str(t) for t in request.prompt_token_ids[:64]).encode()
+            raw = ",".join(str(t)
+                           for t in request.prompt_token_ids[:64]).encode()
             prefix_hash = hashlib.sha256(raw).hexdigest()[:16]
         else:
             return
@@ -206,7 +207,7 @@ class SPFSchedulerBridge:
 
         self.controller.observe_request(session_id, prefix_hash, query_hash)
 
-    def step(self, kv_cache_manager: "KVCacheManager") -> SPFStepResult:
+    def step(self, kv_cache_manager: KVCacheManager) -> SPFStepResult:
         """Called once per scheduling round after scheduling decisions.
 
         Generates prefetch hints and touches the corresponding blocks
@@ -238,8 +239,7 @@ class SPFSchedulerBridge:
                 if isinstance(bh_with_gid, bytes) and len(bh_with_gid) > 4:
                     block_hash_bytes = bh_with_gid[:-4]
                     self._cached_resident_prefixes.add(
-                        _block_hash_to_str(block_hash_bytes)
-                    )
+                        _block_hash_to_str(block_hash_bytes))
             self._resident_rebuild_step = self._step_count
 
         resident_prefixes = self._cached_resident_prefixes
@@ -250,7 +250,8 @@ class SPFSchedulerBridge:
             # Cache is >90% full — check eviction candidate.
             try:
                 tail = block_pool.free_block_queue.tail
-                if tail is not None and hasattr(tail, 'block_hash') and tail.block_hash is not None:
+                if tail is not None and hasattr(
+                        tail, 'block_hash') and tail.block_hash is not None:
                     gpu_lru_victim = _block_hash_to_str(tail.block_hash)
             except (AttributeError, IndexError):
                 pass  # free queue impl may vary
@@ -276,7 +277,8 @@ class SPFSchedulerBridge:
         # Periodic logging.
         if self._step_count % 50 == 0:
             summary = self.metrics.flush_summary(self._step_count)
-            logger.info("SPF integration step=%d summary=%s", self._step_count, summary)
+            logger.info("SPF integration step=%d summary=%s", self._step_count,
+                        summary)
 
         return SPFStepResult(
             hints_issued=len(hints),
@@ -287,8 +289,8 @@ class SPFSchedulerBridge:
     def _touch_hint_blocks(
         self,
         hint: PrefetchHint,
-        block_pool: "BlockPool",
-        kv_cache_manager: "KVCacheManager",
+        block_pool: BlockPool,
+        kv_cache_manager: KVCacheManager,
     ) -> None:
         """Touch blocks in the prefix cache that match a prefetch hint.
 
@@ -359,13 +361,20 @@ class SPFSchedulerBridge:
     def get_integration_stats(self) -> dict:
         """Return current integration stats for external consumption."""
         return {
-            "spf_enabled": self.enabled,
-            "observe_calls": self.metrics.total_observe_calls,
-            "step_calls": self.metrics.total_step_calls,
-            "hints_issued": self.metrics.total_hints_issued,
-            "blocks_touched": self.metrics.total_blocks_touched,
-            "ttft_samples": self.metrics.total_ttft_samples,
-            "ttft_mean_ms": round(
-                self.metrics.ttft_sum_ms / max(1, self.metrics.total_ttft_samples), 3
-            ),
+            "spf_enabled":
+            self.enabled,
+            "observe_calls":
+            self.metrics.total_observe_calls,
+            "step_calls":
+            self.metrics.total_step_calls,
+            "hints_issued":
+            self.metrics.total_hints_issued,
+            "blocks_touched":
+            self.metrics.total_blocks_touched,
+            "ttft_samples":
+            self.metrics.total_ttft_samples,
+            "ttft_mean_ms":
+            round(
+                self.metrics.ttft_sum_ms /
+                max(1, self.metrics.total_ttft_samples), 3),
         }

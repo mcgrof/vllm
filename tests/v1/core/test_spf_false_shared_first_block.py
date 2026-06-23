@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Diagnostic test for the first-block-only identity bug.
 
 Scenario:
@@ -20,12 +21,9 @@ identity refactor.
 """
 from __future__ import annotations
 
-from vllm.v1.core.spf.resource import (
-    DEFAULT_BLOCK_SIZE,
-    ResourceId,
-    hash_prefix_tokens,
-    legacy_first_block_hash,
-)
+from vllm.v1.core.spf.resource import (DEFAULT_BLOCK_SIZE, ResourceId,
+                                       hash_prefix_tokens,
+                                       legacy_first_block_hash)
 
 # A realistic system-prompt-sized shared prefix. 128 tokens is a
 # common chat-template preamble size. The test does not depend on
@@ -36,8 +34,7 @@ SHARED_PREFIX = list(range(128))
 def _divergent_prompts(n: int, tail_base: int) -> list[list[int]]:
     """Build ``n`` prompts sharing the same prefix + distinct tails."""
     return [
-        SHARED_PREFIX + [tail_base + i, tail_base + i + 1,
-                         tail_base + i + 2]
+        SHARED_PREFIX + [tail_base + i, tail_base + i + 1, tail_base + i + 2]
         for i in range(n)
     ]
 
@@ -45,6 +42,7 @@ def _divergent_prompts(n: int, tail_base: int) -> list[list[int]]:
 # ---------------------------------------------------------------------------
 # Diagnosis: what goes wrong under the legacy identity
 # ---------------------------------------------------------------------------
+
 
 class TestLegacyIdentityCollapses:
     """Show that the legacy first-block-only hash collapses many
@@ -60,8 +58,7 @@ class TestLegacyIdentityCollapses:
         # All 50 collapse to the same legacy id — this is the bug.
         assert len(legacy_ids) == 1, (
             f"legacy identity should collapse all {len(prompts)} "
-            f"prompts; got {len(legacy_ids)} distinct ids"
-        )
+            f"prompts; got {len(legacy_ids)} distinct ids")
 
     def test_legacy_does_not_distinguish_divergent_tails(self):
         """Even a single-token divergence after the first block
@@ -69,15 +66,14 @@ class TestLegacyIdentityCollapses:
         a = SHARED_PREFIX + [1]
         b = SHARED_PREFIX + [2]
         assert legacy_first_block_hash(
-            a, block_size=DEFAULT_BLOCK_SIZE
-        ) == legacy_first_block_hash(
-            b, block_size=DEFAULT_BLOCK_SIZE
-        )
+            a, block_size=DEFAULT_BLOCK_SIZE) == legacy_first_block_hash(
+                b, block_size=DEFAULT_BLOCK_SIZE)
 
 
 # ---------------------------------------------------------------------------
 # Fix: the honest identity distinguishes them
 # ---------------------------------------------------------------------------
+
 
 class TestHonestIdentityDistinguishes:
     """Show that :func:`hash_prefix_tokens` — the function the new
@@ -89,8 +85,7 @@ class TestHonestIdentityDistinguishes:
         honest_ids = {hash_prefix_tokens(p) for p in prompts}
         assert len(honest_ids) == 50, (
             f"honest identity should give {len(prompts)} distinct "
-            f"resource_ids; got {len(honest_ids)}"
-        )
+            f"resource_ids; got {len(honest_ids)}")
 
     def test_honest_distinguishes_single_token_divergence(self):
         a = SHARED_PREFIX + [1]
@@ -123,7 +118,9 @@ class TestHonestIdentityDistinguishes:
 # Side-by-side: the honest identity and the legacy field coexist
 # ---------------------------------------------------------------------------
 
+
 class TestCoexistence:
+
     def test_resource_id_struct_carries_both(self):
         p = SHARED_PREFIX + [42]
         r = ResourceId.for_prefix(p, session_id="s")

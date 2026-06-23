@@ -27,12 +27,8 @@ import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
-from vllm.v1.core.spf.utility import (
-    UtilityBreakdown,
-    UtilityConstants,
-    UtilityFeatures,
-    expected_utility,
-)
+from vllm.v1.core.spf.utility import (UtilityBreakdown, UtilityConstants,
+                                      UtilityFeatures, expected_utility)
 
 
 @dataclass
@@ -86,12 +82,9 @@ class SessionAwareScorer(Scorer):
     def score(self, features: CandidateFeatures) -> float:
         # Recency: prefer recently accessed (invert gap).
         recency_score = 1.0 / (1.0 + features.recency)
-        return (
-            self._rw * recency_score
-            + self._fw * features.log_frequency
-            + self._sw * features.session_frequency
-            + self._dw * features.prefix_depth
-        )
+        return (self._rw * recency_score + self._fw * features.log_frequency +
+                self._sw * features.session_frequency +
+                self._dw * features.prefix_depth)
 
 
 class LearnedScorer(Scorer):
@@ -123,9 +116,8 @@ class LearnedScorer(Scorer):
             features.prefix_depth,
             features.last_access_gap,
         ]
-        logit = self._intercept + sum(
-            w * v for w, v in zip(self._weights, values)
-        )
+        logit = self._intercept + sum(w * v
+                                      for w, v in zip(self._weights, values))
         return 1.0 / (1.0 + math.exp(-logit))
 
 
@@ -159,8 +151,7 @@ class ExpectedUtilityScorer:
         return self._mode
 
     def score(self, features: UtilityFeatures) -> float:
-        return expected_utility(
-            features, self._mode, self._consts).total
+        return expected_utility(features, self._mode, self._consts).total
 
     def score_with_breakdown(
         self,
@@ -172,6 +163,7 @@ class ExpectedUtilityScorer:
 # ---------------------------------------------------------------------------
 # Cooldown tracker
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class CooldownTracker:

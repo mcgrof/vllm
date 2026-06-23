@@ -11,67 +11,34 @@ backends, KV cache tensors, or the forward path.
 """
 from __future__ import annotations
 
-from vllm.v1.core.spf.config import (
-    MODE_PREFETCH,
-    MODE_RETENTION,
-    VALID_MODES,
-    SPFConfig,
-)
+from vllm.v1.core.spf.config import (MODE_PREFETCH, MODE_RETENTION,
+                                     VALID_MODES, SPFConfig)
 from vllm.v1.core.spf.controller import SPFController
-from vllm.v1.core.spf.metrics import (
-    PrefetchMetrics,
-    RetentionMetrics,
-    SPFMetrics,
-    SPFStepMetrics,
-)
-from vllm.v1.core.spf.resource import (
-    DEFAULT_BLOCK_SIZE,
-    ResourceCandidate,
-    ResourceId,
-    ResourceScope,
-    hash_prefix_tokens,
-)
-from vllm.v1.core.spf.scorer import (
-    CandidateFeatures,
-    CooldownTracker,
-    ExpectedUtilityScorer,
-    LearnedScorer,
-    Scorer,
-    SessionAwareScorer,
-)
+from vllm.v1.core.spf.integrations import (BlockPool, FakeBlockPool,
+                                           FakePrefetchBackend,
+                                           PrefetchBackend,
+                                           PrefetchIntegration,
+                                           PromotionHandle,
+                                           RetentionIntegration)
+from vllm.v1.core.spf.metrics import (PrefetchMetrics, RetentionMetrics,
+                                      SPFMetrics, SPFStepMetrics)
+from vllm.v1.core.spf.resource import (DEFAULT_BLOCK_SIZE, ResourceCandidate,
+                                       ResourceId, ResourceScope,
+                                       hash_prefix_tokens)
+from vllm.v1.core.spf.scorer import (CandidateFeatures, CooldownTracker,
+                                     ExpectedUtilityScorer, LearnedScorer,
+                                     Scorer, SessionAwareScorer)
+from vllm.v1.core.spf.shadow_baseline import ShadowBaseline, ShadowMetrics
 from vllm.v1.core.spf.transitions import TransitionTable
-from vllm.v1.core.spf.utility import (
-    UtilityBreakdown,
-    UtilityConstants,
-    UtilityFeatures,
-    expected_utility,
-    probability_of_use,
-)
-from vllm.v1.core.spf.workloads import (
-    WORKLOADS,
-    WorkloadEvent,
-    batched_burst,
-    conversation_tree,
-    false_shared_first_block,
-    long_doc_qa,
-    mixed_session_interleave,
-    random_no_reuse,
-    shared_prefix,
-    shuffled_control,
-)
-from vllm.v1.core.spf.integrations import (
-    BlockPool,
-    FakeBlockPool,
-    FakePrefetchBackend,
-    PrefetchBackend,
-    PrefetchIntegration,
-    PromotionHandle,
-    RetentionIntegration,
-)
-from vllm.v1.core.spf.shadow_baseline import (
-    ShadowBaseline,
-    ShadowMetrics,
-)
+from vllm.v1.core.spf.utility import (UtilityBreakdown, UtilityConstants,
+                                      UtilityFeatures, expected_utility,
+                                      probability_of_use)
+from vllm.v1.core.spf.workloads import (WORKLOADS, WorkloadEvent,
+                                        batched_burst, conversation_tree,
+                                        false_shared_first_block, long_doc_qa,
+                                        mixed_session_interleave,
+                                        random_no_reuse, shared_prefix,
+                                        shuffled_control)
 
 __all__ = [
     "get_spf_controller",

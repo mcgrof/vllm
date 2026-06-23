@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for the SPF transition model.
 
 Covers the contract from ``transitions.py``:
@@ -19,12 +20,13 @@ import math
 
 from vllm.v1.core.spf.transitions import TransitionTable
 
-
 # ---------------------------------------------------------------------------
 # Causality
 # ---------------------------------------------------------------------------
 
+
 class TestCausality:
+
     def test_single_access_records_no_transition(self):
         tt = TransitionTable()
         tt.record_access("s", "A")
@@ -60,7 +62,9 @@ class TestCausality:
 # Per-session isolation
 # ---------------------------------------------------------------------------
 
+
 class TestSessionIsolation:
+
     def test_two_sessions_do_not_share(self):
         tt = TransitionTable()
         tt.record_access("sA", "X")
@@ -87,7 +91,9 @@ class TestSessionIsolation:
 # Probability normalisation
 # ---------------------------------------------------------------------------
 
+
 class TestNormalization:
+
     def test_single_destination_probability_one(self):
         tt = TransitionTable()
         tt.record_transition("s", "A", "B")
@@ -128,7 +134,9 @@ class TestNormalization:
 # Unseen / no-smoothing
 # ---------------------------------------------------------------------------
 
+
 class TestNoSmoothing:
+
     def test_unseen_transition_returns_zero(self):
         tt = TransitionTable()
         tt.record_transition("s", "A", "B")
@@ -143,7 +151,9 @@ class TestNoSmoothing:
 # record_access self-loops and reset
 # ---------------------------------------------------------------------------
 
+
 class TestAccessSemantics:
+
     def test_self_loop_is_recorded(self):
         """Two consecutive accesses to the same prefix record a
         self-transition. Consistent with how session_history treats
@@ -168,7 +178,9 @@ class TestAccessSemantics:
 # get the outgoing distribution and the counts for robustness.
 # ---------------------------------------------------------------------------
 
+
 class TestScorerContract:
+
     def test_scorer_can_read_probability_and_count(self):
         tt = TransitionTable()
         for _ in range(10):

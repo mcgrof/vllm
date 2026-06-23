@@ -37,12 +37,12 @@ Scope (what this provider does NOT do):
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 
-from vllm.v1.core.spf.manifest import BlockManifest, BlockManifestProvider
+from vllm.v1.core.spf.manifest import BlockManifest
 
 logger = logging.getLogger("vllm.spf.providers.cartridge_kri")
 
@@ -130,24 +130,18 @@ class CartridgeKRIProvider:
         path = Path(prior_path)
         prior = torch.load(str(path), map_location="cpu", weights_only=False)
         if not isinstance(prior, dict):
-            raise ValueError(
-                f"Routing prior at {path} is not a dict "
-                f"(got {type(prior).__name__})"
-            )
+            raise ValueError(f"Routing prior at {path} is not a dict "
+                             f"(got {type(prior).__name__})")
         # Validate that the dispatch path will actually find
         # something. The manifest builder accepts
         # kmeans_blocks_perK, legacy kmeans_blocks, or a continuous
         # block_affinities tensor (KRI-D-kv-sum style — top-K is
         # computed on the fly via torch.topk).
-        if (
-            "kmeans_blocks_perK" not in prior
-            and "kmeans_blocks" not in prior
-            and prior.get("block_affinities") is None
-        ):
+        if ("kmeans_blocks_perK" not in prior and "kmeans_blocks" not in prior
+                and prior.get("block_affinities") is None):
             raise ValueError(
                 f"Routing prior at {path} has neither "
-                f"kmeans_blocks_perK, kmeans_blocks, nor block_affinities"
-            )
+                f"kmeans_blocks_perK, kmeans_blocks, nor block_affinities")
         entry = _CartridgeKRIEntry(
             prefix_hash=prefix_hash,
             query_hash=query_hash,
@@ -156,13 +150,9 @@ class CartridgeKRIProvider:
             prior_type=prior_type,
         )
         self._store[(prefix_hash, query_hash)] = entry
-        per_k_keys = sorted(
-            (prior.get("kmeans_blocks_perK") or {}).keys()
-        )
-        legacy_len = (
-            len(prior["kmeans_blocks"])
-            if "kmeans_blocks" in prior else 0
-        )
+        per_k_keys = sorted((prior.get("kmeans_blocks_perK") or {}).keys())
+        legacy_len = (len(prior["kmeans_blocks"])
+                      if "kmeans_blocks" in prior else 0)
         logger.info(
             "CartridgeKRI registered prefix=%s query=%s type=%s "
             "from %s (per-K=%s, legacy=%d, num_blocks=%s)",
@@ -239,6 +229,8 @@ class CartridgeKRIProvider:
         """Return a small dict summarizing what's loaded — used in logs."""
         return {
             "num_priors": len(self._store),
-            "prefix_hashes": sorted({k[0] for k in self._store}),
-            "prior_types": sorted({e.prior_type for e in self._store.values()}),
+            "prefix_hashes": sorted({k[0]
+                                     for k in self._store}),
+            "prior_types": sorted({e.prior_type
+                                   for e in self._store.values()}),
         }

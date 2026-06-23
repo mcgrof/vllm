@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Phase-1 honest-mode tests for SPF ResourceId.
 
 Covers the contract the module docstring lays out:
@@ -19,26 +20,21 @@ from __future__ import annotations
 
 import pytest
 
-from vllm.v1.core.spf.resource import (
-    DEFAULT_BLOCK_SIZE,
-    ResourceCandidate,
-    ResourceId,
-    ResourceScope,
-    hash_prefix_tokens,
-    legacy_first_block_hash,
-)
-
+from vllm.v1.core.spf.resource import (DEFAULT_BLOCK_SIZE, ResourceCandidate,
+                                       ResourceId, ResourceScope,
+                                       hash_prefix_tokens,
+                                       legacy_first_block_hash)
 
 # ---------------------------------------------------------------------------
 # Identity stability
 # ---------------------------------------------------------------------------
 
+
 class TestIdentityStability:
+
     def test_same_tokens_same_id(self):
-        a = ResourceId.for_prefix(
-            [1, 2, 3, 4, 5, 6, 7, 8], session_id="s0")
-        b = ResourceId.for_prefix(
-            [1, 2, 3, 4, 5, 6, 7, 8], session_id="s0")
+        a = ResourceId.for_prefix([1, 2, 3, 4, 5, 6, 7, 8], session_id="s0")
+        b = ResourceId.for_prefix([1, 2, 3, 4, 5, 6, 7, 8], session_id="s0")
         assert a.resource_id == b.resource_id
 
     def test_different_sessions_same_resource_hash(self):
@@ -47,10 +43,8 @@ class TestIdentityStability:
         The resource IS the shared prefix; the session is metadata.
         Future session-scoped resources live at a different scope.
         """
-        a = ResourceId.for_prefix(
-            [9, 9, 9], session_id="alpha")
-        b = ResourceId.for_prefix(
-            [9, 9, 9], session_id="beta")
+        a = ResourceId.for_prefix([9, 9, 9], session_id="alpha")
+        b = ResourceId.for_prefix([9, 9, 9], session_id="beta")
         assert a.resource_id == b.resource_id
         assert a.session_id != b.session_id
 
@@ -66,7 +60,9 @@ class TestIdentityStability:
 # NOT first-block-only — the load-bearing correctness test
 # ---------------------------------------------------------------------------
 
+
 class TestNotFirstBlockOnly:
+
     def test_same_first_block_different_tail_yields_different_id(self):
         """Two prompts sharing a first block but diverging after MUST
         produce different resource_ids."""
@@ -83,8 +79,7 @@ class TestNotFirstBlockOnly:
         # But the honest resource_id is DIFFERENT.
         assert a.resource_id != b.resource_id, (
             "resource_id collapses prompts sharing a first block — "
-            "this is the first-block-only bug"
-        )
+            "this is the first-block-only bug")
 
     def test_128_token_shared_prefix_still_distinguishes(self):
         """A realistic system-prompt scenario: 128 tokens of shared
@@ -112,7 +107,9 @@ class TestNotFirstBlockOnly:
 # Validation
 # ---------------------------------------------------------------------------
 
+
 class TestValidation:
+
     def test_num_blocks_must_be_positive(self):
         with pytest.raises(ValueError, match="num_blocks"):
             ResourceId(
@@ -159,16 +156,19 @@ class TestValidation:
 
     def test_for_prefix_block_count_ceiling(self):
         """17 tokens at block_size=16 should count as 2 blocks."""
-        r = ResourceId.for_prefix(
-            list(range(17)), session_id="s", block_size=16)
+        r = ResourceId.for_prefix(list(range(17)),
+                                  session_id="s",
+                                  block_size=16)
         assert r.num_blocks == 2
 
-        r = ResourceId.for_prefix(
-            list(range(16)), session_id="s", block_size=16)
+        r = ResourceId.for_prefix(list(range(16)),
+                                  session_id="s",
+                                  block_size=16)
         assert r.num_blocks == 1
 
-        r = ResourceId.for_prefix(
-            list(range(32)), session_id="s", block_size=16)
+        r = ResourceId.for_prefix(list(range(32)),
+                                  session_id="s",
+                                  block_size=16)
         assert r.num_blocks == 2
 
 
@@ -176,21 +176,23 @@ class TestValidation:
 # Legacy first_block_hash carry
 # ---------------------------------------------------------------------------
 
+
 class TestLegacyCarry:
+
     def test_first_block_hash_present_on_struct(self):
-        r = ResourceId.for_prefix(
-            list(range(32)), session_id="s", block_size=16)
+        r = ResourceId.for_prefix(list(range(32)),
+                                  session_id="s",
+                                  block_size=16)
         assert r.first_block_hash is not None
         # And it matches the bare helper.
-        assert r.first_block_hash == legacy_first_block_hash(
-            list(range(32)), block_size=16)
+        assert r.first_block_hash == legacy_first_block_hash(list(range(32)),
+                                                             block_size=16)
 
     def test_first_block_hash_differs_from_resource_id(self):
         """The two hashes have different domains by construction:
         the legacy one has a distinguishing prefix to prevent any
         accidental comparison-equals-true collision."""
-        r = ResourceId.for_prefix(
-            list(range(16)), session_id="s")
+        r = ResourceId.for_prefix(list(range(16)), session_id="s")
         assert r.first_block_hash != r.resource_id
 
 
@@ -198,10 +200,13 @@ class TestLegacyCarry:
 # ResourceCandidate shape
 # ---------------------------------------------------------------------------
 
+
 class TestResourceCandidate:
+
     def test_candidate_exposes_proxy_properties(self):
-        rid = ResourceId.for_prefix(
-            list(range(10)), session_id="sA", bytes_per_token=4)
+        rid = ResourceId.for_prefix(list(range(10)),
+                                    session_id="sA",
+                                    bytes_per_token=4)
         cand = ResourceCandidate(resource=rid)
         assert cand.resource_id == rid.resource_id
         assert cand.session_id == "sA"
@@ -210,8 +215,7 @@ class TestResourceCandidate:
         assert cand.scope is ResourceScope.PREFIX
 
     def test_candidate_defaults(self):
-        rid = ResourceId.for_prefix(
-            list(range(10)), session_id="sA")
+        rid = ResourceId.for_prefix(list(range(10)), session_id="sA")
         cand = ResourceCandidate(resource=rid)
         assert cand.score == 0.0
         assert cand.last_query_hash is None

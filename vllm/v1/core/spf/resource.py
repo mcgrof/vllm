@@ -39,7 +39,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
-
 # Block size we hash token sequences into for prefix identities.
 # 16 matches vLLM's default KV block size so a ResourceId covers an
 # integer number of paged blocks.
@@ -122,19 +121,14 @@ class ResourceId:
 
     def __post_init__(self):
         if self.num_blocks <= 0:
-            raise ValueError(
-                f"num_blocks must be > 0, got {self.num_blocks}"
-            )
+            raise ValueError(f"num_blocks must be > 0, got {self.num_blocks}")
         if self.num_bytes < 0:
-            raise ValueError(
-                f"num_bytes must be >= 0, got {self.num_bytes}"
-            )
+            raise ValueError(f"num_bytes must be >= 0, got {self.num_bytes}")
         if not self.resource_id:
             raise ValueError("resource_id must be non-empty")
         if not isinstance(self.scope, ResourceScope):
             raise TypeError(
-                f"scope must be ResourceScope, got {type(self.scope)}"
-            )
+                f"scope must be ResourceScope, got {type(self.scope)}")
 
     @classmethod
     def for_prefix(
@@ -143,7 +137,7 @@ class ResourceId:
         session_id: str,
         block_size: int = DEFAULT_BLOCK_SIZE,
         bytes_per_token: int = 0,
-    ) -> "ResourceId":
+    ) -> ResourceId:
         """Build a PREFIX-scope ResourceId from a token sequence.
 
         ``num_blocks`` is computed by block-aligned ceiling of the
@@ -153,8 +147,7 @@ class ResourceId:
         not required for identity or scoring in phase 1.
         """
         if not token_ids:
-            raise ValueError(
-                "PREFIX resource requires at least one token")
+            raise ValueError("PREFIX resource requires at least one token")
         n = len(token_ids)
         nb = (n + block_size - 1) // block_size
         return cls(
@@ -163,8 +156,8 @@ class ResourceId:
             num_blocks=nb,
             num_bytes=bytes_per_token * n,
             session_id=session_id,
-            first_block_hash=legacy_first_block_hash(
-                token_ids, block_size=block_size),
+            first_block_hash=legacy_first_block_hash(token_ids,
+                                                     block_size=block_size),
         )
 
     @property

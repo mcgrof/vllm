@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for the SPF cooldown / suppression tracker.
 
 The cooldown exists so a resource that stays hot across many
@@ -10,12 +11,13 @@ from __future__ import annotations
 
 from vllm.v1.core.spf.scorer import CooldownTracker
 
-
 # ---------------------------------------------------------------------------
 # Basic semantics
 # ---------------------------------------------------------------------------
 
+
 class TestCooldownBasics:
+
     def test_unknown_resource_is_not_suppressed(self):
         c = CooldownTracker(period_steps=3)
         assert c.should_suppress("r", current_step=0) is False
@@ -51,7 +53,9 @@ class TestCooldownBasics:
 # The "don't re-hint every step" behaviour (the whole point)
 # ---------------------------------------------------------------------------
 
+
 class TestRepeatedSteps:
+
     def test_hot_resource_only_hinted_once_per_period(self):
         """Simulate a resource at the top of the ranking for 10
         consecutive steps. With cooldown=3 we should issue a hint
@@ -80,7 +84,9 @@ class TestRepeatedSteps:
 # Manual clearing (post-outcome use case)
 # ---------------------------------------------------------------------------
 
+
 class TestClearing:
+
     def test_clear_allows_immediate_reissue(self):
         c = CooldownTracker(period_steps=5)
         c.mark_issued("r", current_step=10)
@@ -105,7 +111,9 @@ class TestClearing:
 # Interaction with the mark/should-suppress ordering
 # ---------------------------------------------------------------------------
 
+
 class TestOrdering:
+
     def test_mark_before_should_suppress_in_same_step(self):
         """A caller that marks on step N and then checks on step N
         sees the resource as suppressed — i.e. mark takes effect

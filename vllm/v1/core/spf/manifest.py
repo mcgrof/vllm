@@ -45,7 +45,7 @@ Layering rules (do not violate):
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 
@@ -85,21 +85,15 @@ class BlockManifest:
         # Defensive checks — these are cheap and catch malformed
         # manifests at the scheduler boundary instead of letting them
         # poison the prefetch queue.
-        if self.K != len(self.block_indices):
-            raise ValueError(
-                f"BlockManifest K={self.K} disagrees with "
-                f"len(block_indices)={len(self.block_indices)}"
-            )
+        if len(self.block_indices) != self.K:
+            raise ValueError(f"BlockManifest K={self.K} disagrees with "
+                             f"len(block_indices)={len(self.block_indices)}")
         if self.total_blocks <= 0:
-            raise ValueError(
-                f"BlockManifest total_blocks must be positive, "
-                f"got {self.total_blocks}"
-            )
+            raise ValueError(f"BlockManifest total_blocks must be positive, "
+                             f"got {self.total_blocks}")
         if any(b < 0 or b >= self.total_blocks for b in self.block_indices):
-            raise ValueError(
-                f"BlockManifest block_indices out of range "
-                f"[0, {self.total_blocks}): {self.block_indices}"
-            )
+            raise ValueError(f"BlockManifest block_indices out of range "
+                             f"[0, {self.total_blocks}): {self.block_indices}")
 
     @property
     def savings_blocks(self) -> int:
@@ -121,7 +115,7 @@ class BlockManifest:
         K: int,
         prior_type: str | None = None,
         resource_id: str = "",
-    ) -> "BlockManifest | None":
+    ) -> BlockManifest | None:
         """Build a manifest from an on-disk KRI prior dict.
 
         Mirrors the dispatch logic in the routing-side cartridge
@@ -145,7 +139,7 @@ class BlockManifest:
             # connector dispatch in cartridge_connector.py — known to
             # be lossy compared to per-K priors but acceptable for
             # back-compat with older .pt files.
-            block_list = sorted(legacy[: min(K, len(legacy))])
+            block_list = sorted(legacy[:min(K, len(legacy))])
         elif affinities is not None:
             # Continuous-score prior (e.g. KRI-D-kv-sum): compute
             # top-K on the fly. block_affinities shape is

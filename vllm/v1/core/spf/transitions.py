@@ -118,7 +118,8 @@ class TransitionTable:
     ) -> int:
         """Raw count of a transition, 0 if never observed."""
         return self._counts.get(
-            (session_id, from_prefix), {},
+            (session_id, from_prefix),
+            {},
         ).get(to_prefix, 0)
 
     def total_from(
@@ -130,7 +131,7 @@ class TransitionTable:
         this session."""
         return self._totals.get((session_id, from_prefix), 0)
 
-    def current_prefix(self, session_id: str) -> "str | None":
+    def current_prefix(self, session_id: str) -> str | None:
         """The most recent prefix this session accessed, or None."""
         return self._last_prefix.get(session_id)
 
@@ -138,7 +139,7 @@ class TransitionTable:
         self,
         session_id: str,
         from_prefix: str,
-    ) -> "dict[str, float]":
+    ) -> dict[str, float]:
         """Return the probability distribution over next-prefixes
         for ``(session_id, from_prefix)``.
 

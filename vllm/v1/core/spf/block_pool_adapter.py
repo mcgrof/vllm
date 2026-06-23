@@ -82,7 +82,6 @@ if TYPE_CHECKING:
     from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_utils import KVCacheBlock
 
-
 Resolver = Callable[[str], "Optional[KVCacheBlock]"]
 """Type alias: resolves a SPF ``resource_id`` string to a vLLM
 :class:`KVCacheBlock` (or ``None`` if unknown). The mapping is
@@ -106,7 +105,7 @@ class LiveBlockPool:
 
     def __init__(
         self,
-        block_pool: "BlockPool",
+        block_pool: BlockPool,
         kv_cache_group_ids: list[int],
         resolver: Resolver,
     ):
@@ -222,6 +221,7 @@ class LiveBlockPool:
 # Resolver helpers
 # ---------------------------------------------------------------------------
 
+
 def make_token_hash_resolver(
     kv_cache_manager,  # type: ignore[no-untyped-def]
     kv_cache_group_id: int = 0,
@@ -238,9 +238,7 @@ def make_token_hash_resolver(
     write a custom resolver.
     """
     try:
-        from vllm.v1.core.kv_cache_utils import (
-            make_block_hash_with_group_id,
-        )
+        from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id
     except ImportError:
         make_block_hash_with_group_id = None  # type: ignore
 
@@ -257,13 +255,14 @@ def make_token_hash_resolver(
         if bh is None:
             return None
         return table.get_one_block(bh)
+
     return resolve
 
 
 def _parse_block_hash(
-    resource_id: str,
-    group_id: int,
-    make_bhgid,  # type: ignore[no-untyped-def]
+        resource_id: str,
+        group_id: int,
+        make_bhgid,  # type: ignore[no-untyped-def]
 ):
     """Best-effort parse of a SPF resource_id back to a vLLM
     BlockHashWithGroupId. Integration code that controls how
@@ -292,8 +291,7 @@ def _peek_lru_block_id(free_block_queue) -> Optional[int]:
     the head block directly). Returns ``None`` if the queue is
     empty or the API isn't recognised.
     """
-    for attr in ("free_list_head", "_free_list_head",
-                 "fake_free_list_head"):
+    for attr in ("free_list_head", "_free_list_head", "fake_free_list_head"):
         head = getattr(free_block_queue, attr, None)
         if head is None:
             continue

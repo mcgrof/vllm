@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Phase-4 integration tests: SPF prefetch mode ↔ fake LMCache backend.
 
 Covers SPF instruction item 18's prefetch scenarios:
@@ -23,24 +24,23 @@ from __future__ import annotations
 
 from vllm.v1.core.spf.config import MODE_PREFETCH, SPFConfig
 from vllm.v1.core.spf.controller import SPFController
-from vllm.v1.core.spf.integrations import (
-    FakePrefetchBackend,
-    PrefetchIntegration,
-)
+from vllm.v1.core.spf.integrations import (FakePrefetchBackend,
+                                           PrefetchIntegration)
 from vllm.v1.core.spf.resource import ResourceId
-
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _controller() -> SPFController:
-    return SPFController(SPFConfig(
-        enabled=True,
-        mode=MODE_PREFETCH,
-        metrics_interval=0,
-        cooldown_steps=0,
-    ))
+    return SPFController(
+        SPFConfig(
+            enabled=True,
+            mode=MODE_PREFETCH,
+            metrics_interval=0,
+            cooldown_steps=0,
+        ))
 
 
 def _resource(tail: int, session: str = "s0") -> ResourceId:
@@ -63,7 +63,9 @@ def _wire() -> tuple[SPFController, FakePrefetchBackend, PrefetchIntegration]:
 # 1. Happy path: promotion completes before arrival
 # ---------------------------------------------------------------------------
 
+
 class TestPrefetchHappyPath:
+
     def test_completed_before_arrival_is_used(self):
         c, backend, integ = _wire()
         r = _resource(1)
@@ -71,7 +73,8 @@ class TestPrefetchHappyPath:
         # t=100: hint issued.
         integ.apply_hint(r.resource_id, issued_at=100.0)
         # t=101: backend reports completion (1ms later).
-        backend.complete(r.resource_id, completed_at=101.0,
+        backend.complete(r.resource_id,
+                         completed_at=101.0,
                          bytes_promoted=2_000_000)
         # t=102: request arrives — well after completion.
         outcome = integ.on_request_arrival(r, arrival_time=102.0)
@@ -91,7 +94,9 @@ class TestPrefetchHappyPath:
 # 2. Late: request arrives before promotion completes
 # ---------------------------------------------------------------------------
 
+
 class TestPrefetchLate:
+
     def test_arrival_before_completion_is_late_not_success(self):
         c, backend, integ = _wire()
         r = _resource(2)
@@ -119,7 +124,8 @@ class TestPrefetchLate:
         # Request arrives before completion.
         integ.on_request_arrival(r, arrival_time=100.2)
         # Promotion finishes.
-        backend.complete(r.resource_id, completed_at=101.0,
+        backend.complete(r.resource_id,
+                         completed_at=101.0,
                          bytes_promoted=500_000)
         # No retroactive flip of used; bytes_promoted still
         # accumulates though — the move did happen.
@@ -133,12 +139,15 @@ class TestPrefetchLate:
 # 3. Never consumed: waste via expire
 # ---------------------------------------------------------------------------
 
+
 class TestPrefetchWaste:
+
     def test_expire_wasted_flips_outcome(self):
         c, backend, integ = _wire()
         r = _resource(4)
         integ.apply_hint(r.resource_id, issued_at=100.0)
-        backend.complete(r.resource_id, completed_at=101.0,
+        backend.complete(r.resource_id,
+                         completed_at=101.0,
                          bytes_promoted=750_000)
 
         # Session dies; no request ever arrives. Mark wasted.
@@ -163,7 +172,9 @@ class TestPrefetchWaste:
 # 4. Miss-without-hint
 # ---------------------------------------------------------------------------
 
+
 class TestPrefetchMiss:
+
     def test_unhinted_request_is_miss(self):
         c, _, integ = _wire()
         r = _resource(5)
@@ -180,7 +191,9 @@ class TestPrefetchMiss:
 # Bytes / latency accumulation
 # ---------------------------------------------------------------------------
 
+
 class TestBytesAndLatency:
+
     def test_multiple_promotions_accumulate(self):
         c, backend, integ = _wire()
         rs = [_resource(i) for i in range(3)]
@@ -189,7 +202,8 @@ class TestBytesAndLatency:
         for i, r in enumerate(rs):
             t0 = 100.0 + i
             integ.apply_hint(r.resource_id, issued_at=t0)
-            backend.complete(r.resource_id, completed_at=t0 + 0.5,
+            backend.complete(r.resource_id,
+                             completed_at=t0 + 0.5,
                              bytes_promoted=1_000_000 * (i + 1))
             integ.on_request_arrival(r, arrival_time=t0 + 1.0)
 
@@ -206,7 +220,9 @@ class TestBytesAndLatency:
 # Honesty invariants
 # ---------------------------------------------------------------------------
 
+
 class TestPrefetchHonesty:
+
     def test_mode_tagged_prefetch(self):
         c, _, _ = _wire()
         snap = c.metrics_snapshot
@@ -233,7 +249,8 @@ class TestPrefetchHonesty:
         assert r_A.resource_id != r_B.resource_id
 
         integ.apply_hint(r_A.resource_id, issued_at=100.0)
-        backend.complete(r_A.resource_id, completed_at=100.5,
+        backend.complete(r_A.resource_id,
+                         completed_at=100.5,
                          bytes_promoted=500_000)
 
         # B arrives. No hint for B → miss. (If we were keyed by

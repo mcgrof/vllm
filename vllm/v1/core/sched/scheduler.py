@@ -28,6 +28,7 @@ from vllm.v1.core.sched.output import (CachedRequestData, NewRequestData,
 from vllm.v1.core.sched.request_queue import (SchedulingPolicy,
                                               create_request_queue)
 from vllm.v1.core.sched.utils import check_stop, remove_all
+from vllm.v1.core.spf.scheduler_integration import SPFSchedulerBridge
 from vllm.v1.engine import (EngineCoreEventType, EngineCoreOutput,
                             EngineCoreOutputs)
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -35,7 +36,6 @@ from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
-from vllm.v1.core.spf.scheduler_integration import SPFSchedulerBridge
 from vllm.v1.structured_output import StructuredOutputManager
 
 logger = init_logger(__name__)

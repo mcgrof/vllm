@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Negative-control test: shuffled workload destroys transition advantage.
 
 The point of the transition model (``vllm.v1.core.spf.transitions``)
@@ -30,10 +31,8 @@ from __future__ import annotations
 
 from vllm.v1.core.spf.resource import hash_prefix_tokens
 from vllm.v1.core.spf.transitions import TransitionTable
-from vllm.v1.core.spf.workloads import (
-    mixed_session_interleave,
-    shuffled_control,
-)
+from vllm.v1.core.spf.workloads import (mixed_session_interleave,
+                                        shuffled_control)
 
 
 def _observe_all(
@@ -77,7 +76,8 @@ def _top1_prob(tt: TransitionTable, events) -> float:
 
 
 def _avg_outgoing_cardinality(
-    tt: TransitionTable, events,
+    tt: TransitionTable,
+    events,
 ) -> float:
     """Average number of distinct destinations per (session, from)
     pair. Diagnostic: a shuffled workload spreads transitions
@@ -99,15 +99,19 @@ def _avg_outgoing_cardinality(
 # The invariant
 # ---------------------------------------------------------------------------
 
+
 class TestShuffledDestroysTransitionAdvantage:
     """Canonical negative control. If the assertion ever flips,
     the transition model (or the workload generator) has a bug
     that is creating structure where there shouldn't be any."""
 
     def test_top1_probability_degrades_after_shuffle(self):
-        base = mixed_session_interleave(
-            n_sessions=3, n_prefixes=6, n_events=200,
-            prefix_len=64, tail_len=8, seed=42)
+        base = mixed_session_interleave(n_sessions=3,
+                                        n_prefixes=6,
+                                        n_events=200,
+                                        prefix_len=64,
+                                        tail_len=8,
+                                        seed=42)
         shuf = shuffled_control(base, seed=42)
 
         tt_base = _observe_all(base)
@@ -121,8 +125,7 @@ class TestShuffledDestroysTransitionAdvantage:
         # ≈ 1/6 ≈ 0.17; base should be no worse than that.
         assert top1_base > 0.15, (
             f"baseline top-1 probability {top1_base:.3f} too low — "
-            f"workload has no structure to exploit"
-        )
+            f"workload has no structure to exploit")
 
         # The shuffle must not *improve* top-1 probability (that
         # would mean we're faking structure). And it should stay
@@ -132,16 +135,17 @@ class TestShuffledDestroysTransitionAdvantage:
         assert top1_shuf <= top1_base + 1e-6, (
             f"shuffled top-1 {top1_shuf:.3f} exceeded baseline "
             f"{top1_base:.3f} — shuffle created structure, "
-            f"generator or model bug"
-        )
+            f"generator or model bug")
 
     def test_outgoing_cardinality_does_not_shrink_after_shuffle(self):
         """A shuffled workload spreads transitions across at least
         as many destinations as the baseline (a structured
         workload can concentrate; a random one cannot).
         """
-        base = mixed_session_interleave(
-            n_sessions=3, n_prefixes=6, n_events=200, seed=7)
+        base = mixed_session_interleave(n_sessions=3,
+                                        n_prefixes=6,
+                                        n_events=200,
+                                        seed=7)
         shuf = shuffled_control(base, seed=7)
 
         tt_base = _observe_all(base)
@@ -158,6 +162,7 @@ class TestShuffledDestroysTransitionAdvantage:
 # ---------------------------------------------------------------------------
 # Random_no_reuse: transition table learns nothing
 # ---------------------------------------------------------------------------
+
 
 class TestRandomNoReuseTransitions:
     """Complementary negative control. On a workload with NO

@@ -47,7 +47,6 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass, field
 
-
 # Token ID range. 32 bit positive values keep compatibility with
 # the int-to-bytes encoding used by ``hash_prefix_tokens``.
 _TOKEN_MIN = 1
@@ -80,6 +79,7 @@ class WorkloadEvent:
 # Helper: deterministic random token block generator
 # ---------------------------------------------------------------------------
 
+
 def _rand_tokens(rng: random.Random, n: int) -> list[int]:
     """Draw ``n`` independent token IDs from the RNG."""
     return [rng.randint(_TOKEN_MIN, _TOKEN_MAX) for _ in range(n)]
@@ -103,6 +103,7 @@ def _rand_tokens_labeled(
 # ---------------------------------------------------------------------------
 # 1. mixed_session_interleave
 # ---------------------------------------------------------------------------
+
 
 def mixed_session_interleave(
     n_sessions: int = 4,
@@ -128,18 +129,23 @@ def mixed_session_interleave(
         sid = f"s{i % n_sessions}"
         prefix_idx = rng.randrange(n_prefixes)
         tail = _rand_tokens(rng, tail_len)
-        events.append(WorkloadEvent(
-            session_id=sid,
-            token_ids=list(prefixes[prefix_idx]) + tail,
-            arrival_step=i,
-            meta={"prefix_idx": prefix_idx, "kind": "mixed_session"},
-        ))
+        events.append(
+            WorkloadEvent(
+                session_id=sid,
+                token_ids=list(prefixes[prefix_idx]) + tail,
+                arrival_step=i,
+                meta={
+                    "prefix_idx": prefix_idx,
+                    "kind": "mixed_session"
+                },
+            ))
     return events
 
 
 # ---------------------------------------------------------------------------
 # 2. batched_burst
 # ---------------------------------------------------------------------------
+
 
 def batched_burst(
     n_sessions: int = 3,
@@ -170,15 +176,16 @@ def batched_burst(
         prefixes = per_session_prefixes[sid]
         for i in range(burst_size):
             p = prefixes[i % len(prefixes)]
-            events.append(WorkloadEvent(
-                session_id=sid,
-                token_ids=list(p) + _rand_tokens(rng, tail_len),
-                arrival_step=step,
-                meta={
-                    "burst_idx": burst_idx,
-                    "kind": "batched_burst",
-                },
-            ))
+            events.append(
+                WorkloadEvent(
+                    session_id=sid,
+                    token_ids=list(p) + _rand_tokens(rng, tail_len),
+                    arrival_step=step,
+                    meta={
+                        "burst_idx": burst_idx,
+                        "kind": "batched_burst",
+                    },
+                ))
             step += 1
     return events
 
@@ -186,6 +193,7 @@ def batched_burst(
 # ---------------------------------------------------------------------------
 # 3. shared_prefix
 # ---------------------------------------------------------------------------
+
 
 def shared_prefix(
     n_events: int = 100,
@@ -207,18 +215,20 @@ def shared_prefix(
     for i in range(n_events):
         sid = f"s{i % n_sessions}"
         tail = _rand_tokens(rng, tail_len)
-        events.append(WorkloadEvent(
-            session_id=sid,
-            token_ids=list(shared) + tail,
-            arrival_step=i,
-            meta={"kind": "shared_prefix"},
-        ))
+        events.append(
+            WorkloadEvent(
+                session_id=sid,
+                token_ids=list(shared) + tail,
+                arrival_step=i,
+                meta={"kind": "shared_prefix"},
+            ))
     return events
 
 
 # ---------------------------------------------------------------------------
 # 4. conversation_tree
 # ---------------------------------------------------------------------------
+
 
 def conversation_tree(
     n_conversations: int = 5,
@@ -246,13 +256,17 @@ def conversation_tree(
         root_tokens = _rand_tokens(rng, segment_len)
         # BFS layers: list of (tokens, depth_index).
         current_layer = [(root_tokens, 0)]
-        events.append(WorkloadEvent(
-            session_id=sid,
-            token_ids=list(root_tokens),
-            arrival_step=step,
-            meta={"kind": "conversation_tree",
-                  "conv": conv_idx, "depth": 0},
-        ))
+        events.append(
+            WorkloadEvent(
+                session_id=sid,
+                token_ids=list(root_tokens),
+                arrival_step=step,
+                meta={
+                    "kind": "conversation_tree",
+                    "conv": conv_idx,
+                    "depth": 0
+                },
+            ))
         step += 1
         for d in range(1, depth):
             next_layer = []
@@ -260,15 +274,17 @@ def conversation_tree(
                 for _ in range(branches):
                     seg = _rand_tokens(rng, segment_len)
                     child_tokens = list(parent_tokens) + seg
-                    events.append(WorkloadEvent(
-                        session_id=sid,
-                        token_ids=child_tokens,
-                        arrival_step=step,
-                        meta={
-                            "kind": "conversation_tree",
-                            "conv": conv_idx, "depth": d,
-                        },
-                    ))
+                    events.append(
+                        WorkloadEvent(
+                            session_id=sid,
+                            token_ids=child_tokens,
+                            arrival_step=step,
+                            meta={
+                                "kind": "conversation_tree",
+                                "conv": conv_idx,
+                                "depth": d,
+                            },
+                        ))
                     step += 1
                     next_layer.append((child_tokens, d))
             current_layer = next_layer
@@ -278,6 +294,7 @@ def conversation_tree(
 # ---------------------------------------------------------------------------
 # 5. random_no_reuse
 # ---------------------------------------------------------------------------
+
 
 def random_no_reuse(
     n_events: int = 100,
@@ -296,18 +313,20 @@ def random_no_reuse(
     events: list[WorkloadEvent] = []
     for i in range(n_events):
         sid = f"s{i % n_sessions}"
-        events.append(WorkloadEvent(
-            session_id=sid,
-            token_ids=_rand_tokens(rng, prefix_len),
-            arrival_step=i,
-            meta={"kind": "random_no_reuse"},
-        ))
+        events.append(
+            WorkloadEvent(
+                session_id=sid,
+                token_ids=_rand_tokens(rng, prefix_len),
+                arrival_step=i,
+                meta={"kind": "random_no_reuse"},
+            ))
     return events
 
 
 # ---------------------------------------------------------------------------
 # 6. shuffled_control
 # ---------------------------------------------------------------------------
+
 
 def shuffled_control(
     base: list[WorkloadEvent],
@@ -330,18 +349,22 @@ def shuffled_control(
     # Reassign arrival steps in the new order.
     out = []
     for i, ev in enumerate(shuffled):
-        out.append(WorkloadEvent(
-            session_id=ev.session_id,
-            token_ids=list(ev.token_ids),
-            arrival_step=i,
-            meta={**ev.meta, "kind": "shuffled_control"},
-        ))
+        out.append(
+            WorkloadEvent(
+                session_id=ev.session_id,
+                token_ids=list(ev.token_ids),
+                arrival_step=i,
+                meta={
+                    **ev.meta, "kind": "shuffled_control"
+                },
+            ))
     return out
 
 
 # ---------------------------------------------------------------------------
 # 7. false_shared_first_block
 # ---------------------------------------------------------------------------
+
 
 def false_shared_first_block(
     n_events: int = 50,
@@ -366,21 +389,23 @@ def false_shared_first_block(
     for i in range(n_events):
         sid = f"s{i % n_sessions}"
         tail = _rand_tokens(rng, tail_len)
-        events.append(WorkloadEvent(
-            session_id=sid,
-            token_ids=list(shared) + tail,
-            arrival_step=i,
-            meta={
-                "kind": "false_shared_first_block",
-                "shared_block_size": shared_block_size,
-            },
-        ))
+        events.append(
+            WorkloadEvent(
+                session_id=sid,
+                token_ids=list(shared) + tail,
+                arrival_step=i,
+                meta={
+                    "kind": "false_shared_first_block",
+                    "shared_block_size": shared_block_size,
+                },
+            ))
     return events
 
 
 # ---------------------------------------------------------------------------
 # 8. Long Doc QA adapter
 # ---------------------------------------------------------------------------
+
 
 def long_doc_qa(
     n_docs: int = 5,
@@ -413,29 +438,27 @@ def long_doc_qa(
     the generator.
     """
     if not 0.0 <= hit_ratio <= 1.0:
-        raise ValueError(
-            f"hit_ratio must be in [0, 1], got {hit_ratio}")
+        raise ValueError(f"hit_ratio must be in [0, 1], got {hit_ratio}")
     rng = random.Random(seed)
 
-    docs: list[list[int]] = [
-        _rand_tokens(rng, doc_len) for _ in range(n_docs)
-    ]
+    docs: list[list[int]] = [_rand_tokens(rng, doc_len) for _ in range(n_docs)]
 
     events: list[WorkloadEvent] = []
     step = 0
     # Phase 1: introduce each document.
     for doc_idx, doc_tokens in enumerate(docs):
         sid = f"s{doc_idx % n_sessions}"
-        events.append(WorkloadEvent(
-            session_id=sid,
-            token_ids=list(doc_tokens),
-            arrival_step=step,
-            meta={
-                "kind": "long_doc_qa",
-                "phase": "intro",
-                "doc_id": doc_idx,
-            },
-        ))
+        events.append(
+            WorkloadEvent(
+                session_id=sid,
+                token_ids=list(doc_tokens),
+                arrival_step=step,
+                meta={
+                    "kind": "long_doc_qa",
+                    "phase": "intro",
+                    "doc_id": doc_idx,
+                },
+            ))
         step += 1
 
     # Phase 2: interleaved queries. For k in [0, queries_per_doc),
@@ -451,18 +474,19 @@ def long_doc_qa(
                 prefix = _rand_tokens(rng, doc_len)  # unseen doc
                 tag = "miss"
             q_tail = _rand_tokens(rng, query_len)
-            events.append(WorkloadEvent(
-                session_id=sid,
-                token_ids=list(prefix) + q_tail,
-                arrival_step=step,
-                meta={
-                    "kind": "long_doc_qa",
-                    "phase": "query",
-                    "doc_id": doc_idx if is_hit else -1,
-                    "query_idx": k,
-                    "hit_miss": tag,
-                },
-            ))
+            events.append(
+                WorkloadEvent(
+                    session_id=sid,
+                    token_ids=list(prefix) + q_tail,
+                    arrival_step=step,
+                    meta={
+                        "kind": "long_doc_qa",
+                        "phase": "query",
+                        "doc_id": doc_idx if is_hit else -1,
+                        "query_idx": k,
+                        "hit_miss": tag,
+                    },
+                ))
             step += 1
 
     return events

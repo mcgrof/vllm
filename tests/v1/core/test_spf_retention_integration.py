@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Phase-4 integration tests: SPF retention mode ↔ block pool.
 
 Covers the four scenarios from SPF instruction item 18's
@@ -22,20 +23,19 @@ from __future__ import annotations
 
 from vllm.v1.core.spf.config import MODE_RETENTION, SPFConfig
 from vllm.v1.core.spf.controller import SPFController
-from vllm.v1.core.spf.integrations import (
-    FakeBlockPool,
-    RetentionIntegration,
-)
+from vllm.v1.core.spf.integrations import FakeBlockPool, RetentionIntegration
 from vllm.v1.core.spf.resource import ResourceId
-
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _controller(**overrides) -> SPFController:
     defaults = dict(
-        enabled=True, mode=MODE_RETENTION, metrics_interval=0,
+        enabled=True,
+        mode=MODE_RETENTION,
+        metrics_interval=0,
         cooldown_steps=0,  # off so tests can drive hints directly
     )
     defaults.update(overrides)
@@ -53,7 +53,9 @@ def _resource(token_tail: int, session: str = "s0") -> ResourceId:
 # 1. Happy path: hint → touch → survive pressure → used
 # ---------------------------------------------------------------------------
 
+
 class TestRetentionHappyPath:
+
     def test_hint_succeeds_when_resource_resident(self):
         c = _controller()
         pool = FakeBlockPool(capacity=4)
@@ -105,7 +107,9 @@ class TestRetentionHappyPath:
 # 2. Waste path: hint issued, never used, evicted
 # ---------------------------------------------------------------------------
 
+
 class TestRetentionWastePath:
+
     def test_eviction_of_hinted_resource_marks_waste(self):
         c = _controller()
         pool = FakeBlockPool(capacity=2)
@@ -148,7 +152,9 @@ class TestRetentionWastePath:
 # 3. Too-late path: hint fired but resource already evicted
 # ---------------------------------------------------------------------------
 
+
 class TestRetentionTooLate:
+
     def test_touch_fails_immediately_counts_as_waste(self):
         c = _controller()
         pool = FakeBlockPool(capacity=1)
@@ -168,7 +174,9 @@ class TestRetentionTooLate:
 # 4. Identity is resource_id, not first_block_hash
 # ---------------------------------------------------------------------------
 
+
 class TestRetentionIdentity:
+
     def test_two_resources_sharing_first_block_are_distinct(self):
         """Two resources that would collide under the legacy
         first-block-only identity must be tracked separately by
@@ -178,10 +186,8 @@ class TestRetentionIdentity:
         pool = FakeBlockPool(capacity=4)
 
         shared_prefix = list(range(16))
-        r_A = ResourceId.for_prefix(
-            shared_prefix + [100], session_id="s0")
-        r_B = ResourceId.for_prefix(
-            shared_prefix + [200], session_id="s0")
+        r_A = ResourceId.for_prefix(shared_prefix + [100], session_id="s0")
+        r_B = ResourceId.for_prefix(shared_prefix + [200], session_id="s0")
         # Legacy collision, honest distinction.
         assert r_A.first_block_hash == r_B.first_block_hash
         assert r_A.resource_id != r_B.resource_id
@@ -210,7 +216,9 @@ class TestRetentionIdentity:
 # Extra: honest retention never pretends to prefetch
 # ---------------------------------------------------------------------------
 
+
 class TestRetentionNamingHonesty:
+
     def test_snapshot_mode_is_retention(self):
         c = _controller()
         pool = FakeBlockPool(capacity=2)

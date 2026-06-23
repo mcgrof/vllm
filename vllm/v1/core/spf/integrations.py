@@ -43,10 +43,10 @@ from vllm.v1.core.spf.controller import SPFController
 from vllm.v1.core.spf.resource import ResourceId
 from vllm.v1.core.spf.shadow_baseline import ShadowBaseline
 
-
 # ===========================================================================
 # Retention mode
 # ===========================================================================
+
 
 class BlockPool(Protocol):
     """Minimal GPU block-pool interface used by SPF retention.
@@ -114,8 +114,7 @@ class RetentionIntegration:
         tracker."""
         return self._shadow
 
-    def apply_hint(self, resource_id: str,
-                   num_bytes: int = 0) -> bool:
+    def apply_hint(self, resource_id: str, num_bytes: int = 0) -> bool:
         """Ask the block_pool to retain ``resource_id``.
 
         ``num_bytes`` is optional byte size used by the shadow
@@ -171,8 +170,9 @@ class RetentionIntegration:
         """
         if self._shadow is None:
             return []
-        return self._shadow.on_insert(
-            resource_id, num_bytes, would_save_ids=would_save_ids)
+        return self._shadow.on_insert(resource_id,
+                                      num_bytes,
+                                      would_save_ids=would_save_ids)
 
     def on_request_arrival(
         self,
@@ -215,6 +215,7 @@ class RetentionIntegration:
 # plug in vLLM's actual pool.
 # ---------------------------------------------------------------------------
 
+
 class FakeBlockPool:
     """In-memory LRU block pool for retention-mode tests.
 
@@ -229,7 +230,7 @@ class FakeBlockPool:
         # Preserves insertion / touch order so LRU eviction is
         # deterministic.
         from collections import OrderedDict
-        self._order: "OrderedDict[str, None]" = OrderedDict()
+        self._order: OrderedDict[str, None] = OrderedDict()
         # Audit trail for tests.
         self.touches: list[str] = []
         self.evicted: list[str] = []
@@ -275,6 +276,7 @@ class FakeBlockPool:
 # ===========================================================================
 # Prefetch mode
 # ===========================================================================
+
 
 @dataclass
 class PromotionHandle:
@@ -389,9 +391,10 @@ class PrefetchIntegration:
         if handle is None:
             return "miss"
 
-        if handle.completed_at is not None and handle.completed_at <= arrival_time:
+        if (handle.completed_at is not None
+                and handle.completed_at <= arrival_time):
             # Clean prefetch hit. Record latency + bytes + success.
-            self._controller.metrics_snapshot  # touch, no-op
+            _ = self._controller.metrics_snapshot  # touch, no-op
             # Metrics: bytes_promoted, promote_latency_ms have
             # already been accumulated by on_promotion_complete;
             # here we just flip outcome to used.
@@ -451,6 +454,7 @@ class PrefetchIntegration:
 # ---------------------------------------------------------------------------
 # Reference FakePrefetchBackend — for tests only.
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class FakePrefetchBackend:
@@ -513,8 +517,8 @@ class FakePrefetchBackend:
         if bytes_promoted == 0:
             bytes_promoted = self.bytes_per_block
         if self._integration is not None:
-            self._integration.on_promotion_complete(
-                resource_id, completed_at, bytes_promoted)
+            self._integration.on_promotion_complete(resource_id, completed_at,
+                                                    bytes_promoted)
         elif resource_id in self._handles:
             # Backend without integration attached still updates
             # the handle for direct inspection.

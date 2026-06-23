@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Phase-1 honest-mode tests for SPF mode separation.
 
 Covers:
@@ -21,27 +22,20 @@ from unittest.mock import patch
 
 import pytest
 
-from vllm.v1.core.spf.config import (
-    MODE_PREFETCH,
-    MODE_RETENTION,
-    VALID_MODES,
-    SPFConfig,
-)
+from vllm.v1.core.spf.config import (MODE_PREFETCH, MODE_RETENTION,
+                                     VALID_MODES, SPFConfig)
 from vllm.v1.core.spf.controller import SPFController
-from vllm.v1.core.spf.metrics import (
-    PrefetchMetrics,
-    RetentionMetrics,
-    SPFMetrics,
-    SPFStepMetrics,
-)
+from vllm.v1.core.spf.metrics import (PrefetchMetrics, RetentionMetrics,
+                                      SPFMetrics, SPFStepMetrics)
 from vllm.v1.core.spf.resource import ResourceId
-
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
+
 class TestConfigMode:
+
     def test_default_mode_is_retention(self):
         cfg = SPFConfig()
         assert cfg.mode == MODE_RETENTION
@@ -63,9 +57,9 @@ class TestConfigMode:
 
     def test_invalid_mode_raises(self):
         with patch.dict(os.environ, {"VLLM_SPF_MODE": "cartridge"},
-                        clear=False):
-            with pytest.raises(ValueError, match="VLLM_SPF_MODE"):
-                SPFConfig.from_env()
+                        clear=False), pytest.raises(ValueError,
+                                                    match="VLLM_SPF_MODE"):
+            SPFConfig.from_env()
 
     def test_case_insensitive(self):
         with patch.dict(os.environ, {"VLLM_SPF_MODE": "RETENTION"},
@@ -83,13 +77,16 @@ class TestConfigMode:
 # Metrics routing
 # ---------------------------------------------------------------------------
 
+
 class TestMetricsRouting:
+
     def test_retention_hints_go_to_retention_bucket(self):
         m = SPFMetrics(_mode="retention", _interval=0)
         step = SPFStepMetrics(
             mode="retention",
-            retention=RetentionMetrics(
-                hints_issued=3, hints_used=2, hints_wasted=1),
+            retention=RetentionMetrics(hints_issued=3,
+                                       hints_used=2,
+                                       hints_wasted=1),
             budget_blocks=10,
         )
         m.record_step(step)
@@ -107,8 +104,11 @@ class TestMetricsRouting:
         step = SPFStepMetrics(
             mode="prefetch",
             prefetch=PrefetchMetrics(
-                hints_issued=4, prefetch_used=3, prefetch_wasted=1,
-                bytes_promoted=12345, promote_latency_ms=7.5,
+                hints_issued=4,
+                prefetch_used=3,
+                prefetch_wasted=1,
+                bytes_promoted=12345,
+                promote_latency_ms=7.5,
             ),
             budget_blocks=10,
         )
@@ -157,7 +157,9 @@ class TestMetricsRouting:
 # Step-level legacy name compatibility
 # ---------------------------------------------------------------------------
 
+
 class TestLegacyStepNames:
+
     def test_prefetch_issued_alias_retention(self):
         step = SPFStepMetrics(mode="retention")
         step.prefetch_issued = 5
@@ -184,12 +186,14 @@ class TestLegacyStepNames:
 # Controller lifecycle hooks
 # ---------------------------------------------------------------------------
 
+
 def _make_resource(rid_tail: int = 0, session: str = "s0"):
     tokens = list(range(32)) + [rid_tail]
     return ResourceId.for_prefix(tokens, session_id=session)
 
 
 class TestControllerLifecycle:
+
     def _ctrl(self, mode: str = "retention") -> SPFController:
         cfg = SPFConfig(enabled=True, mode=mode, metrics_interval=0)
         return SPFController(cfg)

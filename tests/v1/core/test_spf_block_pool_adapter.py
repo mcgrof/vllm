@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for :class:`LiveBlockPool`.
 
 Tests the adapter against a hand-rolled fake BlockPool that has
@@ -18,16 +19,15 @@ work outside this test file.
 """
 from __future__ import annotations
 
-from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Optional
 
 from vllm.v1.core.spf.block_pool_adapter import LiveBlockPool
 
-
 # ---------------------------------------------------------------------------
 # Fake BlockPool — mirrors the v1 API surface we need.
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class FakeKVCacheBlock:
@@ -36,8 +36,8 @@ class FakeKVCacheBlock:
     is_null: bool = False
     block_hash: Optional[object] = None
     # Linked-list pointers for the fake free queue.
-    prev_free_block: Optional["FakeKVCacheBlock"] = None
-    next_free_block: Optional["FakeKVCacheBlock"] = None
+    prev_free_block: Optional[FakeKVCacheBlock] = None
+    next_free_block: Optional[FakeKVCacheBlock] = None
 
 
 @dataclass
@@ -67,18 +67,17 @@ class FakeBlockPool:
     """Minimal surface of :class:`vllm.v1.core.block_pool.BlockPool`
     the SPF adapter touches."""
 
-    free_block_queue: FakeFreeQueue = field(
-        default_factory=FakeFreeQueue)
+    free_block_queue: FakeFreeQueue = field(default_factory=FakeFreeQueue)
     # Direct map used by touch() for verification in tests.
     touched: list = field(default_factory=list)
 
     def touch(self, blocks) -> None:
+        import contextlib
+
         for b in blocks:
             if b.ref_cnt == 0 and not b.is_null:
-                try:
+                with contextlib.suppress(ValueError):
                     self.free_block_queue.remove(b)
-                except ValueError:
-                    pass
             b.ref_cnt += 1
             self.touched.append(b.block_id)
 
@@ -90,15 +89,17 @@ class FakeBlockPool:
 # Tests
 # ---------------------------------------------------------------------------
 
+
 class TestTouch:
+
     def test_touch_resident_block_succeeds(self):
         pool = FakeBlockPool()
-        blk = FakeKVCacheBlock(
-            block_id=1, block_hash="h-abc", ref_cnt=0)
+        blk = FakeKVCacheBlock(block_id=1, block_hash="h-abc", ref_cnt=0)
         pool.free_block_queue.append(blk)
         resolver_map = {"rid-abc": blk}
         live = LiveBlockPool(
-            pool, kv_cache_group_ids=[0],
+            pool,
+            kv_cache_group_ids=[0],
             resolver=resolver_map.get,
         )
         assert live.touch("rid-abc") is True
@@ -112,7 +113,8 @@ class TestTouch:
     def test_touch_unresolvable_returns_false(self):
         pool = FakeBlockPool()
         live = LiveBlockPool(
-            pool, kv_cache_group_ids=[0],
+            pool,
+            kv_cache_group_ids=[0],
             resolver=lambda rid: None,
         )
         assert live.touch("rid-nope") is False
@@ -123,11 +125,11 @@ class TestTouch:
         """A :class:`KVCacheBlock` with ``block_hash=None`` is not
         in the prefix cache — adapter refuses to touch it."""
         pool = FakeBlockPool()
-        raw_blk = FakeKVCacheBlock(
-            block_id=2, block_hash=None, ref_cnt=0)
+        raw_blk = FakeKVCacheBlock(block_id=2, block_hash=None, ref_cnt=0)
         resolver_map = {"rid-raw": raw_blk}
         live = LiveBlockPool(
-            pool, kv_cache_group_ids=[0],
+            pool,
+            kv_cache_group_ids=[0],
             resolver=resolver_map.get,
         )
         assert live.touch("rid-raw") is False
@@ -135,11 +137,13 @@ class TestTouch:
 
 
 class TestContains:
+
     def test_contains_resolved_with_hash(self):
         pool = FakeBlockPool()
         blk = FakeKVCacheBlock(block_id=3, block_hash="h-xyz")
         live = LiveBlockPool(
-            pool, kv_cache_group_ids=[0],
+            pool,
+            kv_cache_group_ids=[0],
             resolver={"rid-xyz": blk}.get,
         )
         assert live.contains("rid-xyz") is True
@@ -147,7 +151,8 @@ class TestContains:
     def test_contains_unresolvable_is_false(self):
         pool = FakeBlockPool()
         live = LiveBlockPool(
-            pool, kv_cache_group_ids=[0],
+            pool,
+            kv_cache_group_ids=[0],
             resolver=lambda rid: None,
         )
         assert live.contains("rid-nope") is False
@@ -156,22 +161,24 @@ class TestContains:
         pool = FakeBlockPool()
         raw_blk = FakeKVCacheBlock(block_id=4, block_hash=None)
         live = LiveBlockPool(
-            pool, kv_cache_group_ids=[0],
+            pool,
+            kv_cache_group_ids=[0],
             resolver={"rid-raw": raw_blk}.get,
         )
         assert live.contains("rid-raw") is False
 
 
 class TestEvictLRU:
+
     def test_evict_lru_returns_string_ids(self):
         pool = FakeBlockPool()
         # Populate free queue with three cached blocks.
         for i, h in enumerate(["h1", "h2", "h3"]):
-            blk = FakeKVCacheBlock(
-                block_id=i, block_hash=h)
+            blk = FakeKVCacheBlock(block_id=i, block_hash=h)
             pool.free_block_queue.append(blk)
         live = LiveBlockPool(
-            pool, kv_cache_group_ids=[0],
+            pool,
+            kv_cache_group_ids=[0],
             resolver=lambda rid: None,
         )
         evicted = live.evict_lru(n=2)
@@ -183,7 +190,8 @@ class TestEvictLRU:
     def test_evict_lru_on_empty_queue(self):
         pool = FakeBlockPool()
         live = LiveBlockPool(
-            pool, kv_cache_group_ids=[0],
+            pool,
+            kv_cache_group_ids=[0],
             resolver=lambda rid: None,
         )
         assert live.evict_lru(n=5) == []
@@ -193,28 +201,30 @@ class TestEvictLRU:
 # Integration with RetentionIntegration
 # ---------------------------------------------------------------------------
 
+
 class TestWithRetentionIntegration:
+
     def test_live_pool_plugs_into_retention_integration(self):
         """The Protocol contract: LiveBlockPool is
         interchangeable with FakeBlockPool as far as
         :class:`RetentionIntegration` is concerned."""
-        from vllm.v1.core.spf.config import (
-            MODE_RETENTION, SPFConfig,
-        )
+        from vllm.v1.core.spf.config import MODE_RETENTION, SPFConfig
         from vllm.v1.core.spf.controller import SPFController
-        from vllm.v1.core.spf.integrations import (
-            RetentionIntegration,
-        )
+        from vllm.v1.core.spf.integrations import RetentionIntegration
 
-        ctrl = SPFController(SPFConfig(
-            enabled=True, mode=MODE_RETENTION,
-            metrics_interval=0, cooldown_steps=0,
-        ))
+        ctrl = SPFController(
+            SPFConfig(
+                enabled=True,
+                mode=MODE_RETENTION,
+                metrics_interval=0,
+                cooldown_steps=0,
+            ))
         pool = FakeBlockPool()
         blk = FakeKVCacheBlock(block_id=1, block_hash="h-A")
         pool.free_block_queue.append(blk)
         live = LiveBlockPool(
-            pool, kv_cache_group_ids=[0],
+            pool,
+            kv_cache_group_ids=[0],
             resolver={"rid-A": blk}.get,
         )
         integ = RetentionIntegration(ctrl, live)
@@ -227,20 +237,20 @@ class TestWithRetentionIntegration:
         assert blk.ref_cnt == 1
 
     def test_unresolvable_hint_marks_waste(self):
-        from vllm.v1.core.spf.config import (
-            MODE_RETENTION, SPFConfig,
-        )
+        from vllm.v1.core.spf.config import MODE_RETENTION, SPFConfig
         from vllm.v1.core.spf.controller import SPFController
-        from vllm.v1.core.spf.integrations import (
-            RetentionIntegration,
-        )
-        ctrl = SPFController(SPFConfig(
-            enabled=True, mode=MODE_RETENTION,
-            metrics_interval=0, cooldown_steps=0,
-        ))
+        from vllm.v1.core.spf.integrations import RetentionIntegration
+        ctrl = SPFController(
+            SPFConfig(
+                enabled=True,
+                mode=MODE_RETENTION,
+                metrics_interval=0,
+                cooldown_steps=0,
+            ))
         pool = FakeBlockPool()
         live = LiveBlockPool(
-            pool, kv_cache_group_ids=[0],
+            pool,
+            kv_cache_group_ids=[0],
             resolver=lambda rid: None,
         )
         integ = RetentionIntegration(ctrl, live)

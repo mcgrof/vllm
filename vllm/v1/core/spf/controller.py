@@ -21,21 +21,13 @@ import math
 from dataclasses import dataclass, field
 
 from vllm.v1.core.spf.config import SPFConfig
-from vllm.v1.core.spf.manifest import (
-    BlockManifest,
-    BlockManifestProvider,
-    NullManifestProvider,
-)
+from vllm.v1.core.spf.manifest import (BlockManifest, BlockManifestProvider,
+                                       NullManifestProvider)
 from vllm.v1.core.spf.metrics import SPFMetrics, SPFStepMetrics
 from vllm.v1.core.spf.resource import ResourceCandidate, ResourceId
-from vllm.v1.core.spf.scorer import (
-    CandidateFeatures,
-    CooldownTracker,
-    ExpectedUtilityScorer,
-    LearnedScorer,
-    Scorer,
-    SessionAwareScorer,
-)
+from vllm.v1.core.spf.scorer import (CandidateFeatures, CooldownTracker,
+                                     ExpectedUtilityScorer, LearnedScorer,
+                                     Scorer, SessionAwareScorer)
 from vllm.v1.core.spf.transitions import TransitionTable
 from vllm.v1.core.spf.utility import UtilityConstants, UtilityFeatures
 
@@ -156,9 +148,8 @@ class SPFController:
         # scoring loop.  Real providers can be installed via
         # :meth:`set_manifest_provider`.
         self._manifest_provider: BlockManifestProvider = (
-            manifest_provider if manifest_provider is not None
-            else NullManifestProvider()
-        )
+            manifest_provider
+            if manifest_provider is not None else NullManifestProvider())
 
         # Session state tracking (causal — only past observations).
         self._sessions: dict[str, SessionState] = {}
@@ -194,9 +185,7 @@ class SPFController:
             return LearnedScorer(config.learned_weights_path)
         return SessionAwareScorer()
 
-    def set_manifest_provider(
-        self, provider: BlockManifestProvider
-    ) -> None:
+    def set_manifest_provider(self, provider: BlockManifestProvider) -> None:
         """Install or replace the active manifest provider.
 
         Used by the scheduler bridge once a real provider (e.g. a KRI
@@ -348,8 +337,7 @@ class SPFController:
                     session_id=candidate.session_id,
                     num_blocks=effective_blocks,
                     manifest=manifest,
-                )
-            )
+                ))
             blocks_used += effective_blocks
             self._metrics.track_outstanding(candidate.prefix_hash)
 
@@ -357,9 +345,8 @@ class SPFController:
         self._metrics.record_step(step_metrics)
         return hints
 
-    def _lookup_manifest(
-        self, candidate: PrefetchCandidate
-    ) -> BlockManifest | None:
+    def _lookup_manifest(self,
+                         candidate: PrefetchCandidate) -> BlockManifest | None:
         """Ask the active provider for a manifest for this candidate.
 
         Catches the loud-failure path: if a provider raises ValueError
@@ -391,8 +378,7 @@ class SPFController:
             return None
 
     def _generate_candidates(
-        self, resident_prefixes: set[str]
-    ) -> list[PrefetchCandidate]:
+            self, resident_prefixes: set[str]) -> list[PrefetchCandidate]:
         """Generate prefetch candidates from recently active sessions.
 
         Only considers prefixes that:
@@ -447,11 +433,8 @@ class SPFController:
                     continue
 
             # Stale-session guard (2-step window).
-            if (
-                current_sessions
-                and not is_current
-                and state.last_active_step < prev_step - 1
-            ):
+            if (current_sessions and not is_current
+                    and state.last_active_step < prev_step - 1):
                 continue
 
             for prefix_hash in state.prefix_history:
@@ -461,10 +444,8 @@ class SPFController:
                             prefix_hash=prefix_hash,
                             session_id=session_id,
                             query_hash=state.prefix_query_hash.get(
-                                prefix_hash
-                            ),
-                        )
-                    )
+                                prefix_hash),
+                        ))
         return candidates
 
     def _score_block(self, prefix_hash: str) -> float:
@@ -479,8 +460,7 @@ class SPFController:
         blocks from being displaced by single-session candidates.
         """
         last_step, total_accesses = self._prefix_access.get(
-            prefix_hash, (0, 0)
-        )
+            prefix_hash, (0, 0))
         recency = float(self._step_count - last_step)
         victim_sid = self._block_session.get(prefix_hash)
         victim_sess = self._sessions.get(victim_sid) if victim_sid else None
@@ -504,18 +484,15 @@ class SPFController:
 
         return base_score
 
-    def _extract_features(
-        self, candidate: PrefetchCandidate
-    ) -> CandidateFeatures:
+    def _extract_features(self,
+                          candidate: PrefetchCandidate) -> CandidateFeatures:
         """Build causal feature vector for a candidate."""
         last_step, total_accesses = self._prefix_access.get(
-            candidate.prefix_hash, (0, 0)
-        )
+            candidate.prefix_hash, (0, 0))
         session_state = self._sessions.get(candidate.session_id)
         session_freq = session_state.request_count if session_state else 0
         prefix_depth = float(
-            len(session_state.prefix_history) if session_state else 0
-        )
+            len(session_state.prefix_history) if session_state else 0)
 
         return CandidateFeatures(
             recency=float(self._step_count - last_step),
@@ -525,9 +502,7 @@ class SPFController:
             last_access_gap=float(self._step_count - last_step),
         )
 
-    def report_outcome(
-        self, prefix_hash: str, *, hit: bool
-    ) -> None:
+    def report_outcome(self, prefix_hash: str, *, hit: bool) -> None:
         """Report whether a prefetched block was actually used."""
         self._metrics.record_prefetch_outcome(prefix_hash, hit=hit)
 
@@ -739,13 +714,15 @@ class SPFController:
         scored: list[tuple[float, ResourceCandidate]] = []
         for cand in candidates:
             if self._cooldown.should_suppress(
-                cand.resource_id, self._step_count,
+                    cand.resource_id,
+                    self._step_count,
             ):
                 step_metrics.hints_suppressed += 1
                 continue
 
             uf = self._utility_features(
-                cand, victim_saved_ms=victim_util_ms,
+                cand,
+                victim_saved_ms=victim_util_ms,
                 victim_num_bytes=victim_bytes,
             )
             total = self._utility_scorer.score(uf)
@@ -758,9 +735,8 @@ class SPFController:
             # gate more conservative at tight pressure where
             # candidate/victim utilities both collapse to small,
             # noisy values.
-            if (victim is not None
-                    and total <= victim_util_ms
-                    + self._config.victim_gate_margin_ms):
+            if (victim is not None and total
+                    <= victim_util_ms + self._config.victim_gate_margin_ms):
                 step_metrics.hints_suppressed += 1
                 if self._config.mode == "retention":
                     self._metrics.record_harmful_eviction_avoided()
@@ -781,8 +757,7 @@ class SPFController:
                 continue
             selected.append(cand)
             blocks_used += cand.num_blocks
-            self._cooldown.mark_issued(
-                cand.resource_id, self._step_count)
+            self._cooldown.mark_issued(cand.resource_id, self._step_count)
 
         # Counter plumbing: the number we actually selected is the
         # "hints_issued" contribution for the step. Integration
@@ -818,20 +793,18 @@ class SPFController:
         last_step, total_accesses = self._prefix_access.get(
             cand.resource_id, (0, 0))
         recency = float(max(0, self._step_count - last_step))
-        session_freq = (
-            float(session_state.request_count) if session_state else 0.0)
-        consecutive = (
-            session_state.consecutive_steps if session_state else 0)
+        session_freq = (float(session_state.request_count)
+                        if session_state else 0.0)
+        consecutive = (session_state.consecutive_steps if session_state else 0)
 
         # Transition features: look at the session's current
         # prefix and ask the table for (current → candidate).
-        current_prefix = self._transitions.current_prefix(
-            cand.session_id)
+        current_prefix = self._transitions.current_prefix(cand.session_id)
         if current_prefix is not None:
-            tp = self._transitions.probability(
-                cand.session_id, current_prefix, cand.resource_id)
-            tc = self._transitions.count(
-                cand.session_id, current_prefix, cand.resource_id)
+            tp = self._transitions.probability(cand.session_id, current_prefix,
+                                               cand.resource_id)
+            tc = self._transitions.count(cand.session_id, current_prefix,
+                                         cand.resource_id)
         else:
             tp, tc = 0.0, 0
 
@@ -841,8 +814,7 @@ class SPFController:
         if session_state is not None:
             hist = session_state.prefix_history
             if cand.resource_id in hist:
-                idx = (len(hist) - 1
-                       - hist[::-1].index(cand.resource_id))
+                idx = (len(hist) - 1 - hist[::-1].index(cand.resource_id))
                 tail = hist[idx + 1:]
                 reuse_distance = float(len(set(tail)))
 
@@ -865,8 +837,7 @@ class SPFController:
             log_frequency=lf,
             session_frequency=sf,
             prefix_depth=float(
-                len(session_state.prefix_history)
-                if session_state else 0),
+                len(session_state.prefix_history) if session_state else 0),
             last_access_gap=recency,
             reuse_distance=reuse_distance,
             transition_prob=tp,
