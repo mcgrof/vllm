@@ -234,12 +234,29 @@ class SPFSchedulerBridge:
 
         if self._step_count - self._resident_rebuild_step >= 10:
             self._cached_resident_prefixes.clear()
-            for bh_with_gid in block_pool.cached_block_hash_to_block._cache:
-                # BlockHashWithGroupId is bytes: BlockHash + 4-byte group_id.
+            # block_pool.cached_block_hash_to_block is a dict keyed by
+            # BlockHashWithGroupId. Older vLLM revisions wrapped this in a
+            # custom container exposing `_cache`; current API is a plain
+            # dict — iterate keys directly.
+            cache_map = block_pool.cached_block_hash_to_block
+            iter_keys = (cache_map.keys() if isinstance(cache_map, dict)
+                         else getattr(cache_map, "_cache", cache_map))
+            for bh_with_gid in iter_keys:
+                # BlockHashWithGroupId historically was bytes (BlockHash +
+                # 4-byte group_id); recent vLLM uses a NamedTuple wrapper.
+                # Accept both shapes.
                 if isinstance(bh_with_gid, bytes) and len(bh_with_gid) > 4:
                     block_hash_bytes = bh_with_gid[:-4]
                     self._cached_resident_prefixes.add(
                         _block_hash_to_str(block_hash_bytes))
+                else:
+                    # NamedTuple or tuple: (BlockHash, group_id) or similar
+                    bh = getattr(bh_with_gid, "block_hash", None)
+                    if bh is None and isinstance(bh_with_gid, tuple):
+                        bh = bh_with_gid[0] if bh_with_gid else None
+                    if bh is not None:
+                        self._cached_resident_prefixes.add(
+                            _block_hash_to_str(bh))
             self._resident_rebuild_step = self._step_count
 
         resident_prefixes = self._cached_resident_prefixes
