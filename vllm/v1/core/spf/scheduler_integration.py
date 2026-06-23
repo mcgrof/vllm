@@ -334,7 +334,11 @@ class SPFSchedulerBridge:
         cached_blocks = block_pool.get_cached_block(target_hash, group_ids)
 
         if cached_blocks is not None:
-            block_pool.touch(cached_blocks)
+            # block_pool.touch expects tuple[list[KVCacheBlock], ...] (one
+            # list per kv_cache_group); get_cached_block returns a flat
+            # list with one block per group, so wrap each block in a
+            # singleton list to match the expected shape.
+            block_pool.touch(tuple([blk] for blk in cached_blocks))
             if hint.manifest is not None:
                 m = hint.manifest
                 logger.debug(
