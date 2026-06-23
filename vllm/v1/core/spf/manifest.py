@@ -135,6 +135,7 @@ class BlockManifest:
         """
         per_k = prior.get("kmeans_blocks_perK")
         legacy = prior.get("kmeans_blocks")
+        affinities = prior.get("block_affinities")
 
         block_list: list[int] | None = None
         if per_k is not None and K in per_k:
@@ -145,6 +146,28 @@ class BlockManifest:
             # be lossy compared to per-K priors but acceptable for
             # back-compat with older .pt files.
             block_list = sorted(legacy[: min(K, len(legacy))])
+        elif affinities is not None:
+            # Continuous-score prior (e.g. KRI-D-kv-sum): compute
+            # top-K on the fly. block_affinities shape is
+            # (num_layers, num_kv_heads, num_blocks); average across
+            # layers and heads to collapse to a per-block score, then
+            # take top-K. This matches the topk_avg policy that
+            # CartridgeConnector dispatches by default.
+            import torch as _torch
+            if not isinstance(affinities, _torch.Tensor):
+                affinities = _torch.as_tensor(affinities)
+            if affinities.dim() == 3:
+                scores = affinities.mean(dim=(0, 1))
+            elif affinities.dim() == 2:
+                scores = affinities.mean(dim=0)
+            elif affinities.dim() == 1:
+                scores = affinities
+            else:
+                scores = None
+            if scores is not None and scores.numel() > 0:
+                k = min(K, scores.numel())
+                top_idx = _torch.topk(scores, k=k).indices.tolist()
+                block_list = sorted(top_idx)
 
         if block_list is None:
             return None
