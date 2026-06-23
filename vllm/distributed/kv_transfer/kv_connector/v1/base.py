@@ -296,6 +296,40 @@ class KVConnectorBase_V1(ABC):
         """
         pass
 
+    def get_block_skip_list(
+        self,
+        request_id: str,
+        num_logical_blocks: int,
+    ) -> "list[int] | None":
+        """Return logical block indices the connector wants skipped.
+
+        Called by the scheduler after update_state_after_alloc. When a
+        connector returns a non-empty list, the scheduler replaces the
+        corresponding positions in the request's block_table with
+        null_block (freeing the previously-allocated physical block
+        back to the pool). Attention backends treat null_block as
+        "skip this position" — precedent: sliding-window handling in
+        SingleTypeKVCacheManager.remove_skipped_blocks.
+
+        Default: returns None → no skipping. Only connectors that
+        implement routing-aware selection (e.g. CartridgeConnector with
+        a KRIProvider) need to override this.
+
+        Args:
+            request_id: the scheduler-assigned request id.
+            num_logical_blocks: the number of logical block positions
+                the request covers (typically
+                ``externally_computed_tokens // block_size``). The
+                returned list entries must all be ``< num_logical_blocks``.
+
+        Returns:
+            None or an empty list → no skip positions for this request.
+            list[int] → sorted or unsorted list of logical block
+            indices to replace with null_block. Duplicates and
+            out-of-range entries are tolerated (the scheduler filters).
+        """
+        return None
+
     @abstractmethod
     def build_connector_meta(
             self, scheduler_output: SchedulerOutput) -> KVConnectorMetadata:
