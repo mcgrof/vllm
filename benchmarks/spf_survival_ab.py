@@ -377,7 +377,7 @@ def _worker_main(args: argparse.Namespace) -> None:
     for req in workload:
         req_start = time.perf_counter()
         outputs = llm.generate(
-            prompt_token_ids=[req.prompt_tokens],
+            [{"prompt_token_ids": req.prompt_tokens}],
             sampling_params=sp,
             use_tqdm=False,
         )
