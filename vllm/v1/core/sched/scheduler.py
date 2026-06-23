@@ -28,6 +28,7 @@ from vllm.v1.core.sched.output import (CachedRequestData, NewRequestData,
 from vllm.v1.core.sched.request_queue import (SchedulingPolicy,
                                               create_request_queue)
 from vllm.v1.core.sched.utils import check_stop, remove_all
+from vllm.v1.core.spf.scheduler_integration import SPFSchedulerBridge
 from vllm.v1.engine import (EngineCoreEventType, EngineCoreOutput,
                             EngineCoreOutputs)
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -175,6 +176,9 @@ class Scheduler(SchedulerInterface):
             dcp_world_size=self.dcp_world_size,
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+
+        # SPF (Speculative Prefetch) scheduler integration.
+        self.spf_bridge = SPFSchedulerBridge()
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -624,6 +628,10 @@ class Scheduler(SchedulerInterface):
             self.kv_event_publisher.publish(batch)
 
         self._update_after_schedule(scheduler_output)
+
+        # SPF: run one prefetch decision round and touch predicted blocks.
+        self.spf_bridge.step(self.kv_cache_manager)
+
         return scheduler_output
 
     def _update_after_schedule(
@@ -1097,6 +1105,7 @@ class Scheduler(SchedulerInterface):
     def add_request(self, request: Request) -> None:
         self.waiting.add_request(request)
         self.requests[request.request_id] = request
+        self.spf_bridge.observe_request(request)
         if self.log_stats:
             request.record_event(EngineCoreEventType.QUEUED)
 
