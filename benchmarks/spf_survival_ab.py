@@ -144,57 +144,58 @@ def build_workload(
     turns_per_session: int,
     shared_prefix_tokens: int,
     per_query_tokens: int,
+    num_personas: int = 1,
     interleave: str = "round_robin",
     seed: int = 42,
-) -> tuple[list[WorkloadRequest], list[int], dict[str, list[int]]]:
-    """Generate a multi-session shared-prefix workload.
+) -> tuple[list[WorkloadRequest], list[list[int]], dict[str, list[int]]]:
+    """Generate a multi-persona multi-session workload.
 
-    Returns (requests, shared_prefix_ids, oracle_reuse_map).
+    Each of ``num_personas`` personas owns a distinct shared prefix.
+    Sessions are partitioned across personas in a balanced fashion.
+    A persona's shared prefix is the same across all turns of every
+    session bound to it; per-session/per-turn content is the unique
+    tail.
+
+    Returns (requests, per_persona_shared_prefixes, oracle_reuse_map).
     """
-    shared = _gen_shared_prefix(shared_prefix_tokens, seed=seed)
+    personas = [
+        _gen_shared_prefix(shared_prefix_tokens,
+                           seed=(seed * 17_001 + p))
+        for p in range(num_personas)
+    ]
+    session_to_persona = [s % num_personas for s in range(num_sessions)]
     requests: list[WorkloadRequest] = []
     rng = random.Random(seed)
     # Round-robin: s0 t0, s1 t0, ..., sN t0, s0 t1, s1 t1, ...
     # Shuffled: random session, random turn (with caps)
+    def _build(s: int, t: int) -> WorkloadRequest:
+        persona_idx = session_to_persona[s]
+        return _make_req(
+            len(requests), s, t, personas[persona_idx],
+            per_query_tokens, seed,
+        )
+
     if interleave == "round_robin":
         for turn in range(turns_per_session):
             for s in range(num_sessions):
-                requests.append(
-                    _make_req(
-                        len(requests),
-                        s,
-                        turn,
-                        shared,
-                        per_query_tokens,
-                        seed,
-                    )
-                )
+                requests.append(_build(s, turn))
     elif interleave == "shuffled":
         plan: list[tuple[int, int]] = [
             (s, t) for t in range(turns_per_session) for s in range(num_sessions)
         ]
         rng.shuffle(plan)
         for s, t in plan:
-            requests.append(
-                _make_req(
-                    len(requests),
-                    s,
-                    t,
-                    shared,
-                    per_query_tokens,
-                    seed,
-                )
-            )
+            requests.append(_build(s, t))
     else:
         raise ValueError(f"unknown interleave: {interleave}")
 
     # Build oracle reuse map: prefix_hash -> sorted list of step indices
-    # where that prefix appears. The shared prefix appears in EVERY
-    # request; per-session prefixes appear at each session's turn step.
+    # where that prefix appears. Each persona's shared prefix appears in
+    # every request bound to one of its sessions.
     oracle: dict[str, list[int]] = {}
     for req in requests:
         oracle.setdefault(req.prefix_hash, []).append(req.step_idx)
-    return requests, shared, oracle
+    return requests, personas, oracle
 
 
 def _make_req(
@@ -543,6 +544,11 @@ def main() -> None:
     parser.add_argument("--num-sessions", type=int, default=32)
     parser.add_argument("--turns-per-session", type=int, default=4)
     parser.add_argument("--shared-prefix-tokens", type=int, default=4096)
+    parser.add_argument("--num-personas", type=int, default=1,
+                        help="Number of distinct shared-prefix personas; "
+                             "sessions are partitioned across personas. "
+                             "num_personas=1 reproduces the old single-"
+                             "prefix workload (NOT pressured).")
     parser.add_argument("--per-query-tokens", type=int, default=128)
     parser.add_argument("--output-tokens", type=int, default=32)
     parser.add_argument(
