@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Integration tests for CartridgeConnector scheduler-side methods.
 
 These test the connector's interaction with vLLM's scheduler API
@@ -93,6 +94,13 @@ def _make_patched_init(vllm_config, cartridge_path, block_size):
         self._request_cartridge_ids = {}
         self._request_num_tokens = {}
         self._requests_need_load = set()
+        # Routing-aware fields added on this branch; the test
+        # fixture skips __init__, so initialize the routing
+        # attributes explicitly to keep update_state_after_alloc
+        # and build_connector_meta happy.
+        self._request_selected_block_ids = {}
+        self._kri_provider = None
+        self._routing_K = None
         self._kv_transfer_config = vllm_config.kv_transfer_config
         self._vllm_config = vllm_config
 

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Integration tests for multi-cartridge routing end-to-end.
 
 These tests exercise the full scheduler→worker dispatch path without
@@ -309,7 +310,7 @@ class TestInjectionKernelPerRequest:
 
         with patch(
             "vllm.distributed.kv_transfer.kv_connector.v1."
-            "cartridge_connector.ops.reshape_and_cache_flash",
+            "cartridge_connector.triton_reshape_and_cache_flash",
             side_effect=fake_writer,
         ):
             inject_kv_into_paged_cache(
