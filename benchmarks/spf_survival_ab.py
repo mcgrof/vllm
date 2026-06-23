@@ -589,11 +589,12 @@ def main() -> None:
     all_results: dict[str, list[ArmResult]] = {a: [] for a in arms}
 
     for seed in seeds:
-        workload, shared, oracle = build_workload(
+        workload, personas, oracle = build_workload(
             num_sessions=args.num_sessions,
             turns_per_session=args.turns_per_session,
             shared_prefix_tokens=args.shared_prefix_tokens,
             per_query_tokens=args.per_query_tokens,
+            num_personas=args.num_personas,
             interleave=args.interleave,
             seed=seed,
         )
@@ -601,7 +602,8 @@ def main() -> None:
         oracle_path.write_text(json.dumps(oracle))
         print(
             f"workload seed={seed}: {len(workload)} requests, "
-            f"shared_prefix={len(shared)} tokens, "
+            f"num_personas={args.num_personas}, "
+            f"per_persona_prefix={args.shared_prefix_tokens} tokens, "
             f"unique_prefixes={len(oracle)}"
         )
 
