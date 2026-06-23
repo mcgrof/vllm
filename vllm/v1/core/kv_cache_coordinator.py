@@ -163,7 +163,7 @@ class KVCacheCoordinator(ABC):
     def remove_skipped_blocks(self, request_id: str,
                               num_computed_tokens: int) -> None:
         """
-        Remove the blocks that are no longer needed from `blocks` and replace 
+        Remove the blocks that are no longer needed from `blocks` and replace
         the removed blocks with null_block.
 
         Args:
@@ -172,6 +172,25 @@ class KVCacheCoordinator(ABC):
         """
         for manager in self.single_type_managers:
             manager.remove_skipped_blocks(request_id, num_computed_tokens)
+
+    def null_block_positions(
+        self,
+        request_id: str,
+        logical_block_ids: "Sequence[int]",
+    ) -> None:
+        """Replace explicit logical block positions with null_block across
+        every single-type manager holding this request's blocks.
+
+        Connector-facing mutator for routing-aware sparse inject. Fans
+        out to ``SingleTypeKVCacheManager.null_block_positions`` on
+        every attention group. See that method for semantics.
+
+        Args:
+            request_id: The request ID whose block_table is mutated.
+            logical_block_ids: Logical block indices to null-block.
+        """
+        for manager in self.single_type_managers:
+            manager.null_block_positions(request_id, logical_block_ids)
 
     def get_blocks(self, request_id: str) -> tuple[list[KVCacheBlock], ...]:
         """

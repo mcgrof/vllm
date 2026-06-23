@@ -388,6 +388,29 @@ class KVCacheManager:
         """Get the block ids of a request."""
         return self.get_blocks(request_id).get_block_ids()
 
+    def null_block_positions(
+        self,
+        request_id: str,
+        logical_block_ids: "Sequence[int]",
+    ) -> None:
+        """Replace the given logical block positions in this request's
+        block_table with null_block across every attention group.
+
+        Connector-facing mutator for routing-aware sparse inject. Used
+        by the scheduler when a KV connector returns a non-empty skip
+        list from ``get_block_skip_list``. The previously-allocated
+        physical blocks are freed back to the pool. Attention backends
+        see null_block at these positions and skip them.
+
+        Idempotent: replaying the same skip list is safe (already-
+        null positions are left alone).
+
+        Args:
+            request_id: The request ID whose block_table is mutated.
+            logical_block_ids: Logical block indices to null-block.
+        """
+        self.coordinator.null_block_positions(request_id, logical_block_ids)
+
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """Cache the blocks for the request, if enabled."""
         if self.enable_caching:

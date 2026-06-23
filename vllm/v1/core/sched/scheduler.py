@@ -493,6 +493,31 @@ class Scheduler(SchedulerInterface):
                         num_external_computed_tokens,
                     )
 
+                    # Ask the connector whether any logical block
+                    # positions should be replaced with null_block for
+                    # this request (routing-aware sparse inject).
+                    # Default is None -> no-op. Connectors that
+                    # implement routing selection (e.g.
+                    # CartridgeConnector with a KRIProvider) return a
+                    # list of positions; we mutate the block_table so
+                    # attention backends see null_block at those
+                    # positions and skip them.
+                    if num_external_computed_tokens > 0:
+                        num_logical_blocks = (
+                            num_external_computed_tokens //
+                            self.kv_cache_manager.block_size) if hasattr(
+                                self.kv_cache_manager, "block_size") else None
+                        if num_logical_blocks is None:
+                            _blocks = self.kv_cache_manager.get_blocks(
+                                request.request_id)
+                            _ids = _blocks.get_block_ids()
+                            num_logical_blocks = (len(_ids[0]) if _ids else 0)
+                        skip_list = self.connector.get_block_skip_list(
+                            request.request_id, num_logical_blocks)
+                        if skip_list:
+                            self.kv_cache_manager.null_block_positions(
+                                request.request_id, skip_list)
+
                 # Request was already popped from self.waiting
                 # unless it was re-added above due to new_blocks being None.
                 request = self.waiting.pop_request()
@@ -624,6 +649,7 @@ class Scheduler(SchedulerInterface):
             self.kv_event_publisher.publish(batch)
 
         self._update_after_schedule(scheduler_output)
+
         return scheduler_output
 
     def _update_after_schedule(

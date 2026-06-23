@@ -235,7 +235,7 @@ class SingleTypeKVCacheManager(ABC):
     def remove_skipped_blocks(self, request_id: str,
                               num_computed_tokens: int) -> None:
         """
-        Remove the blocks that are no longer needed from `blocks` and free the 
+        Remove the blocks that are no longer needed from `blocks` and free the
         blocks. The removed blocks should be replaced by null_block.
         Need to be customized for each attention type.
 
@@ -244,6 +244,48 @@ class SingleTypeKVCacheManager(ABC):
             num_computed_tokens: The number of tokens that have been computed.
         """
         raise NotImplementedError
+
+    def null_block_positions(
+        self,
+        request_id: str,
+        logical_block_ids: "Sequence[int]",
+    ) -> None:
+        """Replace the given logical block positions in this request's
+        block_table with null_block; free the original blocks back to
+        the pool.
+
+        Connector-facing mutator for routing-aware sparse inject.
+        Unlike ``remove_skipped_blocks`` which computes its own skip
+        set from a sliding-window predicate, this accepts an explicit
+        list of positions decided by the caller (the scheduler, driven
+        by ``KVConnector.get_block_skip_list``).
+
+        Positions that are out of range or already null_block are
+        silently ignored. Duplicates in the input are deduplicated.
+
+        Args:
+            request_id: The request ID whose block_table is mutated.
+            logical_block_ids: Logical block indices to null-block.
+        """
+        if not logical_block_ids:
+            return
+        blocks = self.req_to_blocks.get(request_id)
+        if blocks is None:
+            return
+        removed: list[KVCacheBlock] = []
+        seen: set[int] = set()
+        for i in logical_block_ids:
+            if i in seen:
+                continue
+            seen.add(i)
+            if i < 0 or i >= len(blocks):
+                continue
+            if blocks[i] == self._null_block:
+                continue
+            removed.append(blocks[i])
+            blocks[i] = self._null_block
+        if removed:
+            self.block_pool.free_blocks(removed)
 
 
 class FullAttentionManager(SingleTypeKVCacheManager):
