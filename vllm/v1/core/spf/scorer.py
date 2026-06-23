@@ -121,6 +121,107 @@ class LearnedScorer(Scorer):
         return 1.0 / (1.0 + math.exp(-logit))
 
 
+class FrequencyAdmissionScorer(Scorer):
+    """Frequency-only admission heuristic (Q4 survival-gate arm).
+
+    A degenerate baseline that ignores recency, session, and depth —
+    a block is admitted (high score) iff it has been accessed often.
+    Mirrors a classic LFU prefix-cache admission policy. Use as the
+    "frequency-aware admission" arm in the Q4 survival gate per
+    Codex's plan.
+    """
+
+    def score(self, features: CandidateFeatures) -> float:
+        return features.log_frequency
+
+
+class SessionTTLScorer(Scorer):
+    """Session-TTL + pinning scorer (Q4 survival-gate baseline).
+
+    Issues a retention hint iff the candidate block belongs to a
+    session that was active within the configured TTL window.
+    Independent of frequency / transitions / depth. Mirrors the
+    classic "pin blocks of recently-active sessions; let everything
+    else fall to LRU" baseline that any sophisticated scorer must
+    beat by a real margin per the Q4 survival gate.
+
+    The session activity check is encoded in CandidateFeatures via
+    last_access_gap (steps since this session last touched any
+    prefix). Anything inside the TTL window gets a score of 1.0
+    biased by recency (so the freshest sessions outrank stale ones
+    within the window); anything outside gets 0.0.
+    """
+
+    def __init__(self, ttl_steps: int = 8):
+        self._ttl = max(1, int(ttl_steps))
+
+    def score(self, features: CandidateFeatures) -> float:
+        if features.last_access_gap >= self._ttl:
+            return 0.0
+        # Recency tiebreaker so the freshest in-window session wins.
+        return 1.0 / (1.0 + features.last_access_gap)
+
+
+class ReuseDistanceOracleScorer(Scorer):
+    """Belady-style oracle scorer (Q4 survival-gate upper bound).
+
+    Reads a pre-computed reuse-distance map (``prefix_hash -> next
+    access step index``) loaded from a workload trace. At score()
+    time it returns ``1 / (1 + future_distance)`` so the smallest
+    future distance dominates. Prefixes that never reappear in the
+    future trace score 0.
+
+    The oracle is unimplementable at serve time — it requires
+    omniscient future knowledge — but it is the upper bound any
+    learned scorer can reach. Use as the ceiling in the Q4 survival
+    gate so SPF can be compared against both "what trivial heuristics
+    can do" (session-TTL) and "what's left on the table" (oracle).
+
+    Trace format: JSON file
+        { "<prefix_hash>": [step_idx_a, step_idx_b, ...], ... }
+    where each list is sorted ascending. The scorer maintains the
+    current scheduler step internally so it can find the next access
+    via bisect.
+
+    Loaded from ``VLLM_SPF_ORACLE_TRACE_PATH`` env var by the
+    controller's _build_scorer when ``config.scorer == "oracle"``.
+    """
+
+    def __init__(self, trace_path: str):
+        import bisect
+        with open(trace_path) as f:
+            raw = json.load(f)
+        self._reuse: dict[str, list[int]] = {
+            k: list(v) for k, v in raw.items()
+        }
+        self._step = 0
+        self._bisect = bisect.bisect_right
+        # Map prefix_hash -> CandidateFeatures.last_access_gap
+        # captured at score time so we can convert "steps since
+        # last access" into a current scheduler step.
+
+    def advance_step(self, current_step: int) -> None:
+        """Called by the controller at each step() entry."""
+        self._step = current_step
+
+    def score(self, features: CandidateFeatures) -> float:
+        # The features object doesn't carry a prefix_hash field, so
+        # we use a sidecar set_prefix_hash() pattern — the controller
+        # is responsible for setting _last_prefix_hash before calling
+        # score(). Falls back to 0 if not set.
+        ph = getattr(features, "_oracle_prefix_hash", None)
+        if ph is None:
+            return 0.0
+        accesses = self._reuse.get(ph)
+        if not accesses:
+            return 0.0
+        idx = self._bisect(accesses, self._step)
+        if idx >= len(accesses):
+            return 0.0
+        future_distance = accesses[idx] - self._step
+        return 1.0 / (1.0 + future_distance)
+
+
 class ExpectedUtilityScorer:
     """Rank candidates by expected utility (phase-2 default).
 

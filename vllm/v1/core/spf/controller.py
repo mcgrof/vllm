@@ -181,8 +181,26 @@ class SPFController:
 
     @staticmethod
     def _build_scorer(config: SPFConfig) -> Scorer:
-        if config.scorer == "learned" and config.learned_weights_path:
+        import os
+
+        from vllm.v1.core.spf.scorer import (FrequencyAdmissionScorer,
+                                             ReuseDistanceOracleScorer,
+                                             SessionTTLScorer)
+        name = (config.scorer or "session_aware").lower()
+        if name == "learned" and config.learned_weights_path:
             return LearnedScorer(config.learned_weights_path)
+        if name == "session_ttl":
+            ttl = int(os.environ.get("VLLM_SPF_SESSION_TTL_STEPS", "8"))
+            return SessionTTLScorer(ttl_steps=ttl)
+        if name in ("frequency", "frequency_admit", "freq_admit"):
+            return FrequencyAdmissionScorer()
+        if name == "oracle":
+            trace_path = os.environ.get("VLLM_SPF_ORACLE_TRACE_PATH", "")
+            if not trace_path:
+                raise ValueError(
+                    "VLLM_SPF_SCORER=oracle requires "
+                    "VLLM_SPF_ORACLE_TRACE_PATH to be set")
+            return ReuseDistanceOracleScorer(trace_path)
         return SessionAwareScorer()
 
     def set_manifest_provider(self, provider: BlockManifestProvider) -> None:
