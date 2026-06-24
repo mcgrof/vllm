@@ -16,6 +16,7 @@ Design notes for future asymmetric K/V:
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
@@ -45,6 +46,170 @@ logger = init_logger(__name__)
 # ---------------------------------------------------------------------------
 GROUP_SIZE: int = 32  # number of elements per quantization group
 INT4_RANGE: int = 7  # max absolute value representable in signed INT4
+
+# ---------------------------------------------------------------------------
+# Debug instrumentation (guarded by VLLM_FUSED_INT4_DEBUG=1)
+# ---------------------------------------------------------------------------
+_FUSED_INT4_DEBUG: bool = os.environ.get("VLLM_FUSED_INT4_DEBUG",
+                                          "0") == "1"
+_debug_dumped_cache_write: bool = False
+_debug_dumped_decode: bool = False
+
+
+def _debug_dump_cache_write(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    k_scales: torch.Tensor,
+    v_scales: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    num_kv_heads: int,
+    head_size: int,
+) -> None:
+    """Dump cache-write boundary info for the first token / first head.
+
+    Only called when VLLM_FUSED_INT4_DEBUG=1.  Logs to the vLLM logger
+    at INFO level so it appears in server logs.
+    """
+    global _debug_dumped_cache_write
+    if _debug_dumped_cache_write:
+        return
+    _debug_dumped_cache_write = True
+
+    block_size = key_cache.shape[1]
+    slot0 = slot_mapping[0].item()
+    block_idx = slot0 // block_size
+    block_offset = slot0 % block_size
+
+    # Original FP16 K/V for token 0, head 0
+    k_orig = key[0, 0, :16].detach().cpu().float().tolist()
+    v_orig = value[0, 0, :16].detach().cpu().float().tolist()
+
+    # After the cache write has happened, read back packed bytes + scales
+    torch.cuda.synchronize()
+    k_packed_bytes = key_cache[block_idx, block_offset, 0, :8].detach().cpu().tolist()
+    v_packed_bytes = value_cache[block_idx, block_offset, 0, :8].detach().cpu().tolist()
+    k_scale_vals = k_scales[block_idx, block_offset, 0].detach().cpu().float().tolist()
+    v_scale_vals = v_scales[block_idx, block_offset, 0].detach().cpu().float().tolist()
+
+    # CPU-side reference dequant of the first 16 K values
+    k_recon = _cpu_dequant_slot(key_cache, k_scales,
+                                block_idx, block_offset, head_idx=0,
+                                head_size=head_size, n_values=16)
+    v_recon = _cpu_dequant_slot(value_cache, v_scales,
+                                block_idx, block_offset, head_idx=0,
+                                head_size=head_size, n_values=16)
+
+    k_mae = max(abs(a - b) for a, b in zip(k_orig, k_recon))
+    v_mae = max(abs(a - b) for a, b in zip(v_orig, v_recon))
+
+    logger.info(
+        "[FusedInt4Debug] cache_write: "
+        "slot=%d block_idx=%d block_offset=%d block_size=%d | "
+        "K_orig[:16]=%s | V_orig[:16]=%s | "
+        "K_packed[:8]=%s | V_packed[:8]=%s | "
+        "K_scales=%s | V_scales=%s | "
+        "K_recon[:16]=%s | V_recon[:16]=%s | "
+        "K_max_abs_err=%.6f V_max_abs_err=%.6f",
+        slot0, block_idx, block_offset, block_size,
+        _fmt(k_orig), _fmt(v_orig),
+        k_packed_bytes, v_packed_bytes,
+        _fmt(k_scale_vals), _fmt(v_scale_vals),
+        _fmt(k_recon), _fmt(v_recon),
+        k_mae, v_mae,
+    )
+
+
+def _debug_dump_decode(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    k_scales: torch.Tensor,
+    v_scales: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    num_kv_heads: int,
+    head_size: int,
+) -> None:
+    """Dump decode-launch boundary info for first sequence / first head.
+
+    Only called when VLLM_FUSED_INT4_DEBUG=1.  Fires once.
+    """
+    global _debug_dumped_decode
+    if _debug_dumped_decode:
+        return
+    _debug_dumped_decode = True
+
+    seq_len = seq_lens[0].item()
+    bt_row = block_table[0].detach().cpu().tolist()
+    q_slice = query[0, 0, :16].detach().cpu().float().tolist()
+
+    # First physical block used by this sequence
+    phys0 = bt_row[0] if bt_row else -1
+    block_size = key_cache.shape[1]
+
+    # Read first slot (block 0, offset 0) of the first KV head
+    if phys0 >= 0:
+        k_bytes = key_cache[phys0, 0, 0, :8].detach().cpu().tolist()
+        v_bytes = value_cache[phys0, 0, 0, :8].detach().cpu().tolist()
+        k_sc = k_scales[phys0, 0, 0].detach().cpu().float().tolist()
+        v_sc = v_scales[phys0, 0, 0].detach().cpu().float().tolist()
+    else:
+        k_bytes = v_bytes = k_sc = v_sc = []
+
+    logger.info(
+        "[FusedInt4Debug] decode_launch: "
+        "seq_len=%d block_table[0]=%s | "
+        "query[0,0,:16]=%s | "
+        "K_cache[phys0,0,0,:8]=%s | V_cache[phys0,0,0,:8]=%s | "
+        "K_scales[phys0,0,0]=%s | V_scales[phys0,0,0]=%s",
+        seq_len, bt_row[:8],
+        _fmt(q_slice),
+        k_bytes, v_bytes,
+        _fmt(k_sc), _fmt(v_sc),
+    )
+
+
+def _cpu_dequant_slot(
+    cache: torch.Tensor,
+    scales: torch.Tensor,
+    block_idx: int,
+    block_offset: int,
+    head_idx: int,
+    head_size: int,
+    n_values: int = 16,
+) -> list[float]:
+    """CPU-side dequant of packed INT4 bytes for one slot/head.
+
+    Returns a list of n_values reconstructed float values.
+    """
+    packed = cache[block_idx, block_offset, head_idx].detach().cpu()
+    sc = scales[block_idx, block_offset, head_idx].detach().cpu().float()
+    group_size = GROUP_SIZE
+
+    # Unpack: low nibble = even index, high nibble = odd index
+    low = (packed & 0x0F).to(torch.int8) - 8
+    high = ((packed >> 4) & 0x0F).to(torch.int8) - 8
+
+    # Interleave back to full head_size
+    hd = packed.shape[0] * 2
+    full = torch.empty(hd, dtype=torch.float32)
+    full[0::2] = low.float()
+    full[1::2] = high.float()
+
+    # Apply per-group scales
+    num_groups = hd // group_size
+    full = full.reshape(num_groups, group_size)
+    full = full * sc[:num_groups].unsqueeze(1)
+    full = full.reshape(hd)
+
+    return full[:n_values].tolist()
+
+
+def _fmt(vals: list[float], precision: int = 5) -> str:
+    """Format a list of floats compactly for log lines."""
+    return "[" + ", ".join(f"{v:.{precision}f}" for v in vals) + "]"
 
 
 # Portable rounding helper that works on both CUDA and ROCm Triton
@@ -698,6 +863,17 @@ class FusedInt4AttentionImpl(
                     attn_metadata.slot_mapping,
                 )
 
+                # Debug: dump cache-write info for first token/head
+                if _FUSED_INT4_DEBUG:
+                    _debug_dump_cache_write(
+                        key, value,
+                        key_cache, value_cache,
+                        self._k_scales, self._v_scales,
+                        attn_metadata.slot_mapping,
+                        num_kv_heads=self.num_kv_heads,
+                        head_size=self.head_size,
+                    )
+
             # ---- Decode: fused attention ----
             if attn_metadata.max_query_len == 1:
                 # Pure decode — use fused INT4 kernel
@@ -724,6 +900,18 @@ class FusedInt4AttentionImpl(
                         self.head_size, block_n,
                     )
                 self._decode_fused_count += 1
+
+                # Debug: dump decode-launch info for first seq/head
+                if _FUSED_INT4_DEBUG:
+                    _debug_dump_decode(
+                        query[:attn_metadata.seq_lens.shape[0]],
+                        key_cache, value_cache,
+                        self._k_scales, self._v_scales,
+                        attn_metadata.block_table,
+                        attn_metadata.seq_lens,
+                        num_kv_heads=self.num_kv_heads,
+                        head_size=self.head_size,
+                    )
 
                 decode_output = fused_int4_decode(
                     query[:attn_metadata.seq_lens.shape[0]],
