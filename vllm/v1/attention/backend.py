@@ -159,9 +159,15 @@ class AttentionBackend(ABC):
         return dtype in cls.supported_dtypes
 
     @classmethod
-    def supports_kv_cache_dtype(cls, kv_cache_dtype: "CacheDType | None") -> bool:
+    def supports_kv_cache_dtype(cls, kv_cache_dtype) -> bool:
         if kv_cache_dtype is None:
             return True
+        # Asymmetric K/V: check both halves of the tuple
+        if isinstance(kv_cache_dtype, tuple):
+            return all(
+                cls.supports_kv_cache_dtype(dt)
+                for dt in kv_cache_dtype
+            )
         return (not cls.supported_kv_cache_dtypes) or (
             kv_cache_dtype in cls.supported_kv_cache_dtypes
         )
