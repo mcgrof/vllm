@@ -49,11 +49,34 @@ INT4_RANGE: int = 7  # max absolute value representable in signed INT4
 
 # ---------------------------------------------------------------------------
 # Debug instrumentation (guarded by VLLM_FUSED_INT4_DEBUG=1)
+#
+# When enabled, captures bounded debug snapshots for the first
+# request/head/slot at both cache-write and decode-launch boundaries.
+# Snapshots are accumulated in _debug_snapshots and can be flushed to
+# a JSON file via _debug_flush().
 # ---------------------------------------------------------------------------
 _FUSED_INT4_DEBUG: bool = os.environ.get("VLLM_FUSED_INT4_DEBUG",
                                           "0") == "1"
-_debug_dumped_cache_write: bool = False
-_debug_dumped_decode: bool = False
+_FUSED_INT4_DEBUG_PATH: str = os.environ.get(
+    "VLLM_FUSED_INT4_DEBUG_PATH", "/tmp/fused_int4_debug.json")
+_debug_snapshots: list[dict] = []
+_debug_write_count: int = 0   # how many cache-write dumps we've done
+_debug_decode_count: int = 0  # how many decode dumps we've done
+_DEBUG_MAX_DUMPS: int = 3     # cap per phase to stay bounded
+
+
+def _debug_flush() -> None:
+    """Write accumulated debug snapshots to JSON file."""
+    if not _debug_snapshots:
+        return
+    import json as _json
+    try:
+        with open(_FUSED_INT4_DEBUG_PATH, "w") as f:
+            _json.dump(_debug_snapshots, f, indent=2)
+        logger.info("[FusedInt4Debug] Wrote %d snapshots to %s",
+                    len(_debug_snapshots), _FUSED_INT4_DEBUG_PATH)
+    except OSError as e:
+        logger.warning("[FusedInt4Debug] Could not write debug file: %s", e)
 
 
 def _debug_dump_cache_write(
@@ -66,16 +89,16 @@ def _debug_dump_cache_write(
     slot_mapping: torch.Tensor,
     num_kv_heads: int,
     head_size: int,
+    is_decode: bool = False,
 ) -> None:
     """Dump cache-write boundary info for the first token / first head.
 
-    Only called when VLLM_FUSED_INT4_DEBUG=1.  Logs to the vLLM logger
-    at INFO level so it appears in server logs.
+    Only called when VLLM_FUSED_INT4_DEBUG=1.  Bounded to first few calls.
     """
-    global _debug_dumped_cache_write
-    if _debug_dumped_cache_write:
+    global _debug_write_count
+    if _debug_write_count >= _DEBUG_MAX_DUMPS:
         return
-    _debug_dumped_cache_write = True
+    _debug_write_count += 1
 
     block_size = key_cache.shape[1]
     slot0 = slot_mapping[0].item()
@@ -88,12 +111,16 @@ def _debug_dump_cache_write(
 
     # After the cache write has happened, read back packed bytes + scales
     torch.cuda.synchronize()
-    k_packed_bytes = key_cache[block_idx, block_offset, 0, :8].detach().cpu().tolist()
-    v_packed_bytes = value_cache[block_idx, block_offset, 0, :8].detach().cpu().tolist()
-    k_scale_vals = k_scales[block_idx, block_offset, 0].detach().cpu().float().tolist()
-    v_scale_vals = v_scales[block_idx, block_offset, 0].detach().cpu().float().tolist()
+    k_packed_bytes = key_cache[block_idx, block_offset, 0, :8] \
+        .detach().cpu().tolist()
+    v_packed_bytes = value_cache[block_idx, block_offset, 0, :8] \
+        .detach().cpu().tolist()
+    k_scale_vals = k_scales[block_idx, block_offset, 0] \
+        .detach().cpu().float().tolist()
+    v_scale_vals = v_scales[block_idx, block_offset, 0] \
+        .detach().cpu().float().tolist()
 
-    # CPU-side reference dequant of the first 16 K values
+    # CPU-side reference dequant of the first 16 K/V values
     k_recon = _cpu_dequant_slot(key_cache, k_scales,
                                 block_idx, block_offset, head_idx=0,
                                 head_size=head_size, n_values=16)
@@ -104,19 +131,36 @@ def _debug_dump_cache_write(
     k_mae = max(abs(a - b) for a, b in zip(k_orig, k_recon))
     v_mae = max(abs(a - b) for a, b in zip(v_orig, v_recon))
 
+    snapshot = {
+        "phase": "cache_write",
+        "is_decode": is_decode,
+        "call_index": _debug_write_count,
+        "slot": slot0,
+        "block_idx": block_idx,
+        "block_offset": block_offset,
+        "block_size": block_size,
+        "num_tokens": key.shape[0],
+        "slot_mapping_first8": slot_mapping[:min(8, slot_mapping.shape[0])]
+            .detach().cpu().tolist(),
+        "K_orig_16": k_orig,
+        "V_orig_16": v_orig,
+        "K_packed_8": k_packed_bytes,
+        "V_packed_8": v_packed_bytes,
+        "K_scales": k_scale_vals,
+        "V_scales": v_scale_vals,
+        "K_recon_16": k_recon,
+        "V_recon_16": v_recon,
+        "K_max_abs_err": k_mae,
+        "V_max_abs_err": v_mae,
+    }
+    _debug_snapshots.append(snapshot)
+
     logger.info(
-        "[FusedInt4Debug] cache_write: "
-        "slot=%d block_idx=%d block_offset=%d block_size=%d | "
-        "K_orig[:16]=%s | V_orig[:16]=%s | "
-        "K_packed[:8]=%s | V_packed[:8]=%s | "
-        "K_scales=%s | V_scales=%s | "
-        "K_recon[:16]=%s | V_recon[:16]=%s | "
-        "K_max_abs_err=%.6f V_max_abs_err=%.6f",
-        slot0, block_idx, block_offset, block_size,
-        _fmt(k_orig), _fmt(v_orig),
-        k_packed_bytes, v_packed_bytes,
-        _fmt(k_scale_vals), _fmt(v_scale_vals),
-        _fmt(k_recon), _fmt(v_recon),
+        "[FusedInt4Debug] cache_write(#%d, decode=%s): "
+        "slot=%d block_idx=%d block_offset=%d num_tokens=%d | "
+        "K_mae=%.6f V_mae=%.6f",
+        _debug_write_count, is_decode,
+        slot0, block_idx, block_offset, key.shape[0],
         k_mae, v_mae,
     )
 
@@ -134,12 +178,14 @@ def _debug_dump_decode(
 ) -> None:
     """Dump decode-launch boundary info for first sequence / first head.
 
-    Only called when VLLM_FUSED_INT4_DEBUG=1.  Fires once.
+    Only called when VLLM_FUSED_INT4_DEBUG=1.  Bounded to first few calls.
+    Includes dequantized reconstruction of the first cached slot for
+    cross-checking cache-read correctness.
     """
-    global _debug_dumped_decode
-    if _debug_dumped_decode:
+    global _debug_decode_count
+    if _debug_decode_count >= _DEBUG_MAX_DUMPS:
         return
-    _debug_dumped_decode = True
+    _debug_decode_count += 1
 
     seq_len = seq_lens[0].item()
     bt_row = block_table[0].detach().cpu().tolist()
@@ -149,26 +195,75 @@ def _debug_dump_decode(
     phys0 = bt_row[0] if bt_row else -1
     block_size = key_cache.shape[1]
 
-    # Read first slot (block 0, offset 0) of the first KV head
+    torch.cuda.synchronize()
+
+    k_bytes = v_bytes = []
+    k_sc = v_sc = []
+    k_recon = v_recon = []
     if phys0 >= 0:
         k_bytes = key_cache[phys0, 0, 0, :8].detach().cpu().tolist()
         v_bytes = value_cache[phys0, 0, 0, :8].detach().cpu().tolist()
         k_sc = k_scales[phys0, 0, 0].detach().cpu().float().tolist()
         v_sc = v_scales[phys0, 0, 0].detach().cpu().float().tolist()
-    else:
-        k_bytes = v_bytes = k_sc = v_sc = []
+        # Reconstruct the first slot to verify decode-side read
+        k_recon = _cpu_dequant_slot(key_cache, k_scales,
+                                    phys0, 0, head_idx=0,
+                                    head_size=head_size, n_values=16)
+        v_recon = _cpu_dequant_slot(value_cache, v_scales,
+                                    phys0, 0, head_idx=0,
+                                    head_size=head_size, n_values=16)
+
+    # Also dump the last slot in the sequence (the decode-written token)
+    last_slot_idx = seq_len - 1
+    last_logical_block = last_slot_idx // block_size
+    last_block_offset = last_slot_idx % block_size
+    last_phys = bt_row[last_logical_block] if last_logical_block < len(
+        bt_row) else -1
+    last_k_recon = last_v_recon = []
+    last_k_bytes = last_v_bytes = []
+    if last_phys >= 0:
+        last_k_bytes = key_cache[last_phys, last_block_offset, 0, :8] \
+            .detach().cpu().tolist()
+        last_v_bytes = value_cache[last_phys, last_block_offset, 0, :8] \
+            .detach().cpu().tolist()
+        last_k_recon = _cpu_dequant_slot(
+            key_cache, k_scales, last_phys, last_block_offset,
+            head_idx=0, head_size=head_size, n_values=16)
+        last_v_recon = _cpu_dequant_slot(
+            value_cache, v_scales, last_phys, last_block_offset,
+            head_idx=0, head_size=head_size, n_values=16)
+
+    snapshot = {
+        "phase": "decode_launch",
+        "call_index": _debug_decode_count,
+        "seq_len": seq_len,
+        "block_table_first8": bt_row[:8],
+        "block_size": block_size,
+        "query_0_0_16": q_slice,
+        "slot0_K_packed_8": k_bytes,
+        "slot0_V_packed_8": v_bytes,
+        "slot0_K_scales": k_sc,
+        "slot0_V_scales": v_sc,
+        "slot0_K_recon_16": k_recon,
+        "slot0_V_recon_16": v_recon,
+        "last_slot_idx": last_slot_idx,
+        "last_phys_block": last_phys,
+        "last_block_offset": last_block_offset,
+        "last_K_packed_8": last_k_bytes,
+        "last_V_packed_8": last_v_bytes,
+        "last_K_recon_16": last_k_recon,
+        "last_V_recon_16": last_v_recon,
+    }
+    _debug_snapshots.append(snapshot)
 
     logger.info(
-        "[FusedInt4Debug] decode_launch: "
-        "seq_len=%d block_table[0]=%s | "
-        "query[0,0,:16]=%s | "
-        "K_cache[phys0,0,0,:8]=%s | V_cache[phys0,0,0,:8]=%s | "
-        "K_scales[phys0,0,0]=%s | V_scales[phys0,0,0]=%s",
-        seq_len, bt_row[:8],
-        _fmt(q_slice),
-        k_bytes, v_bytes,
-        _fmt(k_sc), _fmt(v_sc),
+        "[FusedInt4Debug] decode_launch(#%d): "
+        "seq_len=%d block_table[0]=%s last_slot=%d",
+        _debug_decode_count, seq_len, bt_row[:4], last_slot_idx,
     )
+
+    # Flush after each decode dump so we don't lose data on crash
+    _debug_flush()
 
 
 def _cpu_dequant_slot(
@@ -865,6 +960,7 @@ class FusedInt4AttentionImpl(
 
                 # Debug: dump cache-write info for first token/head
                 if _FUSED_INT4_DEBUG:
+                    is_decode_step = (attn_metadata.max_query_len == 1)
                     _debug_dump_cache_write(
                         key, value,
                         key_cache, value_cache,
@@ -872,6 +968,7 @@ class FusedInt4AttentionImpl(
                         attn_metadata.slot_mapping,
                         num_kv_heads=self.num_kv_heads,
                         head_size=self.head_size,
+                        is_decode=is_decode_step,
                     )
 
             # ---- Decode: fused attention ----
