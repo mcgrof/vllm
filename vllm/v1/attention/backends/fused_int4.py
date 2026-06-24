@@ -81,9 +81,38 @@ ASYMMETRIC: bool = os.environ.get("VLLM_FUSED_INT4_ASYMMETRIC", "0") == "1"
 # entry into the lower-memory-traffic fused path.  This is a model-specific
 # default, not a universal rule. Override with VLLM_FUSED_INT4_MIN_SEQ_LEN
 # when calibrating other models or regimes.
-MIN_FUSED_SEQ_LEN: int = int(
-    os.environ.get("VLLM_FUSED_INT4_MIN_SEQ_LEN", "48")
-)
+#
+# Platform-aware default: on sm_80 (A100), INT4 KV quantization error is
+# amplified through attention softmax to the point where output is corrupted
+# for multi-layer models (verified on Qwen2.5-7B-Instruct: per-layer decode
+# cosine similarity between fused INT4 and FP16 fallback drops to 0.52-0.99,
+# producing token-143907 "pérdida" corruption). On sm_90+ (H100), the same
+# code works correctly with MSL=48. Until the underlying precision issue is
+# resolved (e.g. via per-channel scaling or INT8 K), we disable the fused
+# decode kernel on sm_80 by defaulting MSL to a very high value.
+_MIN_FUSED_SEQ_LEN_DEFAULT = "48"
+_user_msl_override = os.environ.get("VLLM_FUSED_INT4_MIN_SEQ_LEN")
+if _user_msl_override is not None:
+    _MIN_FUSED_SEQ_LEN_DEFAULT = _user_msl_override
+else:
+    try:
+        if torch.cuda.is_available():
+            _cc = torch.cuda.get_device_capability()
+            if _cc[0] < 9:
+                # sm_80 (A100), sm_86 (A6000/3090), sm_89 (4090/L4/L40)
+                # Fused INT4 decode is not validated below sm_90.
+                _MIN_FUSED_SEQ_LEN_DEFAULT = "999999"
+                logger.warning(
+                    "[FusedInt4] Detected compute capability %d.%d (< sm_90). "
+                    "Fused INT4 decode is only validated on sm_90+ (H100). "
+                    "Disabling fused decode (MSL=999999, all decode via FP16 "
+                    "SDPA fallback). INT4 cache writes still save memory. "
+                    "Override with VLLM_FUSED_INT4_MIN_SEQ_LEN=48 to force.",
+                    _cc[0], _cc[1],
+                )
+    except Exception:
+        pass  # Non-CUDA or early import — keep default
+MIN_FUSED_SEQ_LEN: int = int(_MIN_FUSED_SEQ_LEN_DEFAULT)
 
 # K-cache precision override for K/V precision-split experiments.
 # "int4" (default): both K and V use INT4 (existing behaviour).
