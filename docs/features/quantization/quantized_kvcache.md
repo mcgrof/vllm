@@ -185,3 +185,111 @@ if __name__ == "__main__":
 ```
 
 For more detailed and up-to-date examples, see the [`llm-compressor` official examples](https://github.com/vllm-project/llm-compressor/tree/main/examples/quantization_kv_cache).
+
+---
+
+## INT4 Fused KV Cache (Experimental)
+
+The INT4 fused KV cache stores keys and values as packed 4-bit integers (2 values
+per uint8 byte) with per-group FP16 scales (group_size=32). During decode, a
+fused Triton kernel dequantizes the INT4 data in-register and computes attention
+without materializing an FP16 intermediate in global memory. This eliminates the
+extra memory traffic that makes non-fused quantization counterproductive.
+
+The fused path reduces KV cache memory footprint by approximately 4x compared to
+FP16 and delivers decode speedups of 2.5x-5.4x at batch sizes >= 2. At batch
+size 1, the overhead of the Triton kernel can exceed the traffic savings, so a
+bounded dispatch policy (falling back to FlashAttention at B=1) is planned.
+
+The research behind this feature is published in
+[Memory-Traffic Saturation in Autoregressive Transformer Decode]((anonymized — see paper supplement)),
+which benchmarks 14 open-weight models across W7900, A100, H100, and B200
+and shows that kernel fusion — not quantization alone — is the mechanism that
+turns compression into real decode speedup.
+
+### Usage
+
+```bash
+# CLI
+vllm serve meta-llama/Llama-3.1-8B-Instruct --kv-cache-dtype int4_fused
+
+# Python
+from vllm import LLM, SamplingParams
+
+llm = LLM(
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    kv_cache_dtype="int4_fused",
+)
+out = llm.generate("London is the capital of", SamplingParams(temperature=0.7))
+print(out[0].outputs[0].text)
+```
+
+### How it works
+
+1. **Cache write (prefill)**: FP16/BF16 K/V outputs from the model are quantized
+   to INT4 by the `reshape_and_cache_int4` Triton kernel. Each group of 32
+   elements is independently scaled: `scale = max(|group|) / 7`. Two INT4
+   values are packed into one uint8 byte (low nibble = even index, high nibble =
+   odd index). Scales are stored as FP16 in a separate tensor.
+
+2. **Cache read (decode)**: The `fused_int4_decode` Triton kernel reads packed
+   uint8 bytes from the paged KV cache, unpacks the nibbles, multiplies by the
+   per-group scale, and computes the QK dot product and softmax-weighted V
+   accumulation — all in-register. No FP16 buffer is written to global memory.
+
+3. **Prefill fallback**: During prefill (multi-token queries), the fresh K/V
+   are still in FP16 from the model. The backend uses `torch.nn.functional.scaled_dot_product_attention`
+   (SDPA) directly on the FP16 data and logs a warning that prefill is not using
+   the fused path. Only decode uses the fused INT4 kernel.
+
+### Asymmetric K/V support (future)
+
+The implementation stores K and V scales in separate tensors (`k_scales`,
+`v_scales`). The decode kernel has independent scale loading paths for K and V.
+This structure supports future asymmetric quantization where keys and values
+use different precision — motivated by the finding that values universally
+tolerate INT4 while some model families (Qwen) require higher key precision.
+
+### Backend verification
+
+When `int4_fused` is selected, vLLM logs machine-readable verification lines:
+
+```
+Backend manifest: requested_backend=int4_fused, selected_backend=FUSED_INT4, ...
+[FusedInt4] Backend verification: selected_backend=FUSED_INT4, decode_kernel=fused_int4_triton, ...
+```
+
+These logs allow benchmark harnesses to confirm the fused path actually ran
+rather than falling back silently.
+
+### Constraints
+
+- **Head size** must be divisible by 32 (the group size)
+- **Sliding window attention** is not yet supported
+- **ALiBi** positional encoding is not yet supported
+- **CUDAGraph** capture is not yet supported (decode runs without graph capture)
+- Prefill uses SDPA fallback, not the fused kernel
+
+### Validated hardware
+
+| GPU | Platform | Triton | Status |
+|-----|----------|--------|--------|
+| AMD Radeon Pro W7900 | ROCm 6.4 | 3.5.1 | Tested: 2.5x-5.4x decode speedup, cos_sim=1.0 |
+| NVIDIA H100 | CUDA | — | Planned |
+
+### Smoke benchmark
+
+A self-contained kernel-level benchmark is included:
+
+```bash
+python benchmarks/fused_int4_smoke.py
+```
+
+This exercises both the FP16 SDPA baseline and the fused INT4 decode kernel
+with synthetic tensors (no model download needed). It emits a JSON manifest
+to stdout with per-point latencies, speedup ratios, cosine similarity, and
+backend verification fields.
+
+### Additional `kv_cache_dtype` option
+
+- `kv_cache_dtype="int4_fused"`: Packed INT4 with fused in-kernel dequantization (experimental)
