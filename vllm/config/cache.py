@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import field
-from typing import ClassVar, Literal
+from typing import ClassVar, Literal, Union
 
 from pydantic import Field, SkipValidation, field_validator, model_validator
 
@@ -27,6 +27,45 @@ MambaCacheMode = Literal["all", "align", "none"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
 KVOffloadingBackend = Literal["native", "lmcache"]
 
+# Asymmetric K/V: cache_dtype can be a single string (symmetric,
+# backward compatible) or a 2-tuple of strings (K dtype, V dtype).
+# Example: ("float16", "fp8_e4m3") for Qwen-safe FP16 keys + FP8 values.
+CacheDTypeSpec = Union[CacheDType, tuple[CacheDType, CacheDType]]
+
+
+def parse_cache_dtype_spec(raw: str) -> CacheDTypeSpec:
+    """Parse a cache dtype spec from a CLI string.
+
+    Accepts either a single token ("fp8_e4m3") or a comma-separated
+    pair ("float16,fp8_e4m3"). Returns either a CacheDType string
+    or a (k_dtype, v_dtype) tuple.
+    """
+    if "," in raw:
+        parts = [p.strip() for p in raw.split(",", 1)]
+        return (parts[0], parts[1])  # type: ignore[return-value]
+    return raw  # type: ignore[return-value]
+
+
+def cache_dtype_k(spec: CacheDTypeSpec) -> CacheDType:
+    """Extract the K dtype from a CacheDTypeSpec."""
+    if isinstance(spec, tuple):
+        return spec[0]
+    return spec
+
+
+def cache_dtype_v(spec: CacheDTypeSpec) -> CacheDType:
+    """Extract the V dtype from a CacheDTypeSpec."""
+    if isinstance(spec, tuple):
+        return spec[1]
+    return spec
+
+
+def is_asymmetric_kv(spec: CacheDTypeSpec) -> bool:
+    """True if K and V use different dtypes."""
+    if isinstance(spec, tuple):
+        return spec[0] != spec[1]
+    return False
+
 
 @config
 class CacheConfig:
@@ -47,13 +86,15 @@ class CacheConfig:
     not matter if you have another vLLM instance running on the same GPU. For
     example, if you have two vLLM instances running on the same GPU, you can
     set the GPU memory utilization to 0.5 for each instance."""
-    cache_dtype: CacheDType = "auto"
+    cache_dtype: CacheDTypeSpec = "auto"
     """Data type for kv cache storage. If "auto", will use model data type.
     CUDA 11.8+ supports fp8 (=fp8_e4m3) and fp8_e5m2. ROCm (AMD GPU) supports
     fp8 (=fp8_e4m3). Intel Gaudi (HPU) supports fp8 (using fp8_inc).
     Some models (namely DeepSeekV3.2) default to fp8, set to bfloat16 to use
     bfloat16 instead, this is an invalid option for models that do not default
     to fp8.
+    For asymmetric K/V, pass a comma-separated pair via CLI:
+    --kv-cache-dtype float16,fp8_e4m3 (FP16 keys, FP8 values).
     """
     is_attention_free: bool = False
     """Whether the model is attention-free. This is primarily set in
@@ -221,20 +262,27 @@ class CacheConfig:
 
     @field_validator("cache_dtype", mode="after")
     @classmethod
-    def _validate_cache_dtype(cls, cache_dtype: CacheDType) -> CacheDType:
+    def _validate_cache_dtype(
+        cls, cache_dtype: CacheDTypeSpec,
+    ) -> CacheDTypeSpec:
+        if isinstance(cache_dtype, tuple):
+            k_dt, v_dt = cache_dtype
+            logger.info(
+                "Using asymmetric KV cache: K=%s, V=%s. "
+                "Keys stay at higher precision to protect "
+                "models with fragile key activations (e.g. "
+                "Qwen family).", k_dt, v_dt,
+            )
+            return cache_dtype
         if cache_dtype.startswith("fp8"):
             logger.info(
-                "Using fp8 data type to store kv cache. It reduces the GPU "
-                "memory footprint and boosts the performance. "
-                "Meanwhile, it may cause accuracy drop without a proper "
-                "scaling factor."
+                "Using fp8 data type to store kv cache. It "
+                "reduces the GPU memory footprint and boosts "
+                "the performance. Meanwhile, it may cause "
+                "accuracy drop without a proper scaling factor."
             )
         elif cache_dtype == "int4_fused":
             logger.info(
-                "Using INT4 fused quantization for KV cache. K and V are "
-                "packed as 2 values per byte with per-group FP16 scales "
-                "(group_size=32). Decode uses a fused Triton kernel that "
-                "dequantizes in-register without materializing FP16 "
-                "intermediates. This reduces memory footprint ~4x vs FP16."
+                "Using INT4 fused quantization for KV cache."
             )
         return cache_dtype
