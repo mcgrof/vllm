@@ -922,6 +922,13 @@ class FusedInt4AttentionImpl(
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # During warmup/profiling attn_metadata may be None
+        if attn_metadata is None:
+            if output is not None:
+                output.zero_()
+                return output
+            return torch.zeros_like(query)
+
         num_actual_tokens = attn_metadata.num_actual_tokens
 
         # Split the (2, ...) cache into K and V planes
