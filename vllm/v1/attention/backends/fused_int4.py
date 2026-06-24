@@ -47,13 +47,16 @@ logger = init_logger(__name__)
 GROUP_SIZE: int = 32  # number of elements per quantization group
 INT4_RANGE: int = 7  # max absolute value representable in signed INT4
 
-# Minimum sequence length to use fused INT4 decode kernel.  For shorter
-# sequences the quantisation error per-token is amplified (fewer tokens
-# to dilute it through softmax), which compounds across 28+ transformer
-# layers and flips the argmax.  Below this threshold we dequantise the
-# cache to FP16 and use a torch SDPA fallback — slower but correct.
+# Minimum sequence length to use fused INT4 decode kernel.  Below this
+# threshold the decode path reads from the FP16 paged cache (written by
+# the standard reshape_and_cache_flash path) via SDPA — slower but
+# correct.  The fused Triton decode kernel has a known correctness bug
+# in the integrated vLLM flow (works in standalone tests but fails when
+# run through the full engine).  Default to a very high value so the
+# FP16 paged SDPA path is always used until the kernel bug is fixed.
+# Set VLLM_FUSED_INT4_MIN_SEQ_LEN=8 to re-enable the fused kernel.
 MIN_FUSED_SEQ_LEN: int = int(
-    os.environ.get("VLLM_FUSED_INT4_MIN_SEQ_LEN", "8")
+    os.environ.get("VLLM_FUSED_INT4_MIN_SEQ_LEN", "999999")
 )
 
 # ---------------------------------------------------------------------------
@@ -820,7 +823,7 @@ class FusedInt4AttentionBackend(AttentionBackend):
     """Attention backend using fused INT4 KV cache with in-kernel dequant."""
 
     accept_output_buffer: bool = True
-    forward_includes_kv_cache_update: bool = True
+    forward_includes_kv_cache_update: bool = False
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [
         torch.float16, torch.bfloat16,
@@ -939,7 +942,18 @@ class FusedInt4AttentionMetadataBuilder(
 class FusedInt4AttentionImpl(
     AttentionImpl[FusedInt4AttentionMetadata],
 ):
-    """Fused INT4 attention: quantize-on-write + dequant-in-attention decode."""
+    """Fused INT4 attention with dedicated INT4 cache buffers.
+
+    Architecture (separate-cache design):
+      - The allocator-provided kv_cache (FP16 paged) is written by the
+        standard do_kv_cache_update path (reshape_and_cache_flash).
+      - A *separate* dedicated INT4 packed cache (uint8) + per-group
+        scales (FP16) is allocated lazily and maintained by this impl.
+      - Prefill uses fresh FP16 K/V directly with SDPA (no cache read).
+      - Decode writes INT4 to the dedicated buffer and reads from it
+        via the fused Triton kernel.  Short sequences (< MIN_FUSED_SEQ_LEN)
+        read from the FP16 paged cache via SDPA instead.
+    """
 
     def __init__(
         self,
@@ -970,23 +984,70 @@ class FusedInt4AttentionImpl(
         self.half_hd = head_size // 2
         self.num_groups = head_size // GROUP_SIZE
 
-        # Scale tensors are allocated alongside the KV cache.  We keep
-        # references here after the first forward call.
+        # Dedicated INT4 packed cache — separate from allocator buffer.
+        # Lazily allocated on first forward with cache.
+        # Shape: [num_blocks, block_size, num_kv_heads, half_hd] uint8
+        self._int4_key_cache: torch.Tensor | None = None
+        self._int4_value_cache: torch.Tensor | None = None
         self._k_scales: torch.Tensor | None = None
         self._v_scales: torch.Tensor | None = None
 
-        # FP16 shadow buffer for short-sequence decode fallback.
-        # Stores the original (unquantized) FP16 K/V for the first
-        # MIN_FUSED_SEQ_LEN tokens per sequence.  Indexed by
-        # [seq_idx, token_position, num_kv_heads, head_size].
-        # Lazily allocated on first forward.
-        self._fp16_k_shadow: torch.Tensor | None = None
-        self._fp16_v_shadow: torch.Tensor | None = None
-
-        # Verification counters (logged periodically)
+        # Verification counters
         self._decode_fused_count: int = 0
+        self._decode_sdpa_count: int = 0
         self._prefill_fallback_count: int = 0
         self._logged_init: bool = False
+
+    def _ensure_int4_cache(
+        self, num_blocks: int, block_size: int, device: torch.device,
+    ) -> None:
+        """Lazily allocate dedicated contiguous INT4 cache + scales."""
+        if self._int4_key_cache is not None:
+            return
+        logger.info(
+            "[FusedInt4] Allocating dedicated INT4 cache: "
+            "num_blocks=%d, block_size=%d, num_kv_heads=%d, half_hd=%d",
+            num_blocks, block_size, self.num_kv_heads, self.half_hd,
+        )
+        self._int4_key_cache = torch.zeros(
+            num_blocks, block_size, self.num_kv_heads, self.half_hd,
+            dtype=torch.uint8, device=device,
+        )
+        self._int4_value_cache = torch.zeros(
+            num_blocks, block_size, self.num_kv_heads, self.half_hd,
+            dtype=torch.uint8, device=device,
+        )
+        self._k_scales = torch.zeros(
+            num_blocks, block_size, self.num_kv_heads, self.num_groups,
+            dtype=torch.float16, device=device,
+        )
+        self._v_scales = torch.zeros(
+            num_blocks, block_size, self.num_kv_heads, self.num_groups,
+            dtype=torch.float16, device=device,
+        )
+
+    def do_kv_cache_update(
+        self,
+        layer: torch.nn.Module,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """Write FP16 K/V to the standard paged cache.
+
+        Called by the framework because forward_includes_kv_cache_update
+        is False.  This keeps the allocator-provided FP16 paged cache
+        correct for the short-sequence SDPA fallback.
+        """
+        from vllm.v1.attention.backends.fa_utils import (
+            reshape_and_cache_flash,
+        )
+        key_cache, value_cache = kv_cache.unbind(0)
+        reshape_and_cache_flash(
+            key, value, key_cache, value_cache, slot_mapping,
+            "auto", layer._k_scale, layer._v_scale,
+        )
 
     def forward(
         self,
@@ -1000,8 +1061,6 @@ class FusedInt4AttentionImpl(
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        global _debug_forward_count
-
         # During warmup/profiling attn_metadata may be None
         if attn_metadata is None:
             if output is not None:
@@ -1009,285 +1068,137 @@ class FusedInt4AttentionImpl(
                 return output
             return torch.zeros_like(query)
 
-        num_actual_tokens = attn_metadata.num_actual_tokens
-
-        # Split the (2, ...) cache into K and V planes.
-        # The allocator gives us the cache in model dtype (FP16/BF16) via
-        # .view(dtype).  We reinterpret as uint8 for packed INT4 storage.
-        #
-        # kv_cache from allocator:
-        #   (2, num_blocks, block_size, num_kv_heads, head_size) in FP16
-        # We view as uint8 -> last dim doubles to head_size*2 bytes.
-        # Then slice [... , :half_hd] to get the packed INT4 region.
-        # This is a view (no copy) so writes go to the actual storage.
-        if kv_cache.numel() > 0:
-            kv_uint8 = kv_cache.view(torch.uint8)
-            # kv_uint8: (2, num_blocks, block_size, num_kv_heads, head_size*2)
-            key_cache = kv_uint8[0][..., :self.half_hd]
-            value_cache = kv_uint8[1][..., :self.half_hd]
-            # key_cache/value_cache: [num_blocks, block_size, num_kv_heads, half_hd]
-            # Strides: head dim stride = head_size*2 (sparse), last dim = 1
-
-            # Lazily allocate scale tensors matching the cache geometry
-            if self._k_scales is None:
-                num_blocks = key_cache.shape[0]
-                block_size = key_cache.shape[1]
-                self._k_scales = torch.zeros(
-                    num_blocks, block_size, self.num_kv_heads, self.num_groups,
-                    dtype=torch.float16, device=key_cache.device,
-                )
-                self._v_scales = torch.zeros(
-                    num_blocks, block_size, self.num_kv_heads, self.num_groups,
-                    dtype=torch.float16, device=key_cache.device,
-                )
-
-            # ---- Cache write: quantize and store ----
-            if num_actual_tokens > 0 and key.numel() > 0:
-                # Reshape key/value from [num_tokens, num_kv_heads * head_size]
-                # or [num_tokens, num_kv_heads, head_size] to the 3D form
-                if key.dim() == 2:
-                    key = key.view(-1, self.num_kv_heads, self.head_size)
-                    value = value.view(-1, self.num_kv_heads, self.head_size)
-
-                reshape_and_cache_int4(
-                    key, value,
-                    key_cache, value_cache,
-                    self._k_scales, self._v_scales,
-                    attn_metadata.slot_mapping,
-                )
-
-                # ---- FP16 shadow buffer for short-sequence fallback ----
-                # Write original FP16 K/V to the shadow buffer so that
-                # early decode steps can use unquantized values.
-                if MIN_FUSED_SEQ_LEN > 1:
-                    self._update_fp16_shadow(
-                        key, value, attn_metadata,
-                    )
-
-                # Debug: dump cache-write info for first token/head
-                if _FUSED_INT4_DEBUG:
-                    is_decode_step = (attn_metadata.max_query_len == 1)
-                    _debug_dump_cache_write(
-                        key, value,
-                        key_cache, value_cache,
-                        self._k_scales, self._v_scales,
-                        attn_metadata.slot_mapping,
-                        num_kv_heads=self.num_kv_heads,
-                        head_size=self.head_size,
-                        is_decode=is_decode_step,
-                    )
-
-            # ---- Decode: fused attention ----
-            if attn_metadata.max_query_len == 1:
-                # Pure decode path
-                if query.dim() == 2:
-                    query = query.view(-1, self.num_heads, self.head_size)
-
-                num_seqs = attn_metadata.seq_lens.shape[0]
-                decode_query = query[:num_seqs]
-                use_fused = attn_metadata.max_seq_len >= MIN_FUSED_SEQ_LEN
-
-                # Backend verification logging
-                if not self._logged_init:
-                    self._logged_init = True
-                    logger.info(
-                        "[FusedInt4] Backend verification: "
-                        "selected_backend=FUSED_INT4, "
-                        "kv_cache_dtype=int4_fused, "
-                        "decode_kernel=fused_int4_triton, "
-                        "group_size=%d, "
-                        "num_kv_heads=%d, head_size=%d, "
-                        "min_fused_seq_len=%d, "
-                        "fallback=fp16_shadow_sdpa",
-                        GROUP_SIZE, self.num_kv_heads,
-                        self.head_size, MIN_FUSED_SEQ_LEN,
-                    )
-
-                # Debug: dump decode-launch info for first seq/head
-                if _FUSED_INT4_DEBUG:
-                    _debug_dump_decode(
-                        decode_query,
-                        key_cache, value_cache,
-                        self._k_scales, self._v_scales,
-                        attn_metadata.block_table,
-                        attn_metadata.seq_lens,
-                        num_kv_heads=self.num_kv_heads,
-                        head_size=self.head_size,
-                    )
-
-                if use_fused:
-                    self._decode_fused_count += 1
-                    block_n = 64
-                    decode_output = fused_int4_decode(
-                        decode_query,
-                        key_cache, value_cache,
-                        self._k_scales, self._v_scales,
-                        attn_metadata.block_table,
-                        attn_metadata.seq_lens,
-                        num_kv_heads=self.num_kv_heads,
-                        head_size=self.head_size,
-                        block_n=block_n,
-                    )
-                else:
-                    # Short sequence: use FP16 shadow K/V for attention
-                    decode_output = decode_fp16_sdpa(
-                        decode_query,
-                        self._fp16_k_shadow,
-                        self._fp16_v_shadow,
-                        attn_metadata.seq_lens,
-                        num_kv_heads=self.num_kv_heads,
-                        num_heads=self.num_heads,
-                        head_size=self.head_size,
-                    )
-
-                # Debug: capture decode output for first few calls
-                if _FUSED_INT4_DEBUG:
-                    if _debug_forward_count < _DEBUG_MAX_FWD:
-                        _debug_forward_count += 1
-                        torch.cuda.synchronize()
-                        d_out = decode_output[0].detach().cpu().float()
-                        q_in = decode_query[0].detach().cpu().float()
-                        _debug_snapshots.append({
-                            "phase": "decode_output",
-                            "fwd_index": _debug_forward_count,
-                            "seq_lens": attn_metadata.seq_lens
-                                .cpu().tolist(),
-                            "decode_output_shape": list(
-                                decode_output.shape),
-                            "query_shape": list(decode_query.shape),
-                            "output_shape": list(output.shape)
-                                if output is not None else None,
-                            "out_abs_max": round(
-                                d_out.abs().max().item(), 6),
-                            "out_abs_mean": round(
-                                d_out.abs().mean().item(), 6),
-                            "out_zero_frac": round(
-                                (d_out == 0).float().mean().item(), 4),
-                            "out_nan": bool(torch.isnan(d_out).any()),
-                            "out_inf": bool(torch.isinf(d_out).any()),
-                            "out_first_head_16":
-                                d_out[0, :16].tolist(),
-                            "query_first_head_16":
-                                q_in[0, :16].tolist(),
-                        })
-                        if _debug_forward_count % 28 == 0:
-                            _debug_flush()
-
-                if output is not None:
-                    output[:decode_output.shape[0]].copy_(
-                        decode_output.view(output[:decode_output.shape[0]].shape)
-                    )
-                    return output
-                return decode_output.view(
-                    decode_output.shape[0], -1
-                )
-            else:
-                # Prefill: dequantize from cache and use standard attention.
-                # For now, fall back to a simple torch SDPA path.
-                # This is NOT the fused path — it's the honest fallback.
-                self._prefill_fallback_count += 1
-                logger.warning_once(
-                    "[FusedInt4] Backend verification: "
-                    "prefill uses dequantized SDPA fallback. "
-                    "Only decode uses the fused INT4 kernel. "
-                    "fallback_reason=prefill_not_fused"
-                )
-                result = self._prefill_fallback(
-                    query, key, value, kv_cache, attn_metadata, output,
-                )
-
-                # Debug: capture prefill output
-                if _FUSED_INT4_DEBUG:
-                    if _debug_forward_count < _DEBUG_MAX_FWD:
-                        _debug_forward_count += 1
-                        torch.cuda.synchronize()
-                        r_out = result[0].detach().cpu().float()
-                        _debug_snapshots.append({
-                            "phase": "prefill_output",
-                            "fwd_index": _debug_forward_count,
-                            "seq_lens": attn_metadata.seq_lens
-                                .cpu().tolist(),
-                            "result_shape": list(result.shape),
-                            "output_shape": list(output.shape)
-                                if output is not None else None,
-                            "out_abs_max": round(
-                                r_out.abs().max().item(), 6),
-                            "out_abs_mean": round(
-                                r_out.abs().mean().item(), 6),
-                        })
-                        if _debug_forward_count % 28 == 0:
-                            _debug_flush()
-
-                return result
-        else:
-            # No cache — just compute attention directly (e.g. prompt eval
-            # with no prior context).  This shouldn't normally happen in
-            # the decode path.
+        if kv_cache.numel() == 0:
             if output is not None:
                 output.zero_()
                 return output
             return torch.zeros_like(query)
 
-    def _update_fp16_shadow(
-        self,
-        key: torch.Tensor,      # [num_tokens, num_kv_heads, head_size]
-        value: torch.Tensor,
-        attn_metadata: FusedInt4AttentionMetadata,
-    ) -> None:
-        """Write original FP16 K/V into the shadow buffer.
+        # The allocator-provided kv_cache is FP16 paged:
+        #   (2, num_blocks, block_size, num_kv_heads, head_size) in FP16
+        # It was already written by do_kv_cache_update (reshape_and_cache_flash).
+        # We use it for short-sequence SDPA decode fallback.
+        key_cache_fp16 = kv_cache[0]   # [num_blocks, block_size, kv_heads, hd]
+        value_cache_fp16 = kv_cache[1]
+        num_blocks = key_cache_fp16.shape[0]
+        block_size = key_cache_fp16.shape[1]
 
-        The shadow buffer is indexed as [seq_idx, position, num_kv_heads,
-        head_size].  During prefill the tokens are laid out contiguously
-        per-sequence (query_start_loc gives boundaries).  During decode
-        each sequence contributes exactly one token.
+        # Ensure dedicated INT4 cache exists
+        self._ensure_int4_cache(num_blocks, block_size, kv_cache.device)
 
-        We only need to populate positions < MIN_FUSED_SEQ_LEN because
-        once a sequence exceeds the threshold we switch to the fused
-        INT4 kernel.
-        """
-        num_seqs = attn_metadata.seq_lens.shape[0]
-        device = key.device
+        # ---- INT4 cache write ----
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        if num_actual_tokens > 0 and key.numel() > 0:
+            if key.dim() == 2:
+                key = key.view(-1, self.num_kv_heads, self.head_size)
+                value = value.view(-1, self.num_kv_heads, self.head_size)
 
-        # Lazily allocate the shadow buffer.  We size it for the current
-        # batch; it will be re-allocated if batch size grows.
-        if (self._fp16_k_shadow is None
-                or self._fp16_k_shadow.shape[0] < num_seqs):
-            self._fp16_k_shadow = torch.zeros(
-                max(num_seqs, 8), MIN_FUSED_SEQ_LEN,
-                self.num_kv_heads, self.head_size,
-                dtype=torch.float16, device=device,
-            )
-            self._fp16_v_shadow = torch.zeros(
-                max(num_seqs, 8), MIN_FUSED_SEQ_LEN,
-                self.num_kv_heads, self.head_size,
-                dtype=torch.float16, device=device,
+            reshape_and_cache_int4(
+                key, value,
+                self._int4_key_cache, self._int4_value_cache,
+                self._k_scales, self._v_scales,
+                attn_metadata.slot_mapping,
             )
 
-        is_decode = (attn_metadata.max_query_len == 1)
+        # ---- Decode path ----
+        if attn_metadata.max_query_len == 1:
+            if query.dim() == 2:
+                query = query.view(-1, self.num_heads, self.head_size)
 
-        if is_decode:
-            # Decode: one token per sequence.
-            # seq_lens[i] is the length AFTER this token was appended.
-            # The new token's position is seq_lens[i] - 1.
-            for s in range(num_seqs):
-                sl = attn_metadata.seq_lens[s].item()
-                pos = sl - 1  # position of the just-written token
-                if pos < MIN_FUSED_SEQ_LEN:
-                    self._fp16_k_shadow[s, pos] = key[s]
-                    self._fp16_v_shadow[s, pos] = value[s]
+            num_seqs = attn_metadata.seq_lens.shape[0]
+            decode_query = query[:num_seqs]
+            use_fused = attn_metadata.max_seq_len >= MIN_FUSED_SEQ_LEN
+
+            if not self._logged_init:
+                self._logged_init = True
+                logger.info(
+                    "[FusedInt4] Backend: separate-cache mode, "
+                    "decode_kernel=fused_int4_triton, "
+                    "fallback=fp16_paged_sdpa, "
+                    "group_size=%d, num_kv_heads=%d, head_size=%d, "
+                    "min_fused_seq_len=%d",
+                    GROUP_SIZE, self.num_kv_heads,
+                    self.head_size, MIN_FUSED_SEQ_LEN,
+                )
+
+            if use_fused:
+                self._decode_fused_count += 1
+                decode_output = fused_int4_decode(
+                    decode_query,
+                    self._int4_key_cache, self._int4_value_cache,
+                    self._k_scales, self._v_scales,
+                    attn_metadata.block_table,
+                    attn_metadata.seq_lens,
+                    num_kv_heads=self.num_kv_heads,
+                    head_size=self.head_size,
+                    block_n=64,
+                )
+            else:
+                # Short sequence: read from FP16 paged cache via SDPA
+                self._decode_sdpa_count += 1
+                decode_output = self._decode_from_paged_fp16(
+                    decode_query,
+                    key_cache_fp16, value_cache_fp16,
+                    attn_metadata.block_table,
+                    attn_metadata.seq_lens,
+                )
+
+            if output is not None:
+                output[:decode_output.shape[0]].copy_(
+                    decode_output.view(
+                        output[:decode_output.shape[0]].shape)
+                )
+                return output
+            return decode_output.view(decode_output.shape[0], -1)
         else:
-            # Prefill: tokens are contiguous, query_start_loc gives bounds.
-            query_start_loc = attn_metadata.query_start_loc
-            for s in range(num_seqs):
-                start = query_start_loc[s].item()
-                end = query_start_loc[s + 1].item()
-                n_tokens = end - start
-                # During prefill, the tokens fill positions 0..n_tokens-1.
-                # (Prior cached tokens would have seq_lens > n_tokens,
-                # but for the first prefill they're equal.)
-                n_copy = min(n_tokens, MIN_FUSED_SEQ_LEN)
-                self._fp16_k_shadow[s, :n_copy] = key[start:start + n_copy]
-                self._fp16_v_shadow[s, :n_copy] = value[start:start + n_copy]
+            # Prefill: use fresh FP16 K/V directly with SDPA
+            self._prefill_fallback_count += 1
+            return self._prefill_fallback(
+                query, key, value, kv_cache, attn_metadata, output,
+            )
+
+    def _decode_from_paged_fp16(
+        self,
+        query: torch.Tensor,        # [num_seqs, num_heads, head_size]
+        key_cache: torch.Tensor,     # [num_blocks, block_size, kv_heads, hd]
+        value_cache: torch.Tensor,
+        block_table: torch.Tensor,   # [num_seqs, max_blocks_per_seq]
+        seq_lens: torch.Tensor,      # [num_seqs]
+    ) -> torch.Tensor:
+        """Decode attention reading from the standard FP16 paged cache."""
+        num_seqs = query.shape[0]
+        n_rep = self.num_heads // self.num_kv_heads
+        scale = 1.0 / (self.head_size ** 0.5)
+        block_size = key_cache.shape[1]
+
+        outputs = []
+        for s in range(num_seqs):
+            sl = seq_lens[s].item()
+            blocks_needed = (sl + block_size - 1) // block_size
+            k_list, v_list = [], []
+            for b in range(blocks_needed):
+                block_idx = block_table[s, b].item()
+                tokens_in_block = min(block_size, sl - b * block_size)
+                k_list.append(key_cache[block_idx, :tokens_in_block])
+                v_list.append(value_cache[block_idx, :tokens_in_block])
+
+            k_fp16 = torch.cat(k_list, dim=0)  # [sl, kv_heads, hd]
+            v_fp16 = torch.cat(v_list, dim=0)
+
+            if n_rep > 1:
+                k_fp16 = k_fp16.repeat_interleave(n_rep, dim=1)
+                v_fp16 = v_fp16.repeat_interleave(n_rep, dim=1)
+
+            q = query[s:s+1].transpose(0, 1).unsqueeze(0)  # [1, H, 1, D]
+            k = k_fp16.transpose(0, 1).unsqueeze(0)         # [1, H, S, D]
+            v = v_fp16.transpose(0, 1).unsqueeze(0)
+
+            out = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, is_causal=False, scale=scale,
+            )
+            outputs.append(out.squeeze(0).transpose(0, 1))  # [1, H, D]
+
+        return torch.cat(outputs, dim=0)
 
     def _prefill_fallback(
         self,
@@ -1298,26 +1209,18 @@ class FusedInt4AttentionImpl(
         attn_metadata: FusedInt4AttentionMetadata,
         output: torch.Tensor | None,
     ) -> torch.Tensor:
-        """Honest prefill fallback using torch SDPA on dequantized KV.
-
-        During prefill the fresh K/V are in FP16/BF16 (not yet quantized
-        into the cache).  We just use them directly with SDPA.
-        """
+        """Prefill using fresh FP16 K/V directly with SDPA."""
         if query.dim() == 2:
             query = query.view(-1, self.num_heads, self.head_size)
         if key.dim() == 2:
             key = key.view(-1, self.num_kv_heads, self.head_size)
             value = value.view(-1, self.num_kv_heads, self.head_size)
 
-        # GQA expansion
         n_rep = self.num_heads // self.num_kv_heads
         if n_rep > 1:
             key = key.repeat_interleave(n_rep, dim=1)
             value = value.repeat_interleave(n_rep, dim=1)
 
-        # SDPA expects [batch, heads, seq_len, head_dim]
-        # For prefill with variable-length sequences, we do a simple
-        # batched approach — process each sequence individually
         query_start_loc = attn_metadata.query_start_loc
         num_seqs = attn_metadata.seq_lens.shape[0]
 
