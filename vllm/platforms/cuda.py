@@ -97,6 +97,12 @@ def _get_backend_priorities(
                 AttentionBackendEnum.FLASHMLA_SPARSE,
             ]
     else:
+        # When int4_fused KV cache is requested, the FUSED_INT4 backend
+        # must be first — it is the only backend that supports this dtype.
+        if kv_cache_dtype == "int4_fused":
+            return [
+                AttentionBackendEnum.FUSED_INT4,
+            ]
         if device_capability.major == 10:
             return [
                 AttentionBackendEnum.FLASHINFER,

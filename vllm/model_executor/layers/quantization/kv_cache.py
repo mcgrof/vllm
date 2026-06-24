@@ -57,9 +57,12 @@ class BaseKVCacheMethod(QuantizeMethodBase):
         # regardless whether the kv-scale is available in the checkpoint.
         # No need to process kv scales after loading if we are going to
         # calculate them on the fly.
+        # INT4 fused computes per-group scales dynamically at cache-write
+        # time — checkpoint-level per-tensor scales do not apply.
         if (
             is_quantized_kv_cache(layer.kv_cache_dtype)
             and not layer.calculate_kv_scales
+            and layer.kv_cache_dtype != "int4_fused"
         ):
             if layer.k_scale > 0.0 and layer.v_scale > 0.0:
                 # We prefer to use separate k_scale and v_scale if present
