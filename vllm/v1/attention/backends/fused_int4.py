@@ -795,18 +795,34 @@ class FusedInt4AttentionBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "int4_fused",
     ) -> tuple[int, ...]:
-        """Cache shape for INT4 fused.
+        """Cache shape for INT4 fused (allocator-compatible).
 
-        We use a (2, ...) leading dimension for K vs V, matching the
-        convention of other backends.  Each K/V plane stores packed uint8
-        data.  Scales are stored in a separate tensor (allocated by the
-        backend impl, not via this shape).
+        The vLLM allocator (gpu_model_runner._reshape_kv_cache_tensors)
+        reinterprets the raw byte buffer as model dtype (FP16/BF16) before
+        reshaping via .view(dtype).view(shape).  To stay compatible we
+        must return a shape whose total element count matches the
+        FP16-reinterpreted buffer size.
 
-        Shape: (2, num_blocks, block_size, num_kv_heads, head_size // 2)
-        where the last dim holds packed INT4 bytes (2 values per byte).
+        The allocator gives us page_size_bytes * num_blocks raw bytes.
+        page_size_bytes = 2 * block_size * num_kv_heads * head_size *
+        dtype_size (FP16 = 2).  After .view(float16) the element count
+        is halved.  Our shape must consume exactly those elements:
+
+            total_fp16_elems = page_size_bytes * num_blocks / 2
+                             = 2 * block_size * num_kv_heads * head_size
+                               * num_blocks
+
+        Shape returned: (2, num_blocks, block_size, num_kv_heads, head_size)
+        Total = 2 * num_blocks * block_size * num_kv_heads * head_size
+        which matches.
+
+        The forward() method then reinterprets as uint8 to get the actual
+        packed INT4 cache with last dim = head_size * 2 packed bytes.
+        Each K/V plane: [num_blocks, block_size, num_kv_heads, head_size]
+        in FP16 view = [num_blocks, block_size, num_kv_heads, head_size*2]
+        in uint8 view.  head_size*2 bytes = head_size packed INT4 pairs.
         """
-        half_hd = head_size // 2
-        return (2, num_blocks, block_size, num_kv_heads, half_hd)
+        return (2, num_blocks, block_size, num_kv_heads, head_size)
 
     @classmethod
     def supports_kv_cache_dtype(
@@ -931,11 +947,22 @@ class FusedInt4AttentionImpl(
 
         num_actual_tokens = attn_metadata.num_actual_tokens
 
-        # Split the (2, ...) cache into K and V planes
-        # kv_cache shape: (2, num_blocks, block_size, num_kv_heads, half_hd)
+        # Split the (2, ...) cache into K and V planes.
+        # The allocator gives us the cache in model dtype (FP16/BF16) via
+        # .view(dtype).  We reinterpret as uint8 for packed INT4 storage.
+        #
+        # kv_cache from allocator:
+        #   (2, num_blocks, block_size, num_kv_heads, head_size) in FP16
+        # We view as uint8 -> last dim doubles to head_size*2 bytes.
+        # Then slice [... , :half_hd] to get the packed INT4 region.
+        # This is a view (no copy) so writes go to the actual storage.
         if kv_cache.numel() > 0:
-            key_cache = kv_cache[0]   # [num_blocks, block_size, num_kv_heads, half_hd]
-            value_cache = kv_cache[1]
+            kv_uint8 = kv_cache.view(torch.uint8)
+            # kv_uint8: (2, num_blocks, block_size, num_kv_heads, head_size*2)
+            key_cache = kv_uint8[0][..., :self.half_hd]
+            value_cache = kv_uint8[1][..., :self.half_hd]
+            # key_cache/value_cache: [num_blocks, block_size, num_kv_heads, half_hd]
+            # Strides: head dim stride = head_size*2 (sparse), last dim = 1
 
             # Lazily allocate scale tensors matching the cache geometry
             if self._k_scales is None:
