@@ -240,8 +240,12 @@ class Attention(nn.Module, AttentionLayerBase):
             and kv_cache_scheme.get("strategy") == "attn_head"
         )
 
+        # Asymmetric K/V: extract K dtype for the torch dtype and
+        # keep the full spec for downstream backends.
+        from vllm.config.cache import cache_dtype_k
+        _k_str = cache_dtype_k(kv_cache_dtype)
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
-            kv_cache_dtype, vllm_config.model_config
+            _k_str, vllm_config.model_config
         )
         self.kv_cache_dtype = kv_cache_dtype
         self.calculate_kv_scales = calculate_kv_scales
