@@ -837,7 +837,8 @@ def may_override_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> int:
 
 
 def get_num_blocks(
-    vllm_config: VllmConfig, num_layers: int, available_memory: int, page_size: int
+    vllm_config: VllmConfig, num_layers: int, available_memory: int,
+    page_size: int, shadow_per_layer: int = 0,
 ) -> int:
     """
     Get the number of kv cache blocks.
@@ -847,8 +848,12 @@ def get_num_blocks(
         num_layers: The number of layers
         available_memory: Memory available for KV cache in bytes.
         page_size: The page size of the KV cache.
+        shadow_per_layer: Extra bytes per block per layer consumed
+            outside the main KV cache tensor (e.g. fused INT4
+            shadow caches).
     """
-    num_blocks = int(available_memory // page_size // num_layers)
+    effective_page_size = page_size + shadow_per_layer
+    num_blocks = int(available_memory // effective_page_size // num_layers)
     num_blocks = max(num_blocks, 0)
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
     return num_blocks
@@ -1110,8 +1115,10 @@ def get_kv_cache_config_from_groups(
         # Special case: all layers have the same type of KV cache but with
         # different hidden size. Allocate different amount of memory for each
         # layer based on its hidden size.
+        _spec = kv_cache_groups[0].kv_cache_spec
         num_blocks = (
-            available_memory // kv_cache_groups[0].kv_cache_spec.page_size_bytes
+            available_memory
+            // (_spec.page_size_bytes + _spec.shadow_size_per_block)
         )
         num_blocks = may_override_num_blocks(vllm_config, num_blocks)
         per_layer_specs = kv_cache_groups[0].kv_cache_spec.kv_cache_specs
@@ -1137,8 +1144,17 @@ def get_kv_cache_config_from_groups(
             [group.kv_cache_spec for group in kv_cache_groups]
         )
         assert group_size > 0, "group_size must be greater than 0"
+        # Sum shadow cost across groups for per-layer overhead.
+        # Each group's shadow_size_per_block is the per-block cost for
+        # one layer in that group. Sum across groups gives the total
+        # per-layer shadow for models with multiple groups.
+        shadow_per_layer = sum(
+            group.kv_cache_spec.shadow_size_per_block
+            for group in kv_cache_groups
+        )
         num_blocks = get_num_blocks(
-            vllm_config, group_size, available_memory, page_size
+            vllm_config, group_size, available_memory, page_size,
+            shadow_per_layer=shadow_per_layer,
         )
         kv_cache_tensors = []
         for i in range(group_size):

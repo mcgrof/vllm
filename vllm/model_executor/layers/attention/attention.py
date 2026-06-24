@@ -526,12 +526,69 @@ class Attention(nn.Module, AttentionLayerBase):
                 sliding_window=self.sliding_window,
             )
         else:
+            # Compute shadow cache cost for fused INT4 backend.
+            # The backend allocates auxiliary INT4 V cache + scales
+            # outside the planner-managed KV cache tensors.
+            # The cost depends on k_precision:
+            #   fp16:  V-only (K lives in FP16 paged cache)
+            #   int4:  K+V both quantized
+            #   int8:  V as INT4 + K as INT8
+            shadow = 0
+            if self.kv_cache_dtype == "int4_fused":
+                import os as _os
+                half_hd = self.head_size // 2
+                group_size = int(_os.environ.get(
+                    "VLLM_FUSED_INT4_GROUP_SIZE", "32"))
+                k_prec = _os.environ.get(
+                    "VLLM_FUSED_INT4_K_PRECISION", "int4")
+                asymmetric = _os.environ.get(
+                    "VLLM_FUSED_INT4_ASYMMETRIC", "0") == "1"
+                v_prec = _os.environ.get(
+                    "VLLM_FUSED_INT4_V_PRECISION", "int4")
+                num_groups = self.head_size // group_size
+                # V per-group FP16 scales — always present
+                v_scales = (block_size * self.num_kv_heads
+                            * num_groups * 2)  # 2 bytes per fp16
+                if v_prec == "int8":
+                    # V as INT8 (1 byte per element, full head_size)
+                    v_bytes = (block_size * self.num_kv_heads
+                               * self.head_size)  # 1 byte per int8
+                    v_bytes += v_scales  # INT8 scales
+                    # Minimal INT4 placeholder (negligible)
+                    v_bytes += 1 + 2  # 1 byte uint8 + 2 bytes fp16
+                else:
+                    # V packed INT4 (uint8, half head_size)
+                    v_bytes = block_size * self.num_kv_heads * half_hd
+                    v_bytes += v_scales
+                    if asymmetric:
+                        v_bytes += v_scales  # V zeros
+                shadow = v_bytes
+                if k_prec == "int4":
+                    # K packed INT4 + K scales (+ K zeros if asymmetric)
+                    k_packed = block_size * self.num_kv_heads * half_hd
+                    shadow += k_packed + v_scales
+                    if asymmetric:
+                        shadow += v_scales
+                elif k_prec == "int8":
+                    # K as INT8 (1 byte per element, full head_size)
+                    k_int8 = (block_size * self.num_kv_heads
+                              * self.head_size)  # 1 byte per int8
+                    k_int8_scales = v_scales  # same group structure
+                    shadow += k_int8 + k_int8_scales
+            # Option D: replace FP16 V plane with quantized-only allocation
+                replace_cache = _os.environ.get(
+                    "VLLM_FUSED_QUANT_REPLACE_CACHE", "0") == "1"
+                num_planes = 1 if replace_cache else 2
+            else:
+                num_planes = 2
             return FullAttentionSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_size,
                 head_size_v=self.head_size_v,
                 dtype=self.kv_cache_torch_dtype,
+                shadow_bytes_per_block=shadow,
+                num_kv_planes=num_planes,
             )
 
 
