@@ -47,6 +47,22 @@ logger = init_logger(__name__)
 GROUP_SIZE: int = int(os.environ.get("VLLM_FUSED_INT4_GROUP_SIZE", "32"))
 INT4_RANGE: int = 7  # max absolute value representable in signed INT4
 
+# Outlier clipping ratio for symmetric INT4 quantization.  In the
+# symmetric path the per-group scale is computed as amax(group) / 7.
+# When a group contains extreme outliers (common in certain KV-head
+# attention patterns, e.g. Qwen2.5-7B kv_head 1 where isolated values
+# reach ±400 while the majority sit below ±5), the resulting scale
+# becomes so large that nearly all other values quantize to zero,
+# destroying the attention signal.
+#
+# OUTLIER_CLIP_RATIO limits the per-group scale to
+#   scale = min(amax/7, mean_abs * CLIP_RATIO / 7)
+# Values beyond the clipped range saturate to ±7/−8.  A ratio of 0
+# disables clipping (original behaviour).
+OUTLIER_CLIP_RATIO: float = float(
+    os.environ.get("VLLM_FUSED_INT4_OUTLIER_CLIP_RATIO", "10.0")
+)
+
 # Asymmetric quantization: uses min/max range with zero-point offset
 # instead of symmetric abs-max.  Better for distributions with non-zero mean
 # (common in V cache).  Set VLLM_FUSED_INT4_ASYMMETRIC=1 to enable.
@@ -188,6 +204,7 @@ def _reshape_and_cache_int4_kernel(
     NUM_GROUPS: tl.constexpr,
     HALF_HD: tl.constexpr,
     IS_ASYMMETRIC: tl.constexpr,
+    CLIP_RATIO: tl.constexpr,
 ):
     """One program instance handles one (token, head) pair."""
     token_idx = tl.program_id(0)
@@ -260,8 +277,21 @@ def _reshape_and_cache_int4_kernel(
             offs = tl.arange(0, GROUP_SIZE)
             k_vals = tl.load(key_ptr + src_k_base + g_start + offs,
                              mask=(g_start + offs) < head_size).to(tl.float32)
-            k_amax = tl.max(tl.abs(k_vals))
+            k_abs = tl.abs(k_vals)
+            k_amax = tl.max(k_abs)
             k_amax = tl.maximum(k_amax, 1e-8)
+            # Outlier clipping: when extreme outliers inflate amax far
+            # beyond the typical group range, the scale makes nearly
+            # all values quantize to zero.  We detect this by computing
+            # the trimmed mean (mean of values below amax) then cap if
+            # the ratio exceeds CLIP_RATIO.
+            if CLIP_RATIO > 0.0:
+                k_below = tl.where(k_abs < k_amax, k_abs, 0.0)
+                k_cnt = tl.sum((k_abs < k_amax).to(tl.float32))
+                k_cnt = tl.maximum(k_cnt, 1.0)
+                k_tmean = tl.sum(k_below) / k_cnt
+                k_clip = k_tmean * CLIP_RATIO
+                k_amax = tl.minimum(k_amax, tl.maximum(k_clip, 1e-8))
             k_scale = k_amax / 7.0
             k_zero = 0.0  # unused but keeps code uniform
 
@@ -306,8 +336,16 @@ def _reshape_and_cache_int4_kernel(
         else:
             v_vals = tl.load(value_ptr + src_v_base + g_start + offs,
                              mask=(g_start + offs) < head_size).to(tl.float32)
-            v_amax = tl.max(tl.abs(v_vals))
+            v_abs = tl.abs(v_vals)
+            v_amax = tl.max(v_abs)
             v_amax = tl.maximum(v_amax, 1e-8)
+            if CLIP_RATIO > 0.0:
+                v_below = tl.where(v_abs < v_amax, v_abs, 0.0)
+                v_cnt = tl.sum((v_abs < v_amax).to(tl.float32))
+                v_cnt = tl.maximum(v_cnt, 1.0)
+                v_tmean = tl.sum(v_below) / v_cnt
+                v_clip = v_tmean * CLIP_RATIO
+                v_amax = tl.minimum(v_amax, tl.maximum(v_clip, 1e-8))
             v_scale = v_amax / 7.0
 
             v_low_q = _triton_round(v_low / v_scale)
@@ -377,6 +415,7 @@ def reshape_and_cache_int4(
         NUM_GROUPS=num_groups,
         HALF_HD=half_hd,
         IS_ASYMMETRIC=asymmetric,
+        CLIP_RATIO=OUTLIER_CLIP_RATIO,
     )
 
 

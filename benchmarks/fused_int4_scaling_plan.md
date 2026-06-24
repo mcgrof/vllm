@@ -1,7 +1,18 @@
-# Fused INT4 scaling plan after the March 29 A100 reconciliation
+# Fused INT4 scaling plan after the March 30 A100 root cause analysis
 
 This note records the current working interpretation and the next scaling steps
 for fused INT4 testing inside `vllm`.
+
+## Root cause identified (2026-03-30)
+
+The serving-path corruption is caused by **activation outliers** in specific
+KV heads. Qwen2.5-7B kv_head 1 produces isolated K-cache values of ±400
+while the per-group (GROUP_SIZE=32) average sits at ±2. Symmetric INT4
+quantization (`scale = amax/7 ≈ 57`) makes nearly all values quantize to
+zero, destroying the attention signal for all query heads sharing that KV head.
+
+A trimmed-mean outlier clipping fix has been implemented in the write kernel
+(`_reshape_and_cache_int4_kernel`). This must be validated before scaling.
 
 ## Current working interpretation
 
