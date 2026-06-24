@@ -115,6 +115,17 @@ def _cached_get_attn_backend(
         )
     backend = resolve_obj_by_qualname(attention_cls)
 
+    # Backend verification logging — machine-readable for benchmark manifests
+    logger.info(
+        "Backend manifest: requested_backend=%s, selected_backend=%s, "
+        "kv_cache_dtype=%s, head_size=%s, dtype=%s",
+        attn_selector_config.kv_cache_dtype,
+        backend.get_name(),
+        attn_selector_config.kv_cache_dtype,
+        attn_selector_config.head_size,
+        attn_selector_config.dtype,
+    )
+
     # Adjust kv cache layout if the selected backend requires a specific one
     required_layout = backend.get_required_kv_cache_layout()
     if required_layout is not None:

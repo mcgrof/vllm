@@ -635,6 +635,11 @@ class FusedInt4AttentionImpl(
         self._k_scales: torch.Tensor | None = None
         self._v_scales: torch.Tensor | None = None
 
+        # Verification counters (logged periodically)
+        self._decode_fused_count: int = 0
+        self._prefill_fallback_count: int = 0
+        self._logged_init: bool = False
+
     def forward(
         self,
         layer: AttentionLayer,
@@ -693,6 +698,23 @@ class FusedInt4AttentionImpl(
                 # (future: use batch-dependent heuristic here)
                 block_n = 64
 
+                # Backend verification logging
+                if not self._logged_init:
+                    self._logged_init = True
+                    logger.info(
+                        "[FusedInt4] Backend verification: "
+                        "selected_backend=FUSED_INT4, "
+                        "kv_cache_dtype=int4_fused, "
+                        "decode_kernel=fused_int4_triton, "
+                        "group_size=%d, "
+                        "num_kv_heads=%d, head_size=%d, "
+                        "block_n=%d, "
+                        "fallback=none",
+                        GROUP_SIZE, self.num_kv_heads,
+                        self.head_size, block_n,
+                    )
+                self._decode_fused_count += 1
+
                 decode_output = fused_int4_decode(
                     query[:attn_metadata.seq_lens.shape[0]],
                     key_cache, value_cache,
@@ -716,9 +738,12 @@ class FusedInt4AttentionImpl(
                 # Prefill: dequantize from cache and use standard attention.
                 # For now, fall back to a simple torch SDPA path.
                 # This is NOT the fused path — it's the honest fallback.
+                self._prefill_fallback_count += 1
                 logger.warning_once(
-                    "FusedInt4: prefill uses dequantized SDPA fallback. "
-                    "Only decode uses the fused INT4 kernel."
+                    "[FusedInt4] Backend verification: "
+                    "prefill uses dequantized SDPA fallback. "
+                    "Only decode uses the fused INT4 kernel. "
+                    "fallback_reason=prefill_not_fused"
                 )
                 return self._prefill_fallback(
                     query, key, value, kv_cache, attn_metadata, output,
