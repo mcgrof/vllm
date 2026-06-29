@@ -48,8 +48,11 @@ class KVConnectorFactory:
 
         kv_transfer_config = config.kv_transfer_config
         connector_cls = cls.get_connector_class(kv_transfer_config)
-        logger.info("Creating v1 connector with name: %s and engine_id: %s",
-                    connector_cls.__name__, kv_transfer_config.engine_id)
+        logger.info(
+            "Creating v1 connector with name: %s and engine_id: %s",
+            connector_cls.__name__,
+            kv_transfer_config.engine_id,
+        )
         # NOTE(Kuntai): v1 connector is explicitly separated into two roles.
         # Scheduler connector:
         # - Co-locate with scheduler process
@@ -85,29 +88,41 @@ class KVConnectorFactory:
 KVConnectorFactory.register_connector(
     "SharedStorageConnector",
     "vllm.distributed.kv_transfer.kv_connector.v1.shared_storage_connector",
-    "SharedStorageConnector")
+    "SharedStorageConnector",
+)
 
 KVConnectorFactory.register_connector(
     "P2pNcclConnector",
     "vllm.distributed.kv_transfer.kv_connector.v1.p2p.p2p_nccl_connector",
-    "P2pNcclConnector")
+    "P2pNcclConnector",
+)
 
 KVConnectorFactory.register_connector(
     "LMCacheConnectorV1",
     "vllm.distributed.kv_transfer.kv_connector.v1.lmcache_connector",
-    "LMCacheConnectorV1")
+    "LMCacheConnectorV1",
+)
+
+KVConnectorFactory.register_connector(
+    "ReasonCacheConnector",
+    "vllm.distributed.kv_transfer.kv_connector.v1.cartridge_connector",
+    "ReasonCacheConnector",
+)
 
 KVConnectorFactory.register_connector(
     "NixlConnector",
     "vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector",
-    "NixlConnector")
+    "NixlConnector",
+)
 
 KVConnectorFactory.register_connector(
     "MultiConnector",
     "vllm.distributed.kv_transfer.kv_connector.v1.multi_connector",
-    "MultiConnector")
+    "MultiConnector",
+)
 
 KVConnectorFactory.register_connector(
     "OffloadingConnector",
     "vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector",
-    "OffloadingConnector")
+    "OffloadingConnector",
+)

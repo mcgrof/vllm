@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Integration tests for CartridgeConnector scheduler-side methods.
 
 These test the connector's interaction with vLLM's scheduler API
@@ -13,45 +14,73 @@ Covers:
    requests, correct num_tokens.
 4. Manifest validation on load (wrong model catches at init).
 """
-import json
+
 import tempfile
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.cartridge_connector import (
-    CartridgeConnector,
-    CartridgeConnectorMetadata,
-    align_to_block_size,
-    load_cartridge,
-)
-
+    CartridgeConnector, CartridgeConnectorMetadata, align_to_block_size,
+    load_cartridge)
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_cartridge_pt(path, num_layers=2, num_kv_heads=2,
-                       num_tokens=32, head_dim=4):
+
+def _make_cartridge_pt(path,
+                       num_layers=2,
+                       num_kv_heads=2,
+                       num_tokens=32,
+                       head_dim=4):
     """Create a minimal TrainableCache .pt file."""
-    cache = {"trainable_keys": [], "trainable_values": []}
+    cache: dict[str, Any] = {"trainable_keys": [], "trainable_values": []}
     for _ in range(num_layers):
         cache["trainable_keys"].append(
-            torch.nn.Parameter(torch.randn(1, num_kv_heads, num_tokens, head_dim)))
+            torch.nn.Parameter(
+                torch.randn(1, num_kv_heads, num_tokens, head_dim)))
         cache["trainable_values"].append(
-            torch.nn.Parameter(torch.randn(1, num_kv_heads, num_tokens, head_dim)))
+            torch.nn.Parameter(
+                torch.randn(1, num_kv_heads, num_tokens, head_dim)))
     torch.save(cache, path)
 
 
-def _make_connector(cartridge_path, block_size=16):
+def _new_tmp_path() -> Path:
+    with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as tmpfile:
+        return Path(tmpfile.name)
+
+
+def _make_reasoncache_pt(path,
+                         num_layers=2,
+                         num_kv_heads=2,
+                         num_tokens=32,
+                         head_dim=4):
+    """Create a minimal ReasonCACHE-style learned KV prefix .pt file."""
+    cache: dict[str, Any] = {
+        "reasoncache": {
+            "prefix_keys": [],
+            "prefix_values": [],
+        }
+    }
+    for _ in range(num_layers):
+        cache["reasoncache"]["prefix_keys"].append(
+            torch.randn(1, num_kv_heads, num_tokens, head_dim))
+        cache["reasoncache"]["prefix_values"].append(
+            torch.randn(1, num_kv_heads, num_tokens, head_dim))
+    torch.save(cache, path)
+
+
+def _make_connector(cartridge_path, block_size=16, extra_config=None):
     """Create a CartridgeConnector with mocked vllm_config."""
     vllm_config = MagicMock()
     vllm_config.cache_config.block_size = block_size
 
     # Mock the kv_transfer_config to return our cartridge_path
-    extra_config = {"cartridge_path": cartridge_path}
+    extra_config = {"cartridge_path": cartridge_path, **(extra_config or {})}
 
     def get_from_extra_config(key, default=None):
         return extra_config.get(key, default)
@@ -62,8 +91,9 @@ def _make_connector(cartridge_path, block_size=16):
 
     # Patch the base class to avoid real KVConnector init
     with patch.object(
-        CartridgeConnector, '__init__',
-        _make_patched_init(vllm_config, cartridge_path, block_size),
+            CartridgeConnector,
+            "__init__",
+            _make_patched_init(vllm_config, cartridge_path, block_size),
     ):
         connector = CartridgeConnector.__new__(CartridgeConnector)
         connector.__init__(vllm_config, MagicMock())
@@ -78,16 +108,11 @@ def _make_patched_init(vllm_config, cartridge_path, block_size):
     state shape (``_cartridge_meta`` dict, ``_request_cartridge_ids``,
     ``_requests_need_load`` as a set of committed request_ids).
     """
+
     def patched_init(self, vllm_config_arg, role, kv_cache_config=None):
-        from vllm.distributed.kv_transfer.kv_connector.v1.cartridge_store import (
-            CartridgeStore,
-        )
-        from vllm.distributed.kv_transfer.kv_connector.v1.cartridge_manifest import (
-            CartridgeManifest,
-        )
-        from vllm.distributed.kv_transfer.kv_connector.v1.cartridge_router import (
-            StaticCartridgeRouter,
-        )
+        from vllm.distributed.kv_transfer.kv_connector.v1 import (
+            cartridge_gpu_residency, cartridge_manifest, cartridge_router,
+            cartridge_store)
 
         self._block_size = block_size
         self._request_cartridge_ids = {}
@@ -97,7 +122,7 @@ def _make_patched_init(vllm_config, cartridge_path, block_size):
         self._vllm_config = vllm_config
 
         cartridge = load_cartridge(cartridge_path)
-        manifest = CartridgeManifest(
+        manifest = cartridge_manifest.CartridgeManifest(
             cartridge_id="test",
             model_id="test/model",
             num_layers=cartridge["num_layers"],
@@ -105,38 +130,38 @@ def _make_patched_init(vllm_config, cartridge_path, block_size):
             head_dim=cartridge["head_dim"],
             dtype="float32",
             num_tokens_raw=cartridge["num_tokens"],
-            num_tokens_aligned=align_to_block_size(
-                cartridge["num_tokens"], block_size),
+            num_tokens_aligned=align_to_block_size(cartridge["num_tokens"],
+                                                   block_size),
             block_size=block_size,
-            num_blocks=align_to_block_size(
-                cartridge["num_tokens"], block_size) // block_size,
+            num_blocks=align_to_block_size(cartridge["num_tokens"], block_size)
+            // block_size,
             has_frozen_prefix=False,
+            resource_kind=cartridge.get("resource_kind", "cartridge"),
+            source_format=cartridge.get("source_format", "trainable_cache"),
         )
         del cartridge
 
-        self._store = CartridgeStore(block_size=block_size)
+        self._store = cartridge_store.CartridgeStore(block_size=block_size)
         self._store.load("test", cartridge_path, manifest, device="cpu")
         residency = self._store.get_residency("test")
 
         self._cartridge_meta = {
             "test": {
                 "num_tokens": residency.num_tokens,
-                "num_blocks": (residency.num_tokens
-                               // block_size),
+                "num_blocks": (residency.num_tokens // block_size),
                 "num_layers": residency.num_layers,
+                "resource_kind": manifest.resource_kind,
+                "source_format": manifest.source_format,
             }
         }
         self._default_cartridge_id = "test"
         # Integration tests target the singleton dispatch path.
-        self._router = StaticCartridgeRouter("test")
+        self._router = cartridge_router.StaticCartridgeRouter("test")
         # Wire a minimal GPUResidencyManager — these tests focus on
         # the scheduler-side plumbing, not the GPU tier. Capacity is
         # huge so eviction never kicks in; device is CPU for
         # host-only testing.
-        from vllm.distributed.kv_transfer.kv_connector.v1.cartridge_gpu_residency import (
-            GPUResidencyManager,
-        )
-        self._residency = GPUResidencyManager(
+        self._residency = cartridge_gpu_residency.GPUResidencyManager(
             store=self._store,
             capacity_bytes=1 << 40,  # 1 TiB (effectively unbounded)
             device="cpu",
@@ -145,7 +170,10 @@ def _make_patched_init(vllm_config, cartridge_path, block_size):
     return patched_init
 
 
-def _make_mock_request(request_id, prompt_len):
+def _make_mock_request(request_id,
+                       prompt_len,
+                       extra_args=None,
+                       prompt_token_ids=None):
     """Create a mock Request with prompt_token_ids + extras.
 
     The mock carries ``sampling_params.extra_args`` so the router can
@@ -154,8 +182,14 @@ def _make_mock_request(request_id, prompt_len):
     """
     req = MagicMock()
     req.request_id = request_id
-    req.prompt_token_ids = list(range(prompt_len))
-    req.sampling_params.extra_args = {"cartridge_id": "test"}
+    if prompt_token_ids is None:
+        req.prompt_token_ids = list(range(prompt_len))
+    else:
+        req.prompt_token_ids = prompt_token_ids
+    req.sampling_params.extra_args = (extra_args
+                                      if extra_args is not None else {
+                                          "cartridge_id": "test"
+                                      })
     return req
 
 
@@ -163,15 +197,22 @@ def _make_mock_request(request_id, prompt_len):
 # Tests: get_num_new_matched_tokens
 # ---------------------------------------------------------------------------
 
+
 class TestGetNumNewMatchedTokens:
+
     def setup_method(self):
-        self._tmpfile = tempfile.NamedTemporaryFile(suffix=".pt", delete=False)
-        _make_cartridge_pt(self._tmpfile.name, num_layers=2,
-                          num_kv_heads=2, num_tokens=32, head_dim=4)
-        self.connector = _make_connector(self._tmpfile.name, block_size=16)
+        self._tmpfile = _new_tmp_path()
+        _make_cartridge_pt(
+            str(self._tmpfile),
+            num_layers=2,
+            num_kv_heads=2,
+            num_tokens=32,
+            head_dim=4,
+        )
+        self.connector = _make_connector(str(self._tmpfile), block_size=16)
 
     def teardown_method(self):
-        Path(self._tmpfile.name).unlink()
+        self._tmpfile.unlink()
 
     def test_returns_cartridge_token_count(self):
         req = _make_mock_request("r1", prompt_len=64)
@@ -207,18 +248,131 @@ class TestGetNumNewMatchedTokens:
         assert num_new == 0
 
 
+class TestReasonCachePlaceholderMatching:
+
+    def setup_method(self):
+        self._tmpfile = _new_tmp_path()
+        _make_reasoncache_pt(
+            str(self._tmpfile),
+            num_layers=2,
+            num_kv_heads=2,
+            num_tokens=32,
+            head_dim=4,
+        )
+        self.connector = _make_connector(str(self._tmpfile), block_size=16)
+
+    def teardown_method(self):
+        self._tmpfile.unlink()
+
+    def test_requires_placeholder_declaration(self):
+        req = _make_mock_request("r1", prompt_len=64)
+        with pytest.raises(ValueError, match="prefix_placeholder_tokens"):
+            self.connector.get_num_new_matched_tokens(req, 0)
+
+    def test_uses_request_placeholder_declaration(self):
+        req = _make_mock_request(
+            "r1",
+            prompt_len=64,
+            extra_args={
+                "kv_transfer_params": {
+                    "prefix_placeholder_tokens": 32,
+                }
+            },
+        )
+
+        num_new, load_async = self.connector.get_num_new_matched_tokens(req, 0)
+
+        assert num_new == 32
+        assert load_async is False
+
+    def test_uses_connector_placeholder_declaration(self):
+        connector = _make_connector(
+            str(self._tmpfile),
+            block_size=16,
+            extra_config={"prefix_placeholder_tokens": 32},
+        )
+        req = _make_mock_request("r1", prompt_len=64)
+
+        num_new, _ = connector.get_num_new_matched_tokens(req, 0)
+
+        assert num_new == 32
+
+    def test_rejects_mismatched_placeholder_count(self):
+        req = _make_mock_request(
+            "r1",
+            prompt_len=64,
+            extra_args={
+                "kv_transfer_params": {
+                    "prefix_placeholder_tokens": 16,
+                }
+            },
+        )
+
+        with pytest.raises(ValueError, match="requires exactly 32"):
+            self.connector.get_num_new_matched_tokens(req, 0)
+
+    def test_rejects_prompt_shorter_than_placeholder_count(self):
+        req = _make_mock_request(
+            "r1",
+            prompt_len=16,
+            extra_args={
+                "kv_transfer_params": {
+                    "prefix_placeholder_tokens": 32,
+                }
+            },
+        )
+
+        with pytest.raises(ValueError, match="prompt has only 16 tokens"):
+            self.connector.get_num_new_matched_tokens(req, 0)
+
+    def test_validates_optional_placeholder_token_id(self):
+        req = _make_mock_request(
+            "r1",
+            prompt_len=64,
+            prompt_token_ids=[0] * 32 + list(range(32)),
+            extra_args={
+                "kv_transfer_params": {
+                    "prefix_placeholder_tokens": 32,
+                    "prefix_placeholder_token_id": 0,
+                }
+            },
+        )
+
+        num_new, _ = self.connector.get_num_new_matched_tokens(req, 0)
+
+        assert num_new == 32
+
+    def test_rejects_placeholder_token_id_mismatch(self):
+        req = _make_mock_request(
+            "r1",
+            prompt_len=64,
+            prompt_token_ids=[0] * 31 + [7] + list(range(32)),
+            extra_args={
+                "kv_transfer_params": {
+                    "prefix_placeholder_tokens": 32,
+                    "prefix_placeholder_token_id": 0,
+                }
+            },
+        )
+
+        with pytest.raises(ValueError, match="placeholder_token_id=0"):
+            self.connector.get_num_new_matched_tokens(req, 0)
+
+
 # ---------------------------------------------------------------------------
 # Tests: update_state_after_alloc — idempotency
 # ---------------------------------------------------------------------------
 
+
 class TestUpdateStateAfterAlloc:
+
     def setup_method(self):
-        self._tmpfile = tempfile.NamedTemporaryFile(suffix=".pt", delete=False)
-        _make_cartridge_pt(self._tmpfile.name)
-        self.connector = _make_connector(self._tmpfile.name)
+        self._tmpfile = _new_tmp_path()
+        _make_cartridge_pt(str(self._tmpfile))
+        self.connector = _make_connector(str(self._tmpfile))
 
     def teardown_method(self):
-        Path(self._tmpfile.name).unlink()
+        self._tmpfile.unlink()
 
     def _prime_resolved(self, req_id: str):
         """Simulate get_num_new_matched_tokens having resolved this id."""
@@ -252,17 +406,26 @@ class TestUpdateStateAfterAlloc:
 # Tests: build_connector_meta — slot mapping
 # ---------------------------------------------------------------------------
 
+
 class TestBuildConnectorMeta:
+
     def setup_method(self):
-        self._tmpfile = tempfile.NamedTemporaryFile(suffix=".pt", delete=False)
-        _make_cartridge_pt(self._tmpfile.name, num_layers=2,
-                          num_kv_heads=2, num_tokens=32, head_dim=4)
-        self.connector = _make_connector(self._tmpfile.name, block_size=16)
+        self._tmpfile = _new_tmp_path()
+        _make_cartridge_pt(
+            str(self._tmpfile),
+            num_layers=2,
+            num_kv_heads=2,
+            num_tokens=32,
+            head_dim=4,
+        )
+        self.connector = _make_connector(str(self._tmpfile), block_size=16)
 
     def teardown_method(self):
-        Path(self._tmpfile.name).unlink()
+        self._tmpfile.unlink()
 
-    def _commit(self, req_id: str, num_tokens: int = 32,
+    def _commit(self,
+                req_id: str,
+                num_tokens: int = 32,
                 cartridge_id: str = "test"):
         """Simulate get_num_new_matched_tokens → update_state_after_alloc.
 
@@ -295,7 +458,7 @@ class TestBuildConnectorMeta:
         # Slot mapping should cover blocks 0,1 (cartridge needs 2 blocks)
         sm = meta.requests[0].slot_mapping
         assert len(sm) == 32  # 2 blocks * 16 tokens
-        assert sm[0].item() == 0   # block 0, offset 0
+        assert sm[0].item() == 0  # block 0, offset 0
         assert sm[15].item() == 15  # block 0, offset 15
         assert sm[16].item() == 16  # block 1, offset 0
         assert sm[31].item() == 31  # block 1, offset 15
@@ -340,5 +503,5 @@ class TestBuildConnectorMeta:
         sm = meta.requests[0].slot_mapping
 
         # Block 5: slots 80-95, Block 10: slots 160-175
-        assert sm[0].item() == 5 * 16   # = 80
+        assert sm[0].item() == 5 * 16  # = 80
         assert sm[16].item() == 10 * 16  # = 160

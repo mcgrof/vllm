@@ -1,14 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-CartridgeConnector: KVConnectorBase_V1 plugin for injecting pre-trained
-cartridge KV caches into vLLM's paged attention system.
+CartridgeConnector: KVConnectorBase_V1 plugin for injecting learned KV
+prefix caches into vLLM's paged attention system.
 
 Cartridges are pre-computed KV caches produced by the HazyResearch
 Self-Study training method (arxiv 2504.16106). A cartridge file
 contains per-layer K and V tensors that have been optimized via
 backpropagation so the model can answer questions about a document
 without re-processing it at serve time.
+
+ReasonCACHE checkpoints use the same serving primitive: a frozen base
+model plus a learned per-layer KV prefix. The connector keeps the
+Cartridge name for compatibility with existing configs, while the
+loader accepts both Self-Study TrainableCache checkpoints and direct
+ReasonCACHE/prefix-tuning KV exports.
 
 Usage:
     vllm serve meta-llama/Llama-3.2-3B-Instruct \\
@@ -22,10 +28,12 @@ Usage:
             "kv_role": "kv_both"
         }'
 
-The cartridge .pt file should be a TrainableCache checkpoint with
-trainable_keys, trainable_values, and optionally frozen_keys /
-frozen_values for the BOS/system prefix that was held fixed during
-Self-Study training.
+The .pt file should contain one learned KV-prefix resource. Supported
+shapes include TrainableCache checkpoints with ``trainable_keys`` /
+``trainable_values`` and optional ``frozen_keys`` / ``frozen_values``,
+ReasonCACHE/prefix-tuning exports with ``prefix_keys`` /
+``prefix_values`` or ``reasoncache_keys`` / ``reasoncache_values``,
+and HF-style ``past_key_values`` lists of per-layer ``(K, V)`` tensors.
 
 The connector supports two modes:
 
@@ -45,27 +53,27 @@ The connector supports two modes:
 In both modes the connector reports per-request num_cartridge_tokens
 as externally computed to the scheduler, which allocates blocks and
 skips prefill accordingly.
+
+ReasonCACHE and generic KV-prefix exports are learned virtual
+prefixes. On this branch, vLLM's scheduler only has token positions
+for the request's existing prompt, so these resources require the
+caller to prepend dummy placeholder tokens and declare their count via
+``sampling_params.extra_args["kv_transfer_params"]["prefix_placeholder_tokens"]``
+or connector extra_config ``prefix_placeholder_tokens``.
 """
-import json
+
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
-from vllm.distributed.kv_transfer.kv_connector.v1.base import (
-    KVConnectorBase_V1,
-    KVConnectorMetadata,
-    KVConnectorRole,
-)
-from vllm.distributed.kv_transfer.kv_connector.v1.cartridge_gpu_residency import (
-    GPUResidencyManager,
-)
-from vllm.distributed.kv_transfer.kv_connector.v1.cartridge_router import (
-    CartridgeRouter,
-    StaticCartridgeRouter,
-    build_router_from_config,
-)
 from vllm import _custom_ops as ops
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorBase_V1, KVConnectorMetadata, KVConnectorRole)
+from vllm.distributed.kv_transfer.kv_connector.v1.cartridge_gpu_residency import (  # noqa: E501
+    GPUResidencyManager)
+from vllm.distributed.kv_transfer.kv_connector.v1.cartridge_router import (
+    CartridgeRouter, StaticCartridgeRouter, build_router_from_config)
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
 
@@ -74,23 +82,292 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+
     pass  # KVCacheConfig not needed on this fork point
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
 
+_PREFIX_RESOURCE_KINDS = frozenset(("reasoncache", "kv_prefix"))
+_PREFIX_PLACEHOLDER_TOKEN_KEYS = (
+    "prefix_placeholder_tokens",
+    "reasoncache_placeholder_tokens",
+    "kv_prefix_placeholder_tokens",
+)
+_PREFIX_PLACEHOLDER_TOKEN_ID_KEYS = (
+    "prefix_placeholder_token_id",
+    "reasoncache_placeholder_token_id",
+    "kv_prefix_placeholder_token_id",
+)
 
 # ---------------------------------------------------------------------------
-# Cartridge loading
+# Learned KV-prefix loading
 # ---------------------------------------------------------------------------
+
+
+def _get(attr: str, obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(attr)
+    if hasattr(obj, attr):
+        return getattr(obj, attr)
+    return None
+
+
+def _unwrap_tensor(tensor: Any) -> torch.Tensor:
+    if hasattr(tensor, "data"):
+        tensor = tensor.data
+    if not isinstance(tensor, torch.Tensor):
+        tensor = torch.as_tensor(tensor)
+    return tensor
+
+
+def _select_checkpoint_payload(checkpoint: Any) -> Any:
+    """Find the object that actually carries KV-prefix tensors."""
+    for attr in (
+            "trainable_keys",
+            "prefix_keys",
+            "reasoncache_keys",
+            "past_key_values",
+    ):
+        if hasattr(checkpoint, attr):
+            return checkpoint
+    if isinstance(checkpoint, dict):
+        for key in (
+                "cache",
+                "reasoncache",
+                "reason_cache",
+                "prefix_cache",
+                "kv_cache",
+        ):
+            nested = checkpoint.get(key)
+            if nested is not None:
+                return nested
+        return checkpoint
+    raise ValueError(f"Unrecognized cartridge format: {type(checkpoint)}")
+
+
+def _normalize_layer_kv(
+    key_tensor: Any,
+    value_tensor: Any,
+    *,
+    layer_idx: int,
+    layout: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Normalize one layer to ``(num_tokens, num_kv_heads, head_dim)``."""
+    k = _unwrap_tensor(key_tensor).detach()
+    v = _unwrap_tensor(value_tensor).detach()
+
+    if k.shape != v.shape:
+        raise ValueError(
+            f"Layer {layer_idx} K shape {k.shape} != V shape {v.shape}")
+
+    # HF-style ``past_key_values`` and TrainableCache both commonly
+    # carry a singleton batch axis: (1, H, T, D) or (1, T, H, D).
+    if k.dim() == 4:
+        if k.shape[0] != 1:
+            raise ValueError(
+                f"Layer {layer_idx} expected batch size 1 for 4D KV "
+                f"tensor, got shape {k.shape}")
+        k = k.squeeze(0)
+        v = v.squeeze(0)
+
+    if k.dim() != 3:
+        raise ValueError(f"Layer {layer_idx} expected 3D or 4D KV tensor, "
+                         f"got shape {k.shape}")
+
+    layout = (layout or "").lower()
+    if layout in ("tokens_heads_dim", "thd", "t,h,d", "t_hd"):
+        k_norm = k
+        v_norm = v
+    elif layout in ("heads_tokens_dim", "htd", "h,t,d", "h_td", ""):
+        # Backward-compatible default for TrainableCache:
+        # (heads, tokens, dim) -> (tokens, heads, dim).
+        k_norm = k.permute(1, 0, 2)
+        v_norm = v.permute(1, 0, 2)
+    else:
+        raise ValueError(
+            f"Unsupported KV layout {layout!r}; expected heads_tokens_dim "
+            "or tokens_heads_dim")
+
+    return k_norm.contiguous(), v_norm.contiguous()
+
+
+def _layer_pairs_from_past_key_values(
+    past_key_values: Any, ) -> list[tuple[Any, Any]]:
+    if hasattr(past_key_values, "key_cache") and hasattr(
+            past_key_values, "value_cache"):
+        return list(zip(past_key_values.key_cache,
+                        past_key_values.value_cache))
+
+    pairs: list[tuple[Any, Any]] = []
+    for layer in past_key_values:
+        if isinstance(layer, dict):
+            k = next(
+                (layer[name] for name in ("key", "k", "keys")
+                 if name in layer and layer[name] is not None),
+                None,
+            )
+            v = next(
+                (layer[name] for name in ("value", "v", "values")
+                 if name in layer and layer[name] is not None),
+                None,
+            )
+            if k is None or v is None:
+                raise ValueError(
+                    "past_key_values layer dict must contain key/value tensors"
+                )
+            pairs.append((k, v))
+        elif isinstance(layer, (tuple, list)) and len(layer) >= 2:
+            pairs.append((layer[0], layer[1]))
+        else:
+            raise ValueError(
+                "past_key_values must contain per-layer (key, value) pairs")
+    return pairs
+
+
+def _find_prefix_kv_fields(cache: Any) -> tuple[Any, Any, str] | None:
+    key_value_names = (
+        ("prefix_keys", "prefix_values", "reasoncache"),
+        ("reasoncache_keys", "reasoncache_values", "reasoncache"),
+        ("reason_cache_keys", "reason_cache_values", "reasoncache"),
+        ("keys", "values", "kv_prefix"),
+        ("key_cache", "value_cache", "kv_prefix"),
+    )
+    for k_name, v_name, source_format in key_value_names:
+        keys = _get(k_name, cache)
+        values = _get(v_name, cache)
+        if keys is not None or values is not None:
+            if keys is None or values is None:
+                raise ValueError(
+                    "Cannot find matching key/value tensors in checkpoint")
+            return keys, values, source_format
+    return None
+
+
+def _extract_learned_kv_prefix(
+    cache: Any,
+) -> tuple[list[tuple[torch.Tensor, torch.Tensor]], str, bool, int, str
+           | None]:
+    """Extract per-layer K/V tensors from a learned-prefix checkpoint."""
+    layout = _get("kv_layout", cache) or _get("layout", cache)
+
+    trainable_keys = _get("trainable_keys", cache)
+    trainable_values = _get("trainable_values", cache)
+    if trainable_keys is not None or trainable_values is not None:
+        if trainable_keys is None or trainable_values is None:
+            raise ValueError(
+                "Cannot find trainable_keys/trainable_values in checkpoint")
+        if len(trainable_keys) != len(trainable_values):
+            raise ValueError(
+                "trainable_keys/trainable_values layer count mismatch")
+
+        frozen_keys = _get("frozen_keys", cache)
+        frozen_values = _get("frozen_values", cache)
+        frozen_keys = [] if frozen_keys is None else frozen_keys
+        frozen_values = [] if frozen_values is None else frozen_values
+        has_frozen = len(frozen_keys) > 0
+        if has_frozen and len(frozen_keys) != len(trainable_keys):
+            raise ValueError(f"frozen_keys length ({len(frozen_keys)}) != "
+                             f"trainable_keys length ({len(trainable_keys)})")
+        if has_frozen and len(frozen_values) != len(trainable_values):
+            raise ValueError(f"frozen_values length ({len(frozen_values)}) != "
+                             f"trainable_values length "
+                             f"({len(trainable_values)})")
+
+        kv_data: list[tuple[torch.Tensor, torch.Tensor]] = []
+        num_frozen_tokens = 0
+        for layer_idx in range(len(trainable_keys)):
+            k_trn = _unwrap_tensor(trainable_keys[layer_idx])
+            v_trn = _unwrap_tensor(trainable_values[layer_idx])
+
+            if has_frozen:
+                k_frz = _unwrap_tensor(frozen_keys[layer_idx])
+                v_frz = _unwrap_tensor(frozen_values[layer_idx])
+                k_full = torch.cat([k_frz, k_trn], dim=2)
+                v_full = torch.cat([v_frz, v_trn], dim=2)
+                if layer_idx == 0:
+                    num_frozen_tokens = int(k_frz.shape[2])
+            else:
+                k_full = k_trn
+                v_full = v_trn
+
+            kv_data.append(
+                _normalize_layer_kv(
+                    k_full,
+                    v_full,
+                    layer_idx=layer_idx,
+                    layout=layout or "heads_tokens_dim",
+                ))
+        return (
+            kv_data,
+            "trainable_cache",
+            has_frozen,
+            (num_frozen_tokens),
+            layout,
+        )
+
+    past_key_values = _get("past_key_values", cache)
+    if past_key_values is not None:
+        pairs = _layer_pairs_from_past_key_values(past_key_values)
+        return (
+            [
+                _normalize_layer_kv(k,
+                                    v,
+                                    layer_idx=i,
+                                    layout=layout or "heads_tokens_dim")
+                for i, (k, v) in enumerate(pairs)
+            ],
+            "past_key_values",
+            False,
+            0,
+            layout,
+        )
+
+    prefix_fields = _find_prefix_kv_fields(cache)
+    if prefix_fields is not None:
+        keys, values, source_format = prefix_fields
+        if len(keys) != len(values):
+            raise ValueError("prefix key/value layer count mismatch")
+        return (
+            [
+                _normalize_layer_kv(k,
+                                    v,
+                                    layer_idx=i,
+                                    layout=layout or "heads_tokens_dim")
+                for i, (k, v) in enumerate(zip(keys, values))
+            ],
+            source_format,
+            False,
+            0,
+            layout,
+        )
+
+    kv_data = _get("kv_data", cache)
+    if kv_data is not None:
+        pairs = _layer_pairs_from_past_key_values(kv_data)
+        return (
+            [
+                _normalize_layer_kv(k,
+                                    v,
+                                    layer_idx=i,
+                                    layout=layout or "tokens_heads_dim")
+                for i, (k, v) in enumerate(pairs)
+            ],
+            "kv_data",
+            False,
+            0,
+            layout,
+        )
+
+    raise ValueError("Cannot find learned KV prefix in checkpoint")
+
 
 def load_cartridge(path: str) -> dict:
-    """Load a TrainableCache cartridge checkpoint.
+    """Load a learned KV-prefix checkpoint.
 
-    The checkpoint is a Python object or dict with ``trainable_keys``
-    and ``trainable_values`` (per-layer parameter lists), and optionally
-    ``frozen_keys`` / ``frozen_values`` for the leading BOS/system
-    tokens that were held fixed during Self-Study training.
+    Backward-compatible name for cartridge deployments. Also accepts
+    ReasonCACHE/prefix-tuning exports that store direct per-layer K/V
+    tensors.
 
     Returns dict with:
         - kv_data: list of (K, V) tuples per layer,
@@ -99,86 +376,43 @@ def load_cartridge(path: str) -> dict:
         - num_layers: int
         - num_kv_heads: int
         - head_dim: int
+        - source_format: str
+        - has_frozen_prefix: bool
+        - num_frozen_tokens: int
     """
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    cache = _select_checkpoint_payload(checkpoint)
+    (
+        kv_data,
+        source_format,
+        has_frozen_prefix,
+        num_frozen_tokens,
+        kv_layout,
+    ) = _extract_learned_kv_prefix(cache)
 
-    if hasattr(checkpoint, "trainable_keys"):
-        cache = checkpoint
-    elif isinstance(checkpoint, dict) and "cache" in checkpoint:
-        cache = checkpoint["cache"]
-    elif isinstance(checkpoint, dict):
-        cache = checkpoint
-    else:
-        raise ValueError(f"Unrecognized cartridge format: {type(checkpoint)}")
+    if not kv_data:
+        raise ValueError("Learned KV prefix has zero layers")
 
-    def _get(attr, obj):
-        if hasattr(obj, attr):
-            return getattr(obj, attr)
-        if isinstance(obj, dict) and attr in obj:
-            return obj[attr]
-        return None
-
-    trainable_keys = _get("trainable_keys", cache)
-    trainable_values = _get("trainable_values", cache)
-    frozen_keys = _get("frozen_keys", cache) or []
-    frozen_values = _get("frozen_values", cache) or []
-
-    if trainable_keys is None or trainable_values is None:
-        raise ValueError("Cannot find trainable_keys in checkpoint")
-
-    num_layers = len(trainable_keys)
-    if frozen_keys and len(frozen_keys) != num_layers:
-        raise ValueError(
-            f"frozen_keys length ({len(frozen_keys)}) != "
-            f"trainable_keys length ({num_layers})"
-        )
-
-    # Per-layer tensor shape: (1, num_heads, num_tokens, head_dim).
-    # Concat frozen (leading BOS/system tokens) + trainable along the
-    # token axis. Without this concatenation, the leading positions
-    # get overwritten with trained values that were optimized assuming
-    # the frozen BOS prefix would be present, which catastrophically
-    # corrupts attention and produces garbage output.
-    kv_data = []
-    for layer_idx in range(num_layers):
-        k_trn = trainable_keys[layer_idx]
-        v_trn = trainable_values[layer_idx]
-        if hasattr(k_trn, "data"):
-            k_trn = k_trn.data
-        if hasattr(v_trn, "data"):
-            v_trn = v_trn.data
-
-        if frozen_keys:
-            k_frz = frozen_keys[layer_idx]
-            v_frz = frozen_values[layer_idx]
-            if hasattr(k_frz, "data"):
-                k_frz = k_frz.data
-            if hasattr(v_frz, "data"):
-                v_frz = v_frz.data
-            k_full = torch.cat([k_frz, k_trn], dim=2).squeeze(0)
-            v_full = torch.cat([v_frz, v_trn], dim=2).squeeze(0)
-        else:
-            k_full = k_trn.squeeze(0)
-            v_full = v_trn.squeeze(0)
-
-        # (num_heads, num_tokens, head_dim) -> (num_tokens, num_heads, head_dim)
-        k = k_full.permute(1, 0, 2).contiguous()
-        v = v_full.permute(1, 0, 2).contiguous()
-
-        # Validate shape consistency across layers
+    for layer_idx, (k, v) in enumerate(kv_data):
+        if k.shape != v.shape:
+            raise ValueError(
+                f"Layer {layer_idx} K shape {k.shape} != V shape {v.shape}")
         if layer_idx > 0:
             prev_k = kv_data[0][0]
             if k.shape != prev_k.shape:
-                raise ValueError(
-                    f"Layer {layer_idx} K shape {k.shape} != "
-                    f"layer 0 K shape {prev_k.shape}"
-                )
+                raise ValueError(f"Layer {layer_idx} K shape {k.shape} != "
+                                 f"layer 0 K shape {prev_k.shape}")
 
-        kv_data.append((k, v))
-
+    num_layers = len(kv_data)
     num_tokens = kv_data[0][0].shape[0]
     num_kv_heads = kv_data[0][0].shape[1]
     head_dim = kv_data[0][0].shape[2]
+    if source_format == "trainable_cache":
+        resource_kind = "cartridge"
+    elif source_format == "reasoncache":
+        resource_kind = "reasoncache"
+    else:
+        resource_kind = "kv_prefix"
 
     return {
         "kv_data": kv_data,
@@ -186,6 +420,11 @@ def load_cartridge(path: str) -> dict:
         "num_layers": num_layers,
         "num_kv_heads": num_kv_heads,
         "head_dim": head_dim,
+        "source_format": source_format,
+        "resource_kind": resource_kind,
+        "has_frozen_prefix": has_frozen_prefix,
+        "num_frozen_tokens": num_frozen_tokens,
+        "kv_layout": kv_layout or "",
     }
 
 
@@ -194,9 +433,43 @@ def align_to_block_size(num_tokens: int, block_size: int) -> int:
     return (num_tokens // block_size) * block_size
 
 
+def _request_extra_value(request: "Request", keys: tuple[str, ...]) -> Any:
+    """Read connector-bound request metadata from SamplingParams extras."""
+    sampling_params = getattr(request, "sampling_params", None)
+    extras = getattr(sampling_params, "extra_args", None)
+    if not isinstance(extras, dict):
+        return None
+
+    for key in keys:
+        value = extras.get(key)
+        if value is not None:
+            return value
+
+    kv_transfer_params = extras.get("kv_transfer_params")
+    if isinstance(kv_transfer_params, dict):
+        for key in keys:
+            value = kv_transfer_params.get(key)
+            if value is not None:
+                return value
+    return None
+
+
+def _coerce_optional_int(value: Any, *, field_name: str) -> int | None:
+    if value is None:
+        return None
+    try:
+        coerced = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be an integer") from exc
+    if coerced < 0:
+        raise ValueError(f"{field_name} must be non-negative")
+    return coerced
+
+
 # ---------------------------------------------------------------------------
 # Cache injection helper (extracted for testability)
 # ---------------------------------------------------------------------------
+
 
 def inject_kv_into_paged_cache(
     src_key: torch.Tensor,
@@ -220,21 +493,29 @@ def inject_kv_into_paged_cache(
             flat slot index in the paged cache.
     """
     # Auto-detect K/V split dimension.
-    # Handles both stacked 5D tensors (K/V at dim 0 or dim 1) and
-    # backends that pass separate (K, V) tensors as a tuple/list.
+    #
+    # Three layouts observed across backends:
+    #   (2, num_blocks, block_size, num_kv_heads, head_dim)
+    #     K/V stacked at dim 0.
+    #   (num_blocks, 2, block_size, num_kv_heads, head_dim)
+    #     K/V stacked at dim 1.
+    #   (num_blocks, block_size, num_kv_heads, head_dim)
+    #     K-only; V lives in a sibling tensor and kv_cache_layer is
+    #     passed as a tuple/list of (k_cache, v_cache).
     if isinstance(kv_cache_layer, (tuple, list)) and len(kv_cache_layer) == 2:
         key_cache, value_cache = kv_cache_layer[0], kv_cache_layer[1]
-    elif hasattr(kv_cache_layer, 'shape') and kv_cache_layer.shape[0] == 2:
+    elif hasattr(kv_cache_layer, "shape") and kv_cache_layer.shape[0] == 2:
         key_cache, value_cache = kv_cache_layer.unbind(0)
-    elif hasattr(kv_cache_layer, 'shape') and kv_cache_layer.shape[1] == 2:
+    elif hasattr(kv_cache_layer, "shape") and kv_cache_layer.shape[1] == 2:
         key_cache, value_cache = kv_cache_layer.unbind(1)
     else:
+        cache_shape = (kv_cache_layer.shape if hasattr(kv_cache_layer, "shape")
+                       else type(kv_cache_layer))
         raise ValueError(
             f"Cannot determine K/V split for cache shape "
-            f"{kv_cache_layer.shape if hasattr(kv_cache_layer, 'shape') else type(kv_cache_layer)}."
+            f"{cache_shape}."
             " Expected a 5D tensor with K/V stacked at dim 0 or 1, "
-            "or a (k_cache, v_cache) tuple."
-        )
+            "or a (k_cache, v_cache) tuple.")
 
     # Align src tensors to slot_mapping length.  A cartridge may carry a
     # few extra tokens beyond the request's block-aligned num_tokens
@@ -245,10 +526,8 @@ def inject_kv_into_paged_cache(
         src_key = src_key[:n_inject]
         src_value = src_value[:n_inject]
 
-    k_scale = torch.tensor(1.0, dtype=torch.float32,
-                            device=key_cache.device)
-    v_scale = torch.tensor(1.0, dtype=torch.float32,
-                            device=value_cache.device)
+    k_scale = torch.tensor(1.0, dtype=torch.float32, device=key_cache.device)
+    v_scale = torch.tensor(1.0, dtype=torch.float32, device=value_cache.device)
 
     ops.reshape_and_cache_flash(
         key=src_key,
@@ -266,6 +545,7 @@ def inject_kv_into_paged_cache(
 # Connector metadata
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class CartridgeReqMeta:
     """Metadata for a single request needing cartridge KV injection.
@@ -275,6 +555,7 @@ class CartridgeReqMeta:
     concurrent requests would all receive the same (singleton)
     cartridge regardless of how the scheduler resolved them.
     """
+
     cartridge_id: str
     slot_mapping: torch.Tensor
     num_tokens: int
@@ -283,12 +564,14 @@ class CartridgeReqMeta:
 @dataclass
 class CartridgeConnectorMetadata(KVConnectorMetadata):
     """Metadata passed from scheduler to worker."""
+
     requests: list[CartridgeReqMeta] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
 # Connector
 # ---------------------------------------------------------------------------
+
 
 class CartridgeConnector(KVConnectorBase_V1):
     """KV connector that injects pre-trained cartridge KV caches into
@@ -364,22 +647,44 @@ class CartridgeConnector(KVConnectorBase_V1):
         (a list of ``{cartridge_id, path, manifest_path?}`` dicts). At
         least one of the two must be set.
         """
-        from vllm.distributed.kv_transfer.kv_connector.v1.cartridge_store import (
-            CartridgeStore,
-        )
+        from .cartridge_store import CartridgeStore
 
         singleton_path = self._kv_transfer_config.get_from_extra_config(
-            "cartridge_path", None
+            "cartridge_path", None)
+        reasoncache_path = self._kv_transfer_config.get_from_extra_config(
+            "reasoncache_path", None)
+        kv_prefix_path = self._kv_transfer_config.get_from_extra_config(
+            "kv_prefix_path", None)
+        singleton_candidates = (
+            (singleton_path, "cartridge"),
+            (reasoncache_path, "reasoncache"),
+            (kv_prefix_path, "kv_prefix"),
         )
+        configured_singletons = [
+            candidate for candidate in singleton_candidates
+            if candidate[0] is not None
+        ]
+        if len(configured_singletons) > 1:
+            raise ValueError("Specify only one of 'cartridge_path', "
+                             "'reasoncache_path', or 'kv_prefix_path'")
+        singleton_kind_hint = None
+        if configured_singletons:
+            singleton_path = configured_singletons[0][0]
+            singleton_kind_hint = configured_singletons[0][1]
+        else:
+            singleton_path = None
         cartridges_list = self._kv_transfer_config.get_from_extra_config(
-            "cartridges", None
-        )
+            "cartridges", None)
+        list_kind_hint = None
+        if cartridges_list is None:
+            cartridges_list = self._kv_transfer_config.get_from_extra_config(
+                "kv_prefixes", None)
+            list_kind_hint = "kv_prefix"
         if singleton_path is None and not cartridges_list:
-            raise ValueError(
-                "CartridgeConnector requires either 'cartridge_path' "
-                "(singleton mode) or 'cartridges' (multi-cartridge "
-                "mode) in --kv-connector-extra-config"
-            )
+            raise ValueError("CartridgeConnector requires one singleton path "
+                             "('cartridge_path', 'reasoncache_path', or "
+                             "'kv_prefix_path') or 'cartridges'/'kv_prefixes' "
+                             "in --kv-connector-extra-config")
 
         self._store = CartridgeStore(block_size=self._block_size)
         # cartridge_id -> {"num_tokens": int, "num_blocks": int,
@@ -390,72 +695,71 @@ class CartridgeConnector(KVConnectorBase_V1):
         self._default_cartridge_id: Optional[str] = None
 
         if singleton_path is not None:
-            manifest_path = (
-                self._kv_transfer_config.get_from_extra_config(
-                    "manifest_path", None
-                )
-            )
+            manifest_path = self._kv_transfer_config.get_from_extra_config(
+                "manifest_path", None)
             cart_id = self._load_one(
                 cartridge_path=singleton_path,
                 manifest_path=manifest_path,
                 explicit_cartridge_id=None,
+                resource_kind_hint=singleton_kind_hint,
             )
             self._default_cartridge_id = cart_id
 
         if cartridges_list:
             if not isinstance(cartridges_list, list):
-                raise ValueError(
-                    "'cartridges' must be a list of entries")
+                raise ValueError("'cartridges' must be a list of entries")
             for entry in cartridges_list:
                 if not isinstance(entry, dict):
-                    raise ValueError(
-                        "each 'cartridges' entry must be a dict")
+                    raise ValueError("each 'cartridges' entry must be a dict")
                 path = entry.get("path")
                 if not path:
-                    raise ValueError(
-                        "each 'cartridges' entry requires 'path'")
+                    raise ValueError("each 'cartridges' entry requires 'path'")
                 self._load_one(
                     cartridge_path=path,
                     manifest_path=entry.get("manifest_path"),
                     explicit_cartridge_id=entry.get("cartridge_id"),
+                    resource_kind_hint=entry.get("resource_kind")
+                    or list_kind_hint,
                 )
             # First listed cartridge is the default fallback if no
             # singleton was provided.
             if self._default_cartridge_id is None:
                 first_entry = cartridges_list[0]
-                self._default_cartridge_id = (
-                    first_entry.get("cartridge_id")
-                    or next(iter(self._cartridge_meta))
-                )
+                self._default_cartridge_id = first_entry.get(
+                    "cartridge_id") or next(iter(self._cartridge_meta))
 
     def _load_one(
         self,
         cartridge_path: str,
         manifest_path: Optional[str],
         explicit_cartridge_id: Optional[str],
+        resource_kind_hint: Optional[str] = None,
     ) -> str:
         """Load a single cartridge, register it in the store, and
         record its per-cartridge sizing in self._cartridge_meta.
 
         Returns the cartridge_id that was registered.
         """
-        from vllm.distributed.kv_transfer.kv_connector.v1.cartridge_manifest import (
-            CartridgeManifest,
-        )
+        from .cartridge_manifest import CartridgeManifest
 
         manifest: Optional[CartridgeManifest] = None
         if manifest_path is not None:
             manifest = CartridgeManifest.from_json(manifest_path)
+            if (resource_kind_hint is not None
+                    and manifest.resource_kind == "cartridge"):
+                manifest.resource_kind = resource_kind_hint
             model_cfg = self._vllm_config.model_config.hf_config
             num_layers = getattr(model_cfg, "num_hidden_layers", 0)
             num_kv_heads = getattr(
-                model_cfg, "num_key_value_heads",
+                model_cfg,
+                "num_key_value_heads",
                 getattr(model_cfg, "num_attention_heads", 0),
             )
             head_dim = getattr(
-                model_cfg, "head_dim",
-                getattr(model_cfg, "hidden_size", 0)
-                // max(getattr(model_cfg, "num_attention_heads", 1), 1),
+                model_cfg,
+                "head_dim",
+                getattr(model_cfg, "hidden_size", 0) //
+                max(getattr(model_cfg, "num_attention_heads", 1), 1),
             )
             errors = manifest.validate_against_model(
                 model_id=self._vllm_config.model_config.model,
@@ -464,13 +768,10 @@ class CartridgeConnector(KVConnectorBase_V1):
                 head_dim=head_dim,
             )
             errors.extend(
-                manifest.validate_against_block_size(self._block_size)
-            )
+                manifest.validate_against_block_size(self._block_size))
             if errors:
-                raise ValueError(
-                    "Cartridge manifest validation failed:\n"
-                    + "\n".join(f"  - {e}" for e in errors)
-                )
+                raise ValueError("Cartridge manifest validation failed:\n" +
+                                 "\n".join(f"  - {e}" for e in errors))
             logger.info("Cartridge manifest validated: %s",
                         manifest.cartridge_id)
             if (explicit_cartridge_id is not None
@@ -478,13 +779,12 @@ class CartridgeConnector(KVConnectorBase_V1):
                 raise ValueError(
                     f"cartridge_id mismatch: config says "
                     f"{explicit_cartridge_id!r} but manifest says "
-                    f"{manifest.cartridge_id!r}"
-                )
+                    f"{manifest.cartridge_id!r}")
 
         if manifest is None:
             cartridge_data = load_cartridge(cartridge_path)
-            aligned = align_to_block_size(
-                cartridge_data["num_tokens"], self._block_size)
+            aligned = align_to_block_size(cartridge_data["num_tokens"],
+                                          self._block_size)
             manifest = CartridgeManifest(
                 cartridge_id=explicit_cartridge_id or "default",
                 model_id="unknown",
@@ -496,14 +796,19 @@ class CartridgeConnector(KVConnectorBase_V1):
                 num_tokens_aligned=aligned,
                 block_size=self._block_size,
                 num_blocks=aligned // self._block_size,
-                has_frozen_prefix=False,
+                has_frozen_prefix=cartridge_data.get("has_frozen_prefix",
+                                                     False),
+                num_frozen_tokens=cartridge_data.get("num_frozen_tokens", 0),
+                resource_kind=cartridge_data.get("resource_kind", "cartridge"),
+                source_format=cartridge_data.get("source_format",
+                                                 "trainable_cache"),
+                kv_layout=cartridge_data.get("kv_layout", ""),
             )
             del cartridge_data
 
         cart_id = manifest.cartridge_id
         if cart_id in self._cartridge_meta:
-            raise ValueError(
-                f"duplicate cartridge_id: {cart_id!r}")
+            raise ValueError(f"duplicate cartridge_id: {cart_id!r}")
 
         self._store.load(cart_id, cartridge_path, manifest, device="cpu")
         # Intentionally NOT calling store.pin() here. GPU residency
@@ -518,12 +823,18 @@ class CartridgeConnector(KVConnectorBase_V1):
             "num_tokens": num_tokens,
             "num_blocks": num_blocks,
             "num_layers": residency.num_layers,
+            "resource_kind": manifest.resource_kind,
+            "source_format": manifest.source_format,
         }
         logger.info(
-            "Cartridge loaded: id=%s, %d layers, %d tokens "
+            "Cartridge loaded: id=%s, kind=%s, %d layers, %d tokens "
             "(%d blocks of %d)",
-            cart_id, residency.num_layers,
-            num_tokens, num_blocks, self._block_size,
+            cart_id,
+            manifest.resource_kind,
+            residency.num_layers,
+            num_tokens,
+            num_blocks,
+            self._block_size,
         )
         return cart_id
 
@@ -540,8 +851,7 @@ class CartridgeConnector(KVConnectorBase_V1):
         ``cpu`` (the tests exercise the CPU path explicitly).
         """
         explicit = self._kv_transfer_config.get_from_extra_config(
-            "gpu_capacity_bytes", None
-        )
+            "gpu_capacity_bytes", None)
         if explicit is not None:
             capacity = int(explicit)
         else:
@@ -558,29 +868,28 @@ class CartridgeConnector(KVConnectorBase_V1):
                 # connector-init time, use 4 bytes to be conservative.
                 model_cfg = self._vllm_config.model_config.hf_config
                 heads = getattr(
-                    model_cfg, "num_key_value_heads",
+                    model_cfg,
+                    "num_key_value_heads",
                     getattr(model_cfg, "num_attention_heads", 1),
                 )
                 dim = getattr(
-                    model_cfg, "head_dim",
-                    getattr(model_cfg, "hidden_size", 0)
-                    // max(getattr(model_cfg, "num_attention_heads", 1), 1),
+                    model_cfg,
+                    "head_dim",
+                    getattr(model_cfg, "hidden_size", 0) //
+                    max(getattr(model_cfg, "num_attention_heads", 1), 1),
                 )
-                bytes_est = (
-                    res.num_layers * 2 * res.num_tokens
-                    * heads * dim * 4
-                )
+                bytes_est = (res.num_layers * 2 * res.num_tokens * heads *
+                             dim * 4)
                 max_cart_bytes = max(max_cart_bytes, bytes_est)
             capacity = max(8 * max_cart_bytes, 1 << 30)
 
         device = self._kv_transfer_config.get_from_extra_config(
-            "gpu_residency_device", None
-        )
+            "gpu_residency_device", None)
         if device is None:
             try:
                 import torch as _torch  # noqa: F401 (reuse outer import)
-                device = ("cuda" if torch.cuda.is_available()
-                          else "cpu")
+
+                device = "cuda" if torch.cuda.is_available() else "cpu"
             except Exception:
                 device = "cpu"
 
@@ -602,13 +911,11 @@ class CartridgeConnector(KVConnectorBase_V1):
         having a residency manager.
         """
         preload = self._kv_transfer_config.get_from_extra_config(
-            "preload", None
-        )
+            "preload", None)
         if not preload:
             return
         if not isinstance(preload, list):
-            raise ValueError(
-                "'preload' must be a list of cartridge_ids")
+            raise ValueError("'preload' must be a list of cartridge_ids")
         for cart_id in preload:
             if cart_id not in self._cartridge_meta:
                 logger.warning(
@@ -618,7 +925,9 @@ class CartridgeConnector(KVConnectorBase_V1):
                 continue
             ok = self._residency.prefetch(str(cart_id))
             logger.info(
-                "preload: cartridge=%s resident=%s", cart_id, ok,
+                "preload: cartridge=%s resident=%s",
+                cart_id,
+                ok,
             )
 
     def _build_router_from_config(self) -> CartridgeRouter:
@@ -629,25 +938,21 @@ class CartridgeConnector(KVConnectorBase_V1):
         (singleton semantics). Otherwise raises.
         """
         router_cfg = self._kv_transfer_config.get_from_extra_config(
-            "router", None
-        )
+            "router", None)
         if router_cfg is None:
             if len(self._cartridge_meta) == 1:
                 only_id = next(iter(self._cartridge_meta))
                 return StaticCartridgeRouter(only_id)
-            raise ValueError(
-                "Multi-cartridge mode requires 'router' in "
-                "--kv-connector-extra-config when more than one "
-                "cartridge is loaded"
-            )
+            raise ValueError("Multi-cartridge mode requires 'router' in "
+                             "--kv-connector-extra-config when more than one "
+                             "cartridge is loaded")
         if not isinstance(router_cfg, dict):
             raise ValueError(
-                "'router' must be a dict describing the router "
-                "configuration")
+                "'router' must be a dict describing the router configuration")
         return build_router_from_config(
             router_cfg,
             registry=None,  # Registry-based routers must be wired
-                           # externally via set_registry() for now.
+            # externally via set_registry() for now.
             default_cartridge_id=self._default_cartridge_id,
         )
 
@@ -656,8 +961,7 @@ class CartridgeConnector(KVConnectorBase_V1):
     # (or only) loaded cartridge.
     @property
     def _cartridge_id(self) -> str:
-        return self._default_cartridge_id or next(
-            iter(self._cartridge_meta))
+        return self._default_cartridge_id or next(iter(self._cartridge_meta))
 
     @property
     def _num_cartridge_tokens(self) -> int:
@@ -678,6 +982,83 @@ class CartridgeConnector(KVConnectorBase_V1):
         routers that need a live CartridgeRegistry handle.
         """
         self._router = router
+
+    def _extra_config_value(self, keys: tuple[str, ...]) -> Any:
+        kv_transfer_config = getattr(self, "_kv_transfer_config", None)
+        get_from_extra_config = getattr(kv_transfer_config,
+                                        "get_from_extra_config", None)
+        if get_from_extra_config is None:
+            return None
+        for key in keys:
+            value = get_from_extra_config(key, None)
+            if value is not None:
+                return value
+        return None
+
+    def _prefix_placeholder_tokens(self, request: "Request") -> int | None:
+        value = _request_extra_value(request, _PREFIX_PLACEHOLDER_TOKEN_KEYS)
+        if value is None:
+            value = self._extra_config_value(_PREFIX_PLACEHOLDER_TOKEN_KEYS)
+        return _coerce_optional_int(value,
+                                    field_name="prefix_placeholder_tokens")
+
+    def _prefix_placeholder_token_id(self, request: "Request") -> int | None:
+        value = _request_extra_value(request,
+                                     _PREFIX_PLACEHOLDER_TOKEN_ID_KEYS)
+        if value is None:
+            value = self._extra_config_value(_PREFIX_PLACEHOLDER_TOKEN_ID_KEYS)
+        return _coerce_optional_int(value,
+                                    field_name="prefix_placeholder_token_id")
+
+    def _matched_token_count(
+        self,
+        request: "Request",
+        cart_id: str,
+        cart_info: dict,
+        prompt_ids: list[int],
+    ) -> int:
+        """Return how many request positions can receive learned KV."""
+        required = int(cart_info["num_tokens"])
+        if (cart_info.get("resource_kind", "cartridge")
+                not in _PREFIX_RESOURCE_KINDS):
+            return min(required, len(prompt_ids))
+
+        if required == 0:
+            return 0
+
+        declared = self._prefix_placeholder_tokens(request)
+        if declared is None:
+            raise ValueError(
+                f"KV-prefix resource {cart_id!r} "
+                f"({cart_info.get('resource_kind')}) requires explicit "
+                "placeholder tokens on this branch. Prepend exactly "
+                f"{required} dummy tokens before the user prompt and set "
+                "prefix_placeholder_tokens to that value in "
+                "sampling_params.extra_args['kv_transfer_params'] or "
+                "kv_connector_extra_config. Transparent virtual-prefix "
+                "scheduling is not implemented yet.")
+        if declared != required:
+            raise ValueError(
+                f"KV-prefix resource {cart_id!r} requires exactly "
+                f"{required} prefix_placeholder_tokens, got {declared}. "
+                "The declared placeholder span must match the aligned "
+                "learned KV prefix length.")
+        if len(prompt_ids) < required:
+            raise ValueError(
+                f"KV-prefix resource {cart_id!r} requires {required} "
+                f"placeholder prompt tokens, but the prompt has only "
+                f"{len(prompt_ids)} tokens.")
+
+        placeholder_token_id = self._prefix_placeholder_token_id(request)
+        if placeholder_token_id is not None:
+            for offset, token_id in enumerate(prompt_ids[:required]):
+                if int(token_id) != placeholder_token_id:
+                    raise ValueError(
+                        f"KV-prefix resource {cart_id!r} expected "
+                        f"placeholder_token_id={placeholder_token_id} at "
+                        f"prompt offset {offset}, got {token_id}.")
+
+        return required
 
     # ==============================
     # Scheduler-side methods
@@ -713,19 +1094,19 @@ class CartridgeConnector(KVConnectorBase_V1):
             logger.warning(
                 "Router resolved request %s to unknown cartridge_id "
                 "%r; falling through to normal prefill",
-                request.request_id, cart_id,
+                request.request_id,
+                cart_id,
             )
             return 0, False
 
         cart_info = self._cartridge_meta[cart_id]
-        # Cap to prompt length so we never claim more positions than
-        # the request has.  Also ensure at least one token remains for
-        # the scheduler to process (it asserts num_new_tokens > 0).
-        max_claim = len(prompt_ids) - 1
-        if max_claim <= 0:
-            return 0, False
+        # For legacy cartridges, cap to prompt length so we never
+        # claim more positions than the request has. For
+        # ReasonCACHE/generic KV-prefix resources, require an
+        # explicit dummy-token prefix because the scheduler does not
+        # yet allocate transparent virtual tokens.
         matched = align_to_block_size(
-            min(cart_info["num_tokens"], max_claim),
+            self._matched_token_count(request, cart_id, cart_info, prompt_ids),
             self._block_size,
         )
 
@@ -742,8 +1123,11 @@ class CartridgeConnector(KVConnectorBase_V1):
         logger.info(
             "Cartridge: request %s routed to %s — %d tokens "
             "externally computed (%d new beyond %d already computed)",
-            request.request_id, cart_id,
-            matched, num_new, num_computed_tokens,
+            request.request_id,
+            cart_id,
+            matched,
+            num_new,
+            num_computed_tokens,
         )
         return num_new, False
 
@@ -764,8 +1148,7 @@ class CartridgeConnector(KVConnectorBase_V1):
         if num_external_tokens > 0:
             # Sanity check: get_num_new_matched_tokens should have
             # populated our state for this request.
-            if (request.request_id
-                    not in self._request_cartridge_ids):
+            if request.request_id not in self._request_cartridge_ids:
                 logger.warning(
                     "update_state_after_alloc: no cartridge_id "
                     "recorded for request %s; skipping",
@@ -791,29 +1174,27 @@ class CartridgeConnector(KVConnectorBase_V1):
             if cart_id is None or num_tokens is None:
                 logger.warning(
                     "build_connector_meta: missing resolved state "
-                    "for request %s; skipping", new_req.req_id,
+                    "for request %s; skipping",
+                    new_req.req_id,
                 )
                 continue
 
             num_blocks = num_tokens // self._block_size
             block_ids = new_req.block_ids[0]
             cartridge_block_ids = block_ids[:num_blocks]
-            block_ids_tensor = torch.tensor(
-                cartridge_block_ids, dtype=torch.long
-            )
-            block_offsets = torch.arange(
-                0, self._block_size, dtype=torch.long
-            )
+            block_ids_tensor = torch.tensor(cartridge_block_ids,
+                                            dtype=torch.long)
+            block_offsets = torch.arange(0, self._block_size, dtype=torch.long)
             slot_mapping = (
-                block_offsets.reshape(1, self._block_size)
-                + block_ids_tensor.reshape(-1, 1) * self._block_size
-            ).flatten()
+                block_offsets.reshape(1, self._block_size) +
+                block_ids_tensor.reshape(-1, 1) * self._block_size).flatten()
 
-            meta.requests.append(CartridgeReqMeta(
-                cartridge_id=cart_id,
-                slot_mapping=slot_mapping,
-                num_tokens=num_tokens,
-            ))
+            meta.requests.append(
+                CartridgeReqMeta(
+                    cartridge_id=cart_id,
+                    slot_mapping=slot_mapping,
+                    num_tokens=num_tokens,
+                ))
 
         # Clear tick-local state for consumed AND any stale resolved
         # requests that never got committed (e.g. deferred by the
@@ -822,8 +1203,7 @@ class CartridgeConnector(KVConnectorBase_V1):
         # Only clear state for requests scheduled this tick — requests
         # that were resolved but not yet scheduled may still be pending.
         # In practice resolved+not-scheduled cleans up on reschedule.
-        scheduled_ids = {r.req_id
-                         for r in scheduler_output.scheduled_new_reqs}
+        scheduled_ids = {r.req_id for r in scheduler_output.scheduled_new_reqs}
         for req_id in list(self._request_cartridge_ids.keys()):
             if req_id in scheduled_ids:
                 self._request_cartridge_ids.pop(req_id, None)
@@ -835,9 +1215,8 @@ class CartridgeConnector(KVConnectorBase_V1):
     # Worker-side methods
     # ==============================
 
-    def start_load_kv(
-        self, forward_context: "ForwardContext", **kwargs: Any
-    ) -> None:
+    def start_load_kv(self, forward_context: "ForwardContext",
+                      **kwargs: Any) -> None:
         """Inject cartridge KV into allocated GPU blocks, dispatching
         per request to the cartridge chosen by the scheduler-side
         router.
@@ -859,8 +1238,8 @@ class CartridgeConnector(KVConnectorBase_V1):
         if self._tp_size > 1 and self._tp_rank == 0:
             try:
                 from vllm.distributed.parallel_state import (
-                    get_tensor_model_parallel_rank,
-                )
+                    get_tensor_model_parallel_rank)
+
                 self._tp_rank = get_tensor_model_parallel_rank()
             except Exception:
                 pass  # fallback to rank 0
@@ -885,7 +1264,9 @@ class CartridgeConnector(KVConnectorBase_V1):
             except Exception as e:
                 logger.error(
                     "start_load_kv: cannot acquire cartridge %r "
-                    "on GPU tier: %s", cart_id, e,
+                    "on GPU tier: %s",
+                    cart_id,
+                    e,
                 )
                 # Continue — releasing what we already acquired in
                 # the finally block; request will fall through.
@@ -895,12 +1276,13 @@ class CartridgeConnector(KVConnectorBase_V1):
                 cart_id = request.cartridge_id
                 if cart_id not in acquired_ids:
                     continue
-                num_layers = self._cartridge_meta.get(
-                    cart_id, {}).get("num_layers")
+                num_layers = self._cartridge_meta.get(cart_id,
+                                                      {}).get("num_layers")
                 if num_layers is None:
                     logger.error(
                         "start_load_kv: unknown cartridge_id %r; "
-                        "skipping request", cart_id,
+                        "skipping request",
+                        cart_id,
                     )
                     continue
 
@@ -920,7 +1302,8 @@ class CartridgeConnector(KVConnectorBase_V1):
     # ------------------------------------------------------------------
 
     def _peek_target_device_dtype(
-        self, forward_context: "ForwardContext",
+        self,
+        forward_context: "ForwardContext",
     ) -> tuple[Any, Any]:
         """Infer the paged-cache device + dtype from the first layer
         in the forward context.
@@ -965,7 +1348,8 @@ class CartridgeConnector(KVConnectorBase_V1):
 
         logger.info(
             "Injecting cartridge %s KV (%d tokens) into GPU cache",
-            cart_id, request.num_tokens,
+            cart_id,
+            request.num_tokens,
         )
 
         for layer_name in forward_context.no_compile_layers:
@@ -1004,7 +1388,9 @@ class CartridgeConnector(KVConnectorBase_V1):
             )
 
     def _fetch_source_kv(
-        self, cartridge_id: str, layer_idx: int,
+        self,
+        cartridge_id: str,
+        layer_idx: int,
     ) -> "torch.Tensor | None":
         """Return the device-correct (K,V) stacked tensor for one
         layer.
@@ -1018,7 +1404,9 @@ class CartridgeConnector(KVConnectorBase_V1):
         except Exception as e:
             logger.error(
                 "fetch_source_kv: %s layer %d missing: %s",
-                cartridge_id, layer_idx, e,
+                cartridge_id,
+                layer_idx,
+                e,
             )
             return None
 
@@ -1055,3 +1443,14 @@ class CartridgeConnector(KVConnectorBase_V1):
                 except ValueError:
                     pass
         return None
+
+
+class ReasonCacheConnector(CartridgeConnector):
+    """User-facing alias for serving ReasonCACHE learned KV prefixes.
+
+    The implementation is identical to ``CartridgeConnector`` because both
+    resources are learned per-layer K/V prefixes injected as externally
+    computed cache.  The alias lets deployments use
+    ``kv_connector="ReasonCacheConnector"`` and ``reasoncache_path`` without
+    carrying cartridge-specific naming in their serving config.
+    """

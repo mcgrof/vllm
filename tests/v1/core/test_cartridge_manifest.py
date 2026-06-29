@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for CartridgeManifest.
 
 Covers:
@@ -8,21 +9,20 @@ Covers:
 4. from_cartridge construction from a real .pt file.
 5. Label storage for routing metadata.
 """
-import json
+
 import tempfile
 from pathlib import Path
+from typing import Any
 
-import pytest
 import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.cartridge_manifest import (
-    CartridgeManifest,
-)
-
+    CartridgeManifest)
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 def _make_manifest(**overrides) -> CartridgeManifest:
     defaults = dict(
@@ -42,16 +42,22 @@ def _make_manifest(**overrides) -> CartridgeManifest:
         file_size_bytes=100_000_000,
         training_steps=2694,
         source_document="patient_04 medical record",
-        labels={"patient_id": "patient_04", "doc_type": "medical_record"},
+        labels={
+            "patient_id": "patient_04",
+            "doc_type": "medical_record"
+        },
     )
     defaults.update(overrides)
     return CartridgeManifest(**defaults)
 
 
-def _make_trainable_cache_pt(path, num_layers=4, num_kv_heads=2,
-                              num_tokens=32, head_dim=8):
+def _make_trainable_cache_pt(path,
+                             num_layers=4,
+                             num_kv_heads=2,
+                             num_tokens=32,
+                             head_dim=8):
     """Create a minimal TrainableCache .pt for from_cartridge tests."""
-    cache = {
+    cache: dict[str, Any] = {
         "trainable_keys": [],
         "trainable_values": [],
         "frozen_keys": [],
@@ -59,9 +65,11 @@ def _make_trainable_cache_pt(path, num_layers=4, num_kv_heads=2,
     }
     for _ in range(num_layers):
         cache["trainable_keys"].append(
-            torch.nn.Parameter(torch.randn(1, num_kv_heads, num_tokens - 1, head_dim)))
+            torch.nn.Parameter(
+                torch.randn(1, num_kv_heads, num_tokens - 1, head_dim)))
         cache["trainable_values"].append(
-            torch.nn.Parameter(torch.randn(1, num_kv_heads, num_tokens - 1, head_dim)))
+            torch.nn.Parameter(
+                torch.randn(1, num_kv_heads, num_tokens - 1, head_dim)))
         cache["frozen_keys"].append(
             torch.nn.Parameter(torch.randn(1, num_kv_heads, 1, head_dim)))
         cache["frozen_values"].append(
@@ -73,12 +81,16 @@ def _make_trainable_cache_pt(path, num_layers=4, num_kv_heads=2,
 # Tests: model compatibility
 # ---------------------------------------------------------------------------
 
+
 class TestModelCompatibility:
+
     def test_compatible(self):
         m = _make_manifest()
         errors = m.validate_against_model(
             model_id="meta-llama/Llama-3.2-3B-Instruct",
-            num_layers=28, num_kv_heads=8, head_dim=128,
+            num_layers=28,
+            num_kv_heads=8,
+            head_dim=128,
         )
         assert errors == []
 
@@ -86,7 +98,9 @@ class TestModelCompatibility:
         m = _make_manifest()
         errors = m.validate_against_model(
             model_id="Qwen/Qwen2.5-7B-Instruct",
-            num_layers=28, num_kv_heads=8, head_dim=128,
+            num_layers=28,
+            num_kv_heads=8,
+            head_dim=128,
         )
         assert len(errors) == 1
         assert "model_id" in errors[0]
@@ -95,7 +109,9 @@ class TestModelCompatibility:
         m = _make_manifest()
         errors = m.validate_against_model(
             model_id="meta-llama/Llama-3.2-3B-Instruct",
-            num_layers=32, num_kv_heads=8, head_dim=128,
+            num_layers=32,
+            num_kv_heads=8,
+            head_dim=128,
         )
         assert len(errors) == 1
         assert "num_layers" in errors[0]
@@ -104,7 +120,9 @@ class TestModelCompatibility:
         m = _make_manifest()
         errors = m.validate_against_model(
             model_id="meta-llama/Llama-3.2-3B-Instruct",
-            num_layers=28, num_kv_heads=4, head_dim=128,
+            num_layers=28,
+            num_kv_heads=4,
+            head_dim=128,
         )
         assert len(errors) == 1
         assert "num_kv_heads" in errors[0]
@@ -113,7 +131,9 @@ class TestModelCompatibility:
         m = _make_manifest()
         errors = m.validate_against_model(
             model_id="meta-llama/Llama-3.2-3B-Instruct",
-            num_layers=28, num_kv_heads=8, head_dim=64,
+            num_layers=28,
+            num_kv_heads=8,
+            head_dim=64,
         )
         assert len(errors) == 1
         assert "head_dim" in errors[0]
@@ -122,12 +142,15 @@ class TestModelCompatibility:
         m = _make_manifest()
         errors = m.validate_against_model(
             model_id="wrong/model",
-            num_layers=99, num_kv_heads=99, head_dim=99,
+            num_layers=99,
+            num_kv_heads=99,
+            head_dim=99,
         )
         assert len(errors) == 4
 
 
 class TestBlockSizeCompatibility:
+
     def test_compatible(self):
         m = _make_manifest(block_size=16)
         assert m.validate_against_block_size(16) == []
@@ -143,7 +166,9 @@ class TestBlockSizeCompatibility:
 # Tests: JSON round-trip
 # ---------------------------------------------------------------------------
 
+
 class TestJsonSerialization:
+
     def test_round_trip(self):
         m = _make_manifest()
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
@@ -159,6 +184,8 @@ class TestJsonSerialization:
         assert m.checksum == m2.checksum
         assert m.labels == m2.labels
         assert m.training_steps == m2.training_steps
+        assert m.resource_kind == m2.resource_kind
+        assert m.source_format == m2.source_format
 
     def test_to_dict(self):
         m = _make_manifest()
@@ -179,12 +206,16 @@ class TestJsonSerialization:
 # Tests: from_cartridge
 # ---------------------------------------------------------------------------
 
+
 class TestFromCartridge:
+
     def test_builds_from_pt_file(self):
         with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
-            _make_trainable_cache_pt(
-                f.name, num_layers=4, num_kv_heads=2,
-                num_tokens=32, head_dim=8)
+            _make_trainable_cache_pt(f.name,
+                                     num_layers=4,
+                                     num_kv_heads=2,
+                                     num_tokens=32,
+                                     head_dim=8)
             m = CartridgeManifest.from_cartridge(
                 cartridge_path=f.name,
                 cartridge_id="test_from_pt",
@@ -209,22 +240,56 @@ class TestFromCartridge:
         assert m.file_size_bytes > 0
         assert m.labels == {"doc_id": "doc_001"}
         assert m.training_steps == 100
+        assert m.resource_kind == "cartridge"
+        assert m.source_format == "trainable_cache"
+
+    def test_builds_from_reasoncache_file(self):
+        with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
+            ckpt = {
+                "reasoncache": {
+                    "prefix_keys": [
+                        torch.randn(1, 2, 32, 8),
+                        torch.randn(1, 2, 32, 8),
+                    ],
+                    "prefix_values": [
+                        torch.randn(1, 2, 32, 8),
+                        torch.randn(1, 2, 32, 8),
+                    ],
+                }
+            }
+            torch.save(ckpt, f.name)
+            m = CartridgeManifest.from_cartridge(
+                cartridge_path=f.name,
+                cartridge_id="reasoncache_math",
+                model_id="test/model",
+                block_size=16,
+            )
+            Path(f.name).unlink()
+
+        assert m.resource_kind == "reasoncache"
+        assert m.source_format == "reasoncache"
+        assert m.num_layers == 2
+        assert m.num_tokens_raw == 32
+        assert m.has_frozen_prefix is False
 
 
 # ---------------------------------------------------------------------------
 # Tests: labels
 # ---------------------------------------------------------------------------
 
+
 class TestLabels:
+
     def test_empty_labels(self):
         m = _make_manifest(labels={})
         assert m.labels == {}
 
     def test_custom_labels(self):
-        m = _make_manifest(labels={
-            "patient_id": "patient_04",
-            "department": "oncology",
-            "urgency": "routine",
-        })
+        m = _make_manifest(
+            labels={
+                "patient_id": "patient_04",
+                "department": "oncology",
+                "urgency": "routine",
+            })
         assert m.labels["department"] == "oncology"
         assert len(m.labels) == 3

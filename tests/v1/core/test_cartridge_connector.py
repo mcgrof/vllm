@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for CartridgeConnector.
 
 Covers:
@@ -9,29 +10,33 @@ Covers:
    cache writer (CPU-only, no GPU required).
 4. Connector state: idempotent update_state_after_alloc.
 """
+
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
+from typing import Any
 
 import pytest
 import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.cartridge_connector import (
-    align_to_block_size,
-    inject_kv_into_paged_cache,
-    load_cartridge,
-)
-
+    CartridgeConnector, ReasonCacheConnector, align_to_block_size,
+    load_cartridge)
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
-def _make_trainable_cache(num_layers=4, num_kv_heads=2,
-                          num_trainable_tokens=30, num_frozen_tokens=2,
-                          head_dim=8, include_frozen=True):
+
+def _make_trainable_cache(
+    num_layers=4,
+    num_kv_heads=2,
+    num_trainable_tokens=30,
+    num_frozen_tokens=2,
+    head_dim=8,
+    include_frozen=True,
+):
     """Create a TrainableCache-style checkpoint dict."""
-    cache = {
+    cache: dict[str, Any] = {
         "trainable_keys": [],
         "trainable_values": [],
     }
@@ -69,7 +74,9 @@ def _save_and_load(checkpoint):
 # Tests: align_to_block_size
 # ---------------------------------------------------------------------------
 
+
 class TestAlignToBlockSize:
+
     def test_exact_multiple(self):
         assert align_to_block_size(32, 16) == 32
 
@@ -83,16 +90,44 @@ class TestAlignToBlockSize:
         assert align_to_block_size(0, 16) == 0
 
 
+class TestReasonCacheConnectorAlias:
+
+    def test_alias_subclasses_cartridge_connector(self):
+        assert issubclass(ReasonCacheConnector, CartridgeConnector)
+
+    def test_factory_registers_reasoncache_connector(self):
+        from vllm.distributed.kv_transfer.kv_connector.factory import (
+            KVConnectorFactory)
+
+        cfg: Any = type(
+            "Cfg",
+            (),
+            {
+                "kv_connector": "ReasonCacheConnector",
+                "kv_connector_module_path": None,
+            },
+        )()
+
+        assert (KVConnectorFactory.get_connector_class(cfg)
+                is ReasonCacheConnector)
+
+
 # ---------------------------------------------------------------------------
 # Tests: load_cartridge — TrainableCache format
 # ---------------------------------------------------------------------------
 
+
 class TestLoadCartridgeTrainableCache:
+
     def test_with_frozen_keys(self):
         ckpt = _make_trainable_cache(
-            num_layers=4, num_kv_heads=2,
-            num_trainable_tokens=30, num_frozen_tokens=2,
-            head_dim=8, include_frozen=True)
+            num_layers=4,
+            num_kv_heads=2,
+            num_trainable_tokens=30,
+            num_frozen_tokens=2,
+            head_dim=8,
+            include_frozen=True,
+        )
         result, path = _save_and_load(ckpt)
 
         # Total tokens = frozen + trainable = 2 + 30 = 32
@@ -105,9 +140,13 @@ class TestLoadCartridgeTrainableCache:
 
     def test_without_frozen_keys(self):
         ckpt = _make_trainable_cache(
-            num_layers=2, num_kv_heads=4,
-            num_trainable_tokens=16, num_frozen_tokens=0,
-            head_dim=16, include_frozen=False)
+            num_layers=2,
+            num_kv_heads=4,
+            num_trainable_tokens=16,
+            num_frozen_tokens=0,
+            head_dim=16,
+            include_frozen=False,
+        )
         result, path = _save_and_load(ckpt)
 
         assert result["num_tokens"] == 16
@@ -115,12 +154,30 @@ class TestLoadCartridgeTrainableCache:
         assert result["head_dim"] == 16
         Path(path).unlink()
 
+    def test_source_metadata(self):
+        ckpt = _make_trainable_cache(
+            num_layers=1,
+            num_kv_heads=2,
+            num_trainable_tokens=16,
+            include_frozen=False,
+        )
+        result, path = _save_and_load(ckpt)
+
+        assert result["source_format"] == "trainable_cache"
+        assert result["has_frozen_prefix"] is False
+        assert result["num_frozen_tokens"] == 0
+        Path(path).unlink()
+
     def test_frozen_tokens_come_first(self):
         """Verify frozen tokens occupy positions 0..T_frozen-1."""
         ckpt = _make_trainable_cache(
-            num_layers=1, num_kv_heads=1,
-            num_trainable_tokens=4, num_frozen_tokens=2,
-            head_dim=4, include_frozen=True)
+            num_layers=1,
+            num_kv_heads=1,
+            num_trainable_tokens=4,
+            num_frozen_tokens=2,
+            head_dim=4,
+            include_frozen=True,
+        )
 
         k_frz = ckpt["frozen_keys"][0].data
         k_trn = ckpt["trainable_keys"][0].data
@@ -137,6 +194,72 @@ class TestLoadCartridgeTrainableCache:
         assert torch.allclose(k_loaded[2:], k_trn_expected)
         Path(path).unlink()
 
+
+class TestLoadReasonCachePrefix:
+    """ReasonCACHE serves the same primitive as cartridges: a learned
+    per-layer KV prefix injected as externally computed cache."""
+
+    def test_reasoncache_prefix_keys_values(self):
+        ckpt: dict[str, Any] = {
+            "reasoncache": {
+                "prefix_keys": [],
+                "prefix_values": [],
+            }
+        }
+        for _ in range(3):
+            ckpt["reasoncache"]["prefix_keys"].append(torch.randn(1, 2, 24, 8))
+            ckpt["reasoncache"]["prefix_values"].append(
+                torch.randn(1, 2, 24, 8))
+
+        result, path = _save_and_load(ckpt)
+
+        assert result["source_format"] == "reasoncache"
+        assert result["num_layers"] == 3
+        assert result["num_tokens"] == 24
+        assert result["num_kv_heads"] == 2
+        assert result["head_dim"] == 8
+        assert result["has_frozen_prefix"] is False
+        Path(path).unlink()
+
+    def test_reasoncache_tokens_heads_layout(self):
+        ckpt: dict[str, Any] = {
+            "reasoncache_keys": [],
+            "reasoncache_values": [],
+            "kv_layout": "tokens_heads_dim",
+        }
+        expected_k = torch.randn(1, 24, 2, 8)
+        expected_v = torch.randn(1, 24, 2, 8)
+        ckpt["reasoncache_keys"].append(expected_k)
+        ckpt["reasoncache_values"].append(expected_v)
+
+        result, path = _save_and_load(ckpt)
+
+        k, v = result["kv_data"][0]
+        assert k.shape == (24, 2, 8)
+        assert v.shape == (24, 2, 8)
+        assert torch.allclose(k, expected_k.squeeze(0))
+        assert result["source_format"] == "reasoncache"
+        assert result["kv_layout"] == "tokens_heads_dim"
+        Path(path).unlink()
+
+    def test_hf_style_past_key_values(self):
+        past_key_values = []
+        for _ in range(2):
+            k = torch.randn(1, 4, 16, 8)
+            v = torch.randn(1, 4, 16, 8)
+            past_key_values.append((k, v))
+        ckpt = {"past_key_values": past_key_values}
+
+        result, path = _save_and_load(ckpt)
+
+        assert result["source_format"] == "past_key_values"
+        assert result["resource_kind"] == "kv_prefix"
+        assert result["num_layers"] == 2
+        assert result["num_tokens"] == 16
+        assert result["num_kv_heads"] == 4
+        assert result["head_dim"] == 8
+        Path(path).unlink()
+
     def test_frozen_layer_count_mismatch_raises(self):
         ckpt = _make_trainable_cache(num_layers=4, include_frozen=True)
         ckpt["frozen_keys"] = ckpt["frozen_keys"][:3]
@@ -150,11 +273,14 @@ class TestLoadCartridgeTrainableCache:
     def test_cross_layer_shape_mismatch_raises(self):
         """Verify that inconsistent shapes across layers are caught."""
         ckpt = _make_trainable_cache(
-            num_layers=2, num_kv_heads=2,
-            num_trainable_tokens=16, include_frozen=False)
+            num_layers=2,
+            num_kv_heads=2,
+            num_trainable_tokens=16,
+            include_frozen=False,
+        )
         # Corrupt layer 1 to have different token count
-        ckpt["trainable_keys"][1] = torch.nn.Parameter(
-            torch.randn(1, 2, 8, 8))  # 8 tokens instead of 16
+        ckpt["trainable_keys"][1] = torch.nn.Parameter(torch.randn(
+            1, 2, 8, 8))  # 8 tokens instead of 16
         ckpt["trainable_values"][1] = torch.nn.Parameter(
             torch.randn(1, 2, 8, 8))
 
@@ -169,7 +295,9 @@ class TestLoadCartridgeTrainableCache:
 # Tests: load_cartridge — error handling
 # ---------------------------------------------------------------------------
 
+
 class TestLoadCartridgeErrors:
+
     def test_unrecognized_format_raises(self):
         with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
             torch.save("not a cartridge", f.name)
@@ -189,6 +317,7 @@ class TestLoadCartridgeErrors:
 # Tests: inject_kv_into_paged_cache — slot mapping correctness
 # ---------------------------------------------------------------------------
 
+
 def _fake_inject_kv(src_key, src_value, kv_cache_layer, slot_mapping):
     """CPU-only fake for inject_kv_into_paged_cache.
 
@@ -206,13 +335,15 @@ def _fake_inject_kv(src_key, src_value, kv_cache_layer, slot_mapping):
 
     # Flatten blocks: (num_blocks, block_size, H, D) -> (num_blocks*bs, H, D)
     flat_k = key_cache.reshape(-1, key_cache.shape[-2], key_cache.shape[-1])
-    flat_v = value_cache.reshape(-1, value_cache.shape[-2], value_cache.shape[-1])
+    flat_v = value_cache.reshape(-1, value_cache.shape[-2],
+                                 value_cache.shape[-1])
 
     flat_k[slot_mapping] = src_key
     flat_v[slot_mapping] = src_value
 
 
 class TestInjectKVSlotMapping:
+
     def test_tokens_land_in_correct_slots(self):
         """Verify that cartridge tokens are written to the expected
         physical slots in the paged cache."""
@@ -226,15 +357,14 @@ class TestInjectKVSlotMapping:
         src_value = torch.randn(num_tokens, num_kv_heads, head_dim)
 
         # Paged cache: (2, num_blocks, block_size, num_kv_heads, head_dim)
-        kv_cache = torch.zeros(2, num_blocks, block_size, num_kv_heads, head_dim)
+        kv_cache = torch.zeros(2, num_blocks, block_size, num_kv_heads,
+                               head_dim)
 
         # Slot mapping: blocks 0 and 1, contiguous
         block_ids = torch.tensor([0, 1])
         block_offsets = torch.arange(0, block_size)
-        slot_mapping = (
-            block_offsets.reshape(1, block_size)
-            + block_ids.reshape(-1, 1) * block_size
-        ).flatten()
+        slot_mapping = (block_offsets.reshape(1, block_size) +
+                        block_ids.reshape(-1, 1) * block_size).flatten()
 
         _fake_inject_kv(src_key, src_value, kv_cache, slot_mapping)
 
@@ -258,15 +388,14 @@ class TestInjectKVSlotMapping:
         src_key = torch.randn(num_tokens, num_kv_heads, head_dim)
         src_value = torch.randn(num_tokens, num_kv_heads, head_dim)
 
-        kv_cache = torch.zeros(2, num_blocks, block_size, num_kv_heads, head_dim)
+        kv_cache = torch.zeros(2, num_blocks, block_size, num_kv_heads,
+                               head_dim)
 
         # Non-contiguous: blocks 2 and 5
         block_ids = torch.tensor([2, 5])
         block_offsets = torch.arange(0, block_size)
-        slot_mapping = (
-            block_offsets.reshape(1, block_size)
-            + block_ids.reshape(-1, 1) * block_size
-        ).flatten()
+        slot_mapping = (block_offsets.reshape(1, block_size) +
+                        block_ids.reshape(-1, 1) * block_size).flatten()
 
         _fake_inject_kv(src_key, src_value, kv_cache, slot_mapping)
 
@@ -290,7 +419,8 @@ class TestInjectKVSlotMapping:
         src_value = torch.randn(num_tokens, num_kv_heads, head_dim)
 
         # Alternate layout: (num_blocks, 2, block_size, H, D)
-        kv_cache = torch.zeros(num_blocks, 2, block_size, num_kv_heads, head_dim)
+        kv_cache = torch.zeros(num_blocks, 2, block_size, num_kv_heads,
+                               head_dim)
 
         slot_mapping = torch.arange(0, block_size)
 
