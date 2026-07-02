@@ -36,7 +36,7 @@ from vllm.config import (
     set_current_vllm_config,
     update_config,
 )
-from vllm.config.cache import CacheConfig
+from vllm.config.cache import CacheConfig, cache_dtype_k
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
@@ -119,6 +119,7 @@ from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import (
     PIN_MEMORY,
     async_tensor_h2d,
+    cache_dtype_is_fp8,
     get_dtype_size,
     is_quantized_kv_cache,
     kv_cache_dtype_str_to_dtype,
@@ -462,9 +463,13 @@ class GPUModelRunner(
         if parallel_config.data_parallel_size > 1 and self.model_config.is_moe:
             self.check_ep_fault = get_ep_all2all_manager().support_fault_tolerance
 
-        self.kv_cache_dtype = kv_cache_dtype_str_to_dtype(
-            cache_config.cache_dtype, self.model_config
-        )
+        # Asymmetric K/V: resolve to K dtype for the model runner.
+        # The full (k_dtype, v_dtype) pair stays in cache_config for
+        # consumers that need both halves (e.g. the FlashInfer
+        # metadata builder resolves the V dtype from it).
+        _cache_spec = cache_config.cache_dtype
+        _k_str = cache_dtype_k(_cache_spec)
+        self.kv_cache_dtype = kv_cache_dtype_str_to_dtype(_k_str, self.model_config)
 
         self.is_pooling_model = model_config.runner_type == "pooling"
         self.enable_prompt_embeds = model_config.enable_prompt_embeds
@@ -961,7 +966,14 @@ class GPUModelRunner(
           If these are left at 0.0 (default after wake_up), all KV cache values
           become effectively zero, causing gibberish output.
         """
-        if not is_quantized_kv_cache(self.cache_config.cache_dtype):
+        cache_dtype = self.cache_config.cache_dtype
+        # Asymmetric K/V passes a (k, v) tuple; the fp8 V still needs its
+        # scales reset. Non-tuple specs use the general quantization check
+        # (which is not tuple-aware and would raise on a pair).
+        if isinstance(cache_dtype, tuple):
+            if not cache_dtype_is_fp8(cache_dtype):
+                return
+        elif not is_quantized_kv_cache(cache_dtype):
             return
 
         kv_caches = getattr(self, "kv_caches", [])
