@@ -9,6 +9,7 @@ import torch.nn as nn
 import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, get_current_vllm_config
+from vllm.config.cache import cache_dtype_k
 from vllm.config.vllm import VllmConfig
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
@@ -288,8 +289,11 @@ class Attention(nn.Module, AttentionLayerBase):
                 sliding_window,
             )
 
+        # Asymmetric K/V: extract K dtype for the torch dtype and
+        # keep the full spec for downstream backends.
+        _k_str = cache_dtype_k(kv_cache_dtype)
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
-            kv_cache_dtype, vllm_config.model_config
+            _k_str, vllm_config.model_config
         )
         self.kv_cache_dtype = kv_cache_dtype
         self.calculate_kv_scales = calculate_kv_scales
@@ -431,12 +435,12 @@ class Attention(nn.Module, AttentionLayerBase):
 
         # for attn backends supporting query quantization
         self.query_quant = None
+        # Asymmetric K/V: kv_cache_dtype may be a tuple; apply the dtype
+        # checks to the K dtype string extracted above.
         if (
             self.impl.supports_quant_query_input
-            and (
-                self.kv_cache_dtype.startswith("fp8") or self.kv_cache_dtype == "nvfp4"
-            )
-            and not self.kv_cache_dtype.endswith("per_token_head")
+            and (_k_str.startswith("fp8") or _k_str == "nvfp4")
+            and not _k_str.endswith("per_token_head")
         ):
             is_per_head = (
                 hasattr(self, "q_scale") and self.q_scale.numel() == self.num_kv_heads
@@ -481,7 +485,7 @@ class Attention(nn.Module, AttentionLayerBase):
             # which reduces overheads during decoding.
             # Otherwise queries are quantized using custom ops
             # which causes decoding overheads
-            assert self.kv_cache_dtype in {"fp8", "fp8_e4m3", "nvfp4"}
+            assert cache_dtype_k(self.kv_cache_dtype) in {"fp8", "fp8_e4m3", "nvfp4"}
 
             # check if query quantization is supported
             if self.impl.supports_quant_query_input:
@@ -592,7 +596,12 @@ class Attention(nn.Module, AttentionLayerBase):
             return None
         # Should not be called for enc-dec attention.
         assert self.attn_type == AttentionType.DECODER
-        quant_mode = get_kv_quant_mode(self.kv_cache_dtype)
+        # Asymmetric K/V: self.kv_cache_dtype may be a (k, v) tuple. The K
+        # half drives the dtype-string decisions here (quant mode,
+        # turboquant); the V half is injected as v_dtype onto the returned
+        # spec by the V2 runner (vllm/v1/worker/gpu/attn_utils.py).
+        k_cache_dtype = cache_dtype_k(self.kv_cache_dtype)
+        quant_mode = get_kv_quant_mode(k_cache_dtype)
         if self.sliding_window is not None:
             assert not vllm_config.model_config.use_mla, (
                 "MLA is not supported for slidingwindow"
@@ -606,15 +615,13 @@ class Attention(nn.Module, AttentionLayerBase):
                 kv_quant_mode=quant_mode,
                 sliding_window=self.sliding_window,
             )
-        elif self.kv_cache_dtype.startswith("turboquant_"):
+        elif k_cache_dtype.startswith("turboquant_"):
             from vllm.model_executor.layers.quantization.turboquant.config import (
                 TurboQuantConfig,
             )
             from vllm.v1.kv_cache_interface import TQFullAttentionSpec
 
-            tq_config = TurboQuantConfig.from_cache_dtype(
-                self.kv_cache_dtype, self.head_size
-            )
+            tq_config = TurboQuantConfig.from_cache_dtype(k_cache_dtype, self.head_size)
             return TQFullAttentionSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
