@@ -166,6 +166,7 @@ class AttentionSpec(KVCacheSpec):
     head_size: int
     dtype: torch.dtype
     kv_quant_mode: KVQuantMode = KVQuantMode.NONE
+    v_dtype: torch.dtype | None = None  # asymmetric K/V: V dtype if different from K
     page_size_padded: int | None = None
     indexes_kv_by_block_stride: bool = False
 
@@ -186,6 +187,22 @@ class AttentionSpec(KVCacheSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
+        # Asymmetric K/V: when v_dtype differs from dtype (K dtype),
+        # the page holds K bytes + V bytes instead of 2 × same bytes.
+        if self.v_dtype is not None and self.v_dtype != self.dtype:
+            k_bytes = (
+                self.block_size
+                * self.num_kv_heads
+                * self.head_size
+                * get_dtype_size(self.dtype)
+            )
+            v_bytes = (
+                self.block_size
+                * self.num_kv_heads
+                * self.head_size
+                * get_dtype_size(self.v_dtype)
+            )
+            return k_bytes + v_bytes
         if self.kv_quant_mode.is_nvfp4:
             # Packed layout: fp4 data + fp8 block scales per head.
             head_dim = nvfp4_kv_cache_full_dim(self.head_size)
@@ -284,6 +301,7 @@ class FullAttentionSpec(AttentionSpec):
             head_size_v=specs[0].head_size_v,
             dtype=specs[0].dtype,
             kv_quant_mode=specs[0].kv_quant_mode,
+            v_dtype=specs[0].v_dtype,
             page_size_padded=specs[0].page_size_padded,
             indexes_kv_by_block_stride=specs[0].indexes_kv_by_block_stride,
             sliding_window=cls.merge_window_sizes(sliding_window),
@@ -308,6 +326,24 @@ class FullAttentionSpec(AttentionSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
+        # Asymmetric K/V: when v_dtype differs from dtype (K dtype),
+        # bill K bytes and V bytes separately. Without this override
+        # the symmetric formula below silently under-allocates and the
+        # cache reshape asserts on the per-page byte budget.
+        if self.v_dtype is not None and self.v_dtype != self.dtype:
+            k_bytes = (
+                self.block_size
+                * self.num_kv_heads
+                * self.head_size
+                * get_dtype_size(self.dtype)
+            )
+            v_bytes = (
+                self.block_size
+                * self.num_kv_heads
+                * self.head_size_v
+                * get_dtype_size(self.v_dtype)
+            )
+            return k_bytes + v_bytes
         if self.kv_quant_mode.is_nvfp4:
             # Packed layout per head: fp4 data + fp8 block scales.
             # fp4 data: head_size//2 bytes (2 fp4 values per byte)
@@ -422,6 +458,7 @@ class MLAAttentionSpec(FullAttentionSpec):
             head_size=specs[0].head_size,
             dtype=specs[0].dtype,
             kv_quant_mode=specs[0].kv_quant_mode,
+            v_dtype=specs[0].v_dtype,
             page_size_padded=specs[0].page_size_padded,
             indexes_kv_by_block_stride=block_stride_set.pop(),
             cache_dtype_str=cache_dtype_str_set.pop(),
@@ -467,6 +504,11 @@ class RSWASpec(FullAttentionSpec):
             head_size=base.head_size,
             head_size_v=base.head_size_v,
             dtype=base.dtype,
+            # Asymmetric K/V: carry the merged v_dtype through, matching the
+            # sibling merges (FullAttentionSpec / MLAAttentionSpec /
+            # SinkFullAttentionSpec). Dropping it here would reset the merged
+            # R-SWA group spec to symmetric sizing and under-allocate.
+            v_dtype=base.v_dtype,
             kv_quant_mode=base.kv_quant_mode,
             page_size_padded=base.page_size_padded,
             indexes_kv_by_block_stride=base.indexes_kv_by_block_stride,
@@ -525,6 +567,26 @@ class SlidingWindowSpec(AttentionSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
+        # Asymmetric K/V: when v_dtype differs from dtype (K dtype), bill K
+        # bytes and V bytes separately (mirrors
+        # ``FullAttentionSpec.real_page_size_bytes``). Without this override
+        # the symmetric formula below bills V at the K dtype, so the page is
+        # over-sized relative to the asymmetric reshape's per-page byte
+        # budget and the cache reshape asserts.
+        if self.v_dtype is not None and self.v_dtype != self.dtype:
+            k_bytes = (
+                self.block_size
+                * self.num_kv_heads
+                * self.head_size
+                * get_dtype_size(self.dtype)
+            )
+            v_bytes = (
+                self.block_size
+                * self.num_kv_heads
+                * self.head_size_v
+                * get_dtype_size(self.v_dtype)
+            )
+            return k_bytes + v_bytes
         # Mirror ``FullAttentionSpec.real_page_size_bytes`` for NVFP4 KV cache.
         if self.kv_quant_mode.is_nvfp4:
             last_dim = nvfp4_kv_cache_full_dim(
@@ -759,6 +821,7 @@ class SinkFullAttentionSpec(FullAttentionSpec):
             sink_len=specs[0].sink_len,
             dtype=specs[0].dtype,
             kv_quant_mode=specs[0].kv_quant_mode,
+            v_dtype=specs[0].v_dtype,
             page_size_padded=specs[0].page_size_padded,
             indexes_kv_by_block_stride=specs[0].indexes_kv_by_block_stride,
             sliding_window=cls.merge_window_sizes(sliding_window),
