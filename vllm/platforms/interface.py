@@ -657,12 +657,23 @@ class Platform:
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
 
-        if cache_config.cache_dtype == "auto":
+        # Asymmetric K/V: cache_dtype may be a (k_dtype, v_dtype) tuple.
+        # The dtype-string lookups below are keyed on single dtype
+        # strings, so reduce to the K dtype for this hybrid block-size
+        # alignment. The full-attention page estimate errs high for an
+        # FP8 V half (2 x K bytes vs K + V bytes), which is safe for
+        # alignment purposes; the exact asymmetric page size is computed
+        # later by AttentionSpec.real_page_size_bytes.
+        ct = cache_config.cache_dtype
+        if isinstance(ct, tuple):
+            ct = ct[0]
+
+        if ct == "auto":
             kv_cache_dtype = model_config.dtype
         else:
-            kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
+            kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[ct]
 
-        kv_quant_mode = get_kv_quant_mode(cache_config.cache_dtype)
+        kv_quant_mode = get_kv_quant_mode(ct)
 
         # Compute attention page size for 1 token
         if model_config.use_mla:
@@ -673,7 +684,7 @@ class Platform:
                 dtype=kv_cache_dtype,
                 kv_quant_mode=kv_quant_mode,
             ).page_size_bytes
-        elif cache_config.cache_dtype.startswith("turboquant_"):
+        elif ct.startswith("turboquant_"):
             # TQ has a packed K|V layout; the standard FullAttentionSpec
             # formula over-sizes it and trips unify_kv_cache_spec_page_size
             # when all attention layers are TQ. With mixed skip+TQ the skip
@@ -684,9 +695,7 @@ class Platform:
             )
             from vllm.v1.kv_cache_interface import TQFullAttentionSpec
 
-            tq_cfg = TurboQuantConfig.from_cache_dtype(
-                cache_config.cache_dtype, model_config.get_head_size()
-            )
+            tq_cfg = TurboQuantConfig.from_cache_dtype(ct, model_config.get_head_size())
             tq_page = TQFullAttentionSpec(
                 block_size=1,
                 num_kv_heads=model_config.get_num_kv_heads(parallel_config),
