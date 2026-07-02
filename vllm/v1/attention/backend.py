@@ -19,7 +19,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-    from vllm.config.cache import CacheDType
+    from vllm.config.cache import CacheDType, CacheDTypeSpec
     from vllm.model_executor.layers.linear import ColumnParallelLinear
     from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
     from vllm.platforms.interface import DeviceCapability
@@ -164,9 +164,12 @@ class AttentionBackend(ABC):
         return dtype in cls.supported_dtypes
 
     @classmethod
-    def supports_kv_cache_dtype(cls, kv_cache_dtype: "CacheDType | None") -> bool:
+    def supports_kv_cache_dtype(cls, kv_cache_dtype: "CacheDTypeSpec | None") -> bool:
         if kv_cache_dtype is None:
             return True
+        # Asymmetric K/V: check both halves of the tuple
+        if isinstance(kv_cache_dtype, tuple):
+            return all(cls.supports_kv_cache_dtype(dt) for dt in kv_cache_dtype)
         return (not cls.supported_kv_cache_dtypes) or (
             kv_cache_dtype in cls.supported_kv_cache_dtypes
         )
