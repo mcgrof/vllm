@@ -291,7 +291,7 @@ class BatchDCPPrefillWrapper:
         self,
         layer: torch.nn.Module,
         prefill_query: torch.Tensor,
-        kv_cache_permute: torch.Tensor,
+        paged_kv_cache: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
         out: torch.Tensor,
@@ -301,7 +301,7 @@ class BatchDCPPrefillWrapper:
         )
         output_context_tmp, lse_context_tmp = self._context.run(
             prefill_query_across_dcp,
-            kv_cache_permute,
+            paged_kv_cache,
             k_scale=layer._k_scale_float,
             v_scale=layer._v_scale_float,
             return_lse=True,
@@ -1510,6 +1510,97 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         return False
 
 
+# ---------------------------------------------------------------------------
+# Asymmetric K/V helpers
+#
+# The asymmetric KV cache allocator (vllm/v1/worker/gpu/attn_utils.py) returns
+# `kv_caches[layer_name] = (k_cache, v_cache)` when the layer's spec asks for
+# different K and V dtypes (e.g., BF16 K + FP8 V).  bind_kv_cache passes that
+# tuple verbatim to the per-layer attention forward context.
+#
+# FlashInfer's `BatchPrefillWithPagedKVCacheWrapper.run` and
+# `BatchDecodeWithPagedKVCacheWrapper.run` already accept either a single 5-D
+# paged tensor or a 2-tuple `(k_cache, v_cache)` of 4-D paged tensors.  The
+# only missing piece in vLLM is the read-side prep: today the forward path
+# does `kv_cache.permute(*stride_order)`, which raises AttributeError on a
+# tuple.  These helpers normalize that prep, dispatch on tuple vs tensor, and
+# derive the correct 4-D stride order from the canonical 5-D one so layout
+# changes (NHD/HND) stay consistent across both paths.
+
+
+def _is_asym_paged_kv_cache(kv_cache: object) -> bool:
+    """True iff `kv_cache` is the (k_cache, v_cache) tuple produced by the
+    asymmetric KV cache allocator."""
+    return (
+        isinstance(kv_cache, tuple)
+        and len(kv_cache) == 2
+        and isinstance(kv_cache[0], torch.Tensor)
+        and isinstance(kv_cache[1], torch.Tensor)
+    )
+
+
+def _derive_4d_stride_order_from_5d(
+    stride_order_5d: tuple[int, ...] | list[int],
+) -> tuple[int, ...]:
+    """Convert the 5-D KV cache stride order to its 4-D side-tensor form.
+
+    The 5-D cache has dims `[block, kv_side, block_size, kv_head, head_dim]`.
+    The asymmetric tuple side tensors drop the `kv_side` dim and become
+    `[block, block_size, kv_head, head_dim]`.  Drop original dim 1 from the
+    permutation and renumber dims > 1 down by one so each remaining dim
+    refers to its position in the 4-D tensor.
+
+    NHD: (0, 1, 2, 3, 4)  ->  (0, 1, 2, 3)   (identity 4-D)
+    HND: (0, 1, 3, 2, 4)  ->  (0, 2, 1, 3)   (swap block_size, kv_heads)
+    """
+    assert len(stride_order_5d) == 5, (
+        f"expected 5-D stride order, got {stride_order_5d}"
+    )
+    return tuple(dim - 1 if dim > 1 else dim for dim in stride_order_5d if dim != 1)
+
+
+def _prepare_flashinfer_paged_kv_cache(
+    kv_cache: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Apply the FlashInfer stride-order permute to the read-side cache.
+
+    For symmetric callers (legacy 5-D `kv_cache`), returns the standard
+    permuted tensor.  For asymmetric callers (tuple), permutes each side
+    by the derived 4-D stride order and returns a permuted tuple — which
+    FlashInfer's prefill/decode `run()` accepts as a paged_kv_cache.
+    """
+    stride_order_5d = FlashInferBackend.get_kv_cache_stride_order()
+
+    if _is_asym_paged_kv_cache(kv_cache):
+        k_cache, v_cache = kv_cache
+        assert k_cache.ndim == 4, (
+            f"asym K cache must be 4-D NHD/HND, got shape {tuple(k_cache.shape)}"
+        )
+        assert v_cache.ndim == 4, (
+            f"asym V cache must be 4-D NHD/HND, got shape {tuple(v_cache.shape)}"
+        )
+        assert k_cache.shape == v_cache.shape, (
+            f"asym K/V shapes must match: K={tuple(k_cache.shape)}, "
+            f"V={tuple(v_cache.shape)}"
+        )
+        stride_order_4d = _derive_4d_stride_order_from_5d(stride_order_5d)
+        return (
+            k_cache.permute(*stride_order_4d),
+            v_cache.permute(*stride_order_4d),
+        )
+
+    assert isinstance(kv_cache, torch.Tensor), (
+        f"symmetric kv_cache must be a Tensor, got {type(kv_cache)}"
+    )
+    assert kv_cache.ndim == 5, (
+        f"symmetric kv_cache must be 5-D, got shape {tuple(kv_cache.shape)}"
+    )
+    return kv_cache.permute(*stride_order_5d)
+
+
+# ---------------------------------------------------------------------------
+
+
 class FlashInferImpl(AttentionImpl):
     can_return_lse_for_decode: bool = True
 
@@ -1665,7 +1756,7 @@ class FlashInferImpl(AttentionImpl):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        kv_cache: torch.Tensor,
+        kv_cache: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         attn_metadata: FlashInferMetadata,
         output: torch.Tensor,
         output_scale: torch.Tensor | None = None,
@@ -1677,9 +1768,16 @@ class FlashInferImpl(AttentionImpl):
             query: shape = [num_tokens, num_heads, head_size]
             key: shape = [num_tokens, num_kv_heads, head_size]
             value: shape = [num_tokens, num_kv_heads, head_size]
-            kv_cache: KV cache tensor with different possible shapes:
-                - NHD: [num_blocks, 2, block_size, num_kv_heads, head_size]
-                - HND: [num_blocks, 2, num_kv_heads, block_size, head_size]
+            kv_cache: KV cache.  Two supported representations:
+                - symmetric (legacy): single 5-D tensor with shapes
+                    NHD: [num_blocks, 2, block_size, num_kv_heads, head_size]
+                    HND: [num_blocks, 2, num_kv_heads, block_size, head_size]
+                - asymmetric K/V: tuple `(k_cache, v_cache)` of two 4-D
+                    tensors at potentially different dtypes (e.g., BF16 K +
+                    FP8 V).  Each side is `[num_blocks, block_size,
+                    num_kv_heads, head_size]` (NHD) or `[num_blocks,
+                    num_kv_heads, block_size, head_size]` (HND).  This is
+                    the form produced by the asymmetric KV cache allocator.
             attn_metadata: Metadata for attention.
         Returns:
             shape = [num_tokens, num_heads * head_size]
@@ -1762,9 +1860,16 @@ class FlashInferImpl(AttentionImpl):
 
         num_actual_tokens = attn_metadata.num_actual_tokens
 
+        # Asymmetric K/V: the allocator hands forward() a (k_cache, v_cache)
+        # tuple instead of a single packed tensor. Detect it up front so the
+        # symmetric-only uint8/nvfp4 view logic below is skipped (a tuple has
+        # no `.dtype`) and the asym read-prep branch is taken instead. This
+        # is a cheap isinstance check; safe on the eager-mode hot path.
+        is_asym = _is_asym_paged_kv_cache(kv_cache)
+
         # FlashInfer treats uint8 KV cache as NVFP4. vLLM stores FP8 KV cache
         # as uint8 bytes, so pass FP8 caches with their logical dtype.
-        if not self.is_kvcache_nvfp4 and kv_cache.dtype == torch.uint8:
+        if not is_asym and not self.is_kvcache_nvfp4 and kv_cache.dtype == torch.uint8:
             fp8_view_dtype = None
             if self.kv_cache_dtype in ("fp8", "fp8_e4m3", torch.float8_e4m3fn):
                 fp8_view_dtype = torch.float8_e4m3fn
@@ -1780,6 +1885,16 @@ class FlashInferImpl(AttentionImpl):
         output_padded = output
         output = output[:num_actual_tokens]
 
+        # Asymmetric K/V: fail closed on paths we have not yet wired.
+        # The asym tuple cache is currently supported only on the
+        # standard non-DCP non-TRTLLM non-cascade prefill+decode path.
+        # `is_asym` was computed above, before the symmetric uint8 view.
+        if is_asym and attn_metadata.use_cascade:
+            raise NotImplementedError(
+                "Asymmetric tuple KV cache is not yet supported in "
+                "FlashInfer cascade attention."
+            )
+
         if attn_metadata.use_cascade:
             # Cascade attention (rare case).
             assert attn_metadata.cascade_wrapper is not None
@@ -1791,34 +1906,60 @@ class FlashInferImpl(AttentionImpl):
         num_decode_tokens = attn_metadata.num_decode_tokens
         num_prefill_tokens = attn_metadata.num_prefill_tokens
 
-        stride_order = FlashInferBackend.get_kv_cache_stride_order()
-        kv_cache_permute = kv_cache.permute(*stride_order)  # HND and contiguous
-        # Fix degenerate strides on any size-1 dimension (e.g. num_kv_heads=1
-        # with TP=8).  PyTorch permits non-canonical strides on size-1 dims;
-        # CUDA TMA requires ≥16-byte alignment on all non-outermost strides.
-        # canonicalize_singleton_dim_strides patches metadata via as_strided —
-        # zero-copy.  See vllm.utils.torch_utils.
-        fixed = canonicalize_singleton_dim_strides(kv_cache_permute)
-        if fixed is not kv_cache_permute:
-            logger.debug(
-                "Canonicalized degenerate KV cache strides (FlashInfer): "
-                "shape=%s, strides before=%s, strides after=%s",
-                kv_cache_permute.shape,
-                kv_cache_permute.stride(),
-                fixed.stride(),
-            )
-        kv_cache_permute = fixed
-
-        # For NVFP4, the kv_cache last dim is full_dim (data + scale packed).
-        # Split into correctly-strided data and scale views.
+        # `paged_kv_cache` is the read-side object handed to FlashInfer's
+        # prefill_wrapper.run / decode_wrapper.run.  For asym callers it's a
+        # `(k_cache, v_cache)` permuted tuple — which the FlashInfer wrapper
+        # accepts directly.  For symmetric callers it's the legacy single
+        # permuted 5-D tensor, with degenerate-stride canonicalization and
+        # nvfp4 split views below.
         nvfp4_kv_data = None
         nvfp4_kv_block_scales = None
-        if self.is_kvcache_nvfp4:
-            nvfp4_kv_data, nvfp4_kv_block_scales = nvfp4_kv_cache_split_views(
-                kv_cache_permute
-            )
+        if is_asym:
+            paged_kv_cache = _prepare_flashinfer_paged_kv_cache(kv_cache)
+        else:
+            stride_order = FlashInferBackend.get_kv_cache_stride_order()
+            paged_kv_cache = kv_cache.permute(*stride_order)  # HND and contiguous
+            # Fix degenerate strides on any size-1 dimension (e.g. num_kv_heads=1
+            # with TP=8).  PyTorch permits non-canonical strides on size-1 dims;
+            # CUDA TMA requires ≥16-byte alignment on all non-outermost strides.
+            # canonicalize_singleton_dim_strides patches metadata via as_strided —
+            # zero-copy.  See vllm.utils.torch_utils.
+            fixed = canonicalize_singleton_dim_strides(paged_kv_cache)
+            if fixed is not paged_kv_cache:
+                logger.debug(
+                    "Canonicalized degenerate KV cache strides (FlashInfer): "
+                    "shape=%s, strides before=%s, strides after=%s",
+                    paged_kv_cache.shape,
+                    paged_kv_cache.stride(),
+                    fixed.stride(),
+                )
+            paged_kv_cache = fixed
+
+            # For NVFP4, the kv_cache last dim is full_dim (data + scale packed).
+            # Split into correctly-strided data and scale views.
+            if self.is_kvcache_nvfp4:
+                nvfp4_kv_data, nvfp4_kv_block_scales = nvfp4_kv_cache_split_views(
+                    paged_kv_cache
+                )
 
         use_dcp = self.dcp_world_size > 1
+
+        if is_asym:
+            if use_dcp:
+                raise NotImplementedError(
+                    "Asymmetric tuple KV cache is not yet supported in "
+                    "the FlashInfer DCP paths."
+                )
+            if prefill_use_trtllm:
+                raise NotImplementedError(
+                    "Asymmetric tuple KV cache is not yet supported in "
+                    "the TRTLLM prefill path."
+                )
+            if decode_with_flashinfer_trtllm_api:
+                raise NotImplementedError(
+                    "Asymmetric tuple KV cache is not yet supported in "
+                    "the TRTLLM decode path."
+                )
 
         # Regular attention (common case).
         # Decodes are at the front and prefills are at the back.
@@ -1855,7 +1996,7 @@ class FlashInferImpl(AttentionImpl):
                     prefill_wrapper.run(
                         layer,
                         prefill_query,
-                        kv_cache_permute,
+                        paged_kv_cache,
                         key[num_decode_tokens:],
                         value[num_decode_tokens:],
                         out=output[num_decode_tokens:],
@@ -1872,7 +2013,7 @@ class FlashInferImpl(AttentionImpl):
                     assert prefill_wrapper._causal == attn_metadata.causal
 
                     if self.is_kvcache_nvfp4:
-                        kv_cache_permute = nvfp4_kv_data
+                        paged_kv_cache = nvfp4_kv_data
                     kv_cache_sf = (
                         nvfp4_kv_block_scales if self.is_kvcache_nvfp4 else None
                     )
@@ -1890,7 +2031,7 @@ class FlashInferImpl(AttentionImpl):
 
                     prefill_wrapper.run(
                         prefill_query,
-                        kv_cache_permute,
+                        paged_kv_cache,
                         q_scale=layer._q_scale_float,
                         k_scale=layer._k_scale_float,
                         v_scale=layer._v_scale_float,
@@ -1959,26 +2100,29 @@ class FlashInferImpl(AttentionImpl):
                     # with fp8 kv cache, we can construct a mock block
                     # and mock kv cache with BF16 KV involved in the prefill
                     #
-                    kv_cache_permute = canonicalize_singleton_dim_strides(
-                        kv_cache_permute
-                    )
-                    kv_strides = kv_cache_permute.stride()
+                    # The inner (block_size, head_size) dims must be
+                    # contiguous; outer dims may have non-canonical strides
+                    # (e.g. cross-layer unified allocation).
+                    # Degenerate strides on outer dims break TMA descriptors
+                    # (see flashinfer-ai/flashinfer#2232).
+                    paged_kv_cache = canonicalize_singleton_dim_strides(paged_kv_cache)
+                    kv_strides = paged_kv_cache.stride()
                     assert (
                         kv_strides[-1] == 1
-                        and kv_strides[-2] == kv_cache_permute.shape[-1]
+                        and kv_strides[-2] == paged_kv_cache.shape[-1]
                     ), (
                         "KV cache inner dims (block_size, head_size) must be "
                         f"contiguous, got strides {kv_strides}"
                     )
                     mock_kv_cache, mock_block_table = trtllm_prefill_attn_kvfp8_dequant(
-                        kv_cache_permute,
+                        paged_kv_cache,
                         block_tables_prefill,
                         layer._k_scale,
                         layer._v_scale,
                         attn_metadata.q_data_type_prefill,
                     )
                 else:
-                    mock_kv_cache = kv_cache_permute
+                    mock_kv_cache = paged_kv_cache
                     mock_block_table = block_tables_prefill
 
                 trtllm_batch_context_with_kv_cache(
@@ -2026,7 +2170,7 @@ class FlashInferImpl(AttentionImpl):
                 assert decode_wrapper._sm_scale == self.scale
 
                 if self.is_kvcache_nvfp4:
-                    kv_cache_permute = nvfp4_kv_data
+                    paged_kv_cache = nvfp4_kv_data
                 kv_cache_sf = nvfp4_kv_block_scales if self.is_kvcache_nvfp4 else None
 
                 # NVFP4 kernel only supports FP8 output.
@@ -2049,7 +2193,7 @@ class FlashInferImpl(AttentionImpl):
                     )
                     decode_wrapper.run(
                         decode_query,
-                        kv_cache_permute,
+                        paged_kv_cache,
                         q_scale=layer._q_scale_float,
                         k_scale=layer._k_scale_float,
                         v_scale=layer._v_scale_float,
@@ -2066,7 +2210,7 @@ class FlashInferImpl(AttentionImpl):
                 else:
                     decode_wrapper.run(
                         decode_query,
-                        kv_cache_permute,
+                        paged_kv_cache,
                         q_scale=layer._q_scale_float,
                         k_scale=layer._k_scale_float,
                         v_scale=layer._v_scale_float,
@@ -2098,10 +2242,15 @@ class FlashInferImpl(AttentionImpl):
                 assert is_strictly_contiguous(workspace_buffer)
                 assert is_strictly_contiguous(block_tables_decode)
                 assert is_strictly_contiguous(seq_lens_decode)
-                kv_cache_permute = canonicalize_singleton_dim_strides(kv_cache_permute)
-                kv_strides = kv_cache_permute.stride()
+                # kv_cache outer dims may be non-contiguous (e.g.
+                # cross-layer unified allocation), but inner dims
+                # (block_size, head_size) must be contiguous and
+                # strides must be canonical to avoid TMA descriptor
+                # failures (see flashinfer-ai/flashinfer#2232).
+                paged_kv_cache = canonicalize_singleton_dim_strides(paged_kv_cache)
+                kv_strides = paged_kv_cache.stride()
                 assert (
-                    kv_strides[-1] == 1 and kv_strides[-2] == kv_cache_permute.shape[-1]
+                    kv_strides[-1] == 1 and kv_strides[-2] == paged_kv_cache.shape[-1]
                 ), (
                     "KV cache inner dims (block_size, head_size) must be "
                     f"contiguous, got strides {kv_strides}"
@@ -2148,7 +2297,7 @@ class FlashInferImpl(AttentionImpl):
                 trtllm_batch_decode_with_kv_cache(
                     query=decode_query,
                     kv_cache=(
-                        nvfp4_kv_data if self.is_kvcache_nvfp4 else kv_cache_permute
+                        nvfp4_kv_data if self.is_kvcache_nvfp4 else paged_kv_cache
                     ),
                     workspace_buffer=workspace_buffer,
                     block_tables=block_tables_decode,
