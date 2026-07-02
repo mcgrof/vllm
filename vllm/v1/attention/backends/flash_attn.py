@@ -46,7 +46,12 @@ from vllm.config import (
     get_current_vllm_config_or_none,
     get_layers_from_vllm_config,
 )
-from vllm.config.cache import CacheDType
+from vllm.config.cache import (
+    CacheDType,
+    cache_dtype_k,
+    cache_dtype_v,
+    is_asymmetric_kv,
+)
 from vllm.distributed.parallel_state import get_dcp_group
 from vllm.logger import init_logger
 from vllm.platforms.interface import DeviceCapability
@@ -701,7 +706,17 @@ class FlashAttentionImpl(AttentionImpl):
             self.sliding_window = (sliding_window - 1, sliding_window - 1)
         else:
             self.sliding_window = (sliding_window - 1, 0)
+        # Asymmetric K/V: kv_cache_dtype may be a tuple ("auto", "fp8_e4m3").
+        # Cache the side-specific dtype strings for the writer path.
+        # The full spec is preserved on self.kv_cache_dtype so
+        # downstream code sees the original value.
         self.kv_cache_dtype = kv_cache_dtype
+        if is_asymmetric_kv(kv_cache_dtype):
+            self._k_cache_dtype_str = cache_dtype_k(kv_cache_dtype)
+            self._v_cache_dtype_str = cache_dtype_v(kv_cache_dtype)
+        else:
+            self._k_cache_dtype_str = kv_cache_dtype
+            self._v_cache_dtype_str = kv_cache_dtype
         if logits_soft_cap is None:
             # In flash-attn, setting logits_soft_cap as 0 means no soft cap.
             logits_soft_cap = 0
@@ -997,6 +1012,71 @@ class FlashAttentionImpl(AttentionImpl):
             # we use direct Q, K, V tensors without caching
             return
 
+        # Asymmetric K/V: handle a (k_cache, v_cache) tuple. Layers
+        # whose per-layer impl is FlashAttentionImpl dispatch their
+        # cache write here; the dtypes of the two sides can differ,
+        # so issue two reshape_and_cache_flash calls with the
+        # appropriate per-side dtype string -- never the tuple, and
+        # never the V dtype for the K write.
+        if isinstance(kv_cache, tuple):
+            assert is_asymmetric_kv(self.kv_cache_dtype), (
+                "tuple kv_cache requires asymmetric kv_cache_dtype; got "
+                f"{self.kv_cache_dtype!r}"
+            )
+            k_cache, v_cache = kv_cache
+            assert k_cache.ndim == 4, (
+                f"asym k_cache must be 4-D; got shape {tuple(k_cache.shape)}"
+            )
+            assert v_cache.ndim == 4, (
+                f"asym v_cache must be 4-D; got shape {tuple(v_cache.shape)}"
+            )
+            # The C++ cache-write op only dispatches on "auto"/fp8*
+            # dtype strings; unquantized K ("auto", "float16",
+            # "bfloat16") always writes natively as "auto".
+            k_dtype = self._k_cache_dtype_str or "auto"
+            if not k_dtype.startswith("fp8"):
+                k_dtype = "auto"
+            v_dtype = self._v_cache_dtype_str
+            assert v_dtype is not None, (
+                "asymmetric KV tuple requires a V cache dtype string"
+            )
+            # Each call passes the same tensor and the same scale in
+            # both the key and value slots, so the kernel's
+            # double-write stores identical bytes to the same
+            # location and stays idempotent regardless of store
+            # ordering.
+            # K stays native: no quantization.
+            torch.ops._C_cache_ops.reshape_and_cache_flash(
+                key,
+                key,
+                k_cache,
+                k_cache,
+                slot_mapping,
+                k_dtype,
+                layer._k_scale,
+                layer._k_scale,
+            )
+            # V is quantized at v_dtype.
+            torch.ops._C_cache_ops.reshape_and_cache_flash(
+                value,
+                value,
+                v_cache,
+                v_cache,
+                slot_mapping,
+                v_dtype,
+                layer._v_scale,
+                layer._v_scale,
+            )
+            return
+
+        # Fail-closed: asym dtype with non-tuple cache should never happen
+        # and would silently quantize K through the symmetric writer below.
+        if is_asymmetric_kv(self.kv_cache_dtype):
+            raise RuntimeError(
+                "asymmetric kv_cache_dtype requires tuple(k_cache, v_cache); "
+                f"got non-tuple kv_cache type={type(kv_cache).__name__}"
+            )
+
         # Scatter write into the KV cache using slot_mapping indices.
         # No TMA kernel is invoked here, so stride canonicalization is not needed.
         key_cache, value_cache = kv_cache.unbind(1)
@@ -1141,8 +1221,14 @@ class FlashAttentionImpl(AttentionImpl):
             "FlashAttention version not detected."
         )
 
-        # For encoder attention, process FP8 quantization if needed
-        if is_quantized_kv_cache(self.kv_cache_dtype):
+        # For encoder attention, process FP8 quantization if needed.
+        # Asymmetric: the V-side dtype drives the FP8 rejection below.
+        _kvd_str = (
+            self._v_cache_dtype_str
+            if is_asymmetric_kv(self.kv_cache_dtype)
+            else self.kv_cache_dtype
+        )
+        if is_quantized_kv_cache(_kvd_str):
             raise NotImplementedError(
                 "quantization is not supported for encoder attention"
             )
