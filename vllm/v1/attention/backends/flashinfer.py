@@ -1541,8 +1541,15 @@ class FlashInferImpl(AttentionImpl):
         self.window_left = (
             self.sliding_window[0] if self.sliding_window is not None else -1
         )
-        self.kv_cache_dtype = kv_cache_dtype
-        self.is_kvcache_nvfp4 = kv_cache_dtype == "nvfp4"
+        # Asymmetric: extract K dtype string for FP8 checks,
+        # store V dtype for the cache write path.
+        if isinstance(kv_cache_dtype, tuple):
+            self.kv_cache_dtype = kv_cache_dtype[0]
+            self._v_cache_str = kv_cache_dtype[1]
+        else:
+            self.kv_cache_dtype = kv_cache_dtype
+            self._v_cache_str = None
+        self.is_kvcache_nvfp4 = self.kv_cache_dtype == "nvfp4"
         self.fp4_data_dim = head_size // 2 if self.is_kvcache_nvfp4 else 0
         self.logits_soft_cap = logits_soft_cap
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
@@ -2175,18 +2182,53 @@ class FlashInferImpl(AttentionImpl):
             # and value[:num_actual_tokens] because the reshape_and_cache_flash
             # op uses the slot_mapping's shape to determine the number of
             # actual tokens.
-            k_cache = kv_cache[:, 0]
-            v_cache = kv_cache[:, 1]
-            torch.ops._C_cache_ops.reshape_and_cache_flash(
-                key,
-                value,
-                k_cache,
-                v_cache,
-                slot_mapping,
-                self.kv_cache_dtype,
-                layer._k_scale,
-                layer._v_scale,
-            )
+            # Asymmetric K/V: when kv_cache is a (k, v) tuple with
+            # different dtypes, write K and V in separate calls.
+            # Each call passes the same tensor and the same scale in
+            # both the key and value slots, so the kernel's
+            # double-write stores identical bytes to the same
+            # location and stays idempotent regardless of intra-
+            # thread store ordering.
+            if isinstance(kv_cache, tuple):
+                k_cache, v_cache = kv_cache
+                v_dtype = self._v_cache_str
+                assert v_dtype is not None, (
+                    "tuple kv_cache requires an asymmetric "
+                    "kv_cache_dtype with a V dtype string"
+                )
+                # Write K at native dtype (no quantization)
+                torch.ops._C_cache_ops.reshape_and_cache_flash(
+                    key,
+                    key,
+                    k_cache,
+                    k_cache,
+                    slot_mapping,
+                    "auto",
+                    layer._k_scale,
+                    layer._k_scale,
+                )
+                # Write V at the (FP8) V dtype
+                torch.ops._C_cache_ops.reshape_and_cache_flash(
+                    value,
+                    value,
+                    v_cache,
+                    v_cache,
+                    slot_mapping,
+                    v_dtype,
+                    layer._v_scale,
+                    layer._v_scale,
+                )
+            else:
+                torch.ops._C_cache_ops.reshape_and_cache_flash(
+                    key,
+                    value,
+                    kv_cache[:, 0],
+                    kv_cache[:, 1],
+                    slot_mapping,
+                    self.kv_cache_dtype,
+                    layer._k_scale,
+                    layer._v_scale,
+                )
 
 
 def fast_plan_decode(
