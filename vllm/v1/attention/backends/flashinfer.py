@@ -27,7 +27,12 @@ from vllm.config import (
     VllmConfig,
     get_current_vllm_config_or_none,
 )
-from vllm.config.cache import CacheDType
+from vllm.config.cache import (
+    CacheDType,
+    cache_dtype_k,
+    cache_dtype_v,
+    is_asymmetric_kv,
+)
 from vllm.distributed.parallel_state import get_dcp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -681,8 +686,28 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.head_dim = self.kv_cache_spec.head_size
         self.page_size = self.kv_cache_spec.block_size
 
-        if self.kv_cache_spec.kv_quant_mode != KVQuantMode.NONE:
-            self.cache_dtype = self.cache_config.cache_dtype
+        self.cache_dtype = self.cache_config.cache_dtype
+        # Asymmetric K/V (bf16/fp16 K + fp8 V): resolve separate K and V
+        # dtypes.  Mutually exclusive with nvfp4 and symmetric quantization,
+        # so it is handled ahead of the kv_quant_mode branches below.
+        self._is_asymmetric = is_asymmetric_kv(self.cache_dtype)
+        if self._is_asymmetric:
+            self.is_kvcache_nvfp4 = False
+            k_dtype_str = cache_dtype_k(self.cache_dtype)
+            v_dtype_str = cache_dtype_v(self.cache_dtype)
+
+            def _resolve_one(dt_str):
+                if isinstance(dt_str, str) and dt_str.startswith("fp8"):
+                    return FlashInferBackend.get_dtype_for_flashinfer(dt_str)
+                assert self.kv_cache_spec.dtype == self.model_config.dtype
+                return self.kv_cache_spec.dtype
+
+            self.k_cache_dtype = _resolve_one(k_dtype_str)
+            self.v_cache_dtype = _resolve_one(v_dtype_str)
+            # Backward compat: kv_cache_dtype carries the K dtype for
+            # downstream readers (e.g. the q_data_type logic).
+            self.kv_cache_dtype = self.k_cache_dtype
+        elif self.kv_cache_spec.kv_quant_mode != KVQuantMode.NONE:
             # Cannot use self.kv_cache_spec.dtype here because kv_cache_spec
             # storage dtype may not be the same as the op dtype (uint8 vs fp8_e4m3)
             self.is_kvcache_nvfp4 = self.cache_dtype == "nvfp4"
@@ -703,11 +728,26 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 self.kv_cache_dtype = FlashInferBackend.get_dtype_for_flashinfer(
                     self.cache_dtype
                 )
+            self.k_cache_dtype = self.kv_cache_dtype
+            self.v_cache_dtype = self.kv_cache_dtype
         else:
             self.cache_dtype = "auto"
             self.is_kvcache_nvfp4 = False
             assert self.kv_cache_spec.dtype == self.model_config.dtype
             self.kv_cache_dtype = self.kv_cache_spec.dtype
+            self.k_cache_dtype = self.kv_cache_dtype
+            self.v_cache_dtype = self.kv_cache_dtype
+        # Per-side dtype kwargs threaded into the decode plan() call below.
+        # Populated only for asymmetric K/V: stock FlashInfer plan() does
+        # not accept k_data_type/v_data_type (they exist in FlashInfer
+        # builds with the asymmetric K/V kernels), so symmetric
+        # configurations must not pass them.
+        self._asym_plan_kwargs: dict[str, torch.dtype] = {}
+        if self._is_asymmetric:
+            self._asym_plan_kwargs = {
+                "k_data_type": self.k_cache_dtype,
+                "v_data_type": self.v_cache_dtype,
+            }
 
         # Compute per-phase Q dtype.  On SM90 (XQA decode), the prefill and
         # decode phases require different Q dtypes when the KV cache is FP8
@@ -817,7 +857,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
         # On SM90, XQA decode requires BF16/FP16-Q even with FP8 KV cache.
         # FI native prefill on SM90 still uses FP8-Q in that case.
-        cache_dtype = vllm_config.cache_config.cache_dtype
+        # Asymmetric K/V: cache_dtype may be a (k, v) tuple. Q is matched to
+        # the K (unquantized) half, so reduce to it before the dtype-string
+        # checks below (asym K is never fp8/nvfp4, so Q stays unquantized).
+        cache_dtype = cache_dtype_k(vllm_config.cache_config.cache_dtype)
         if (
             current_platform.is_device_capability(90)
             and not is_prefill
@@ -1100,7 +1143,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             num_prefill_tokens,
             max_seq_len,
             self.dcp_world_size,
-            self.cache_dtype,
+            # K dtype: use_trtllm_attention expects a single dtype
+            # string. Asymmetric specs never reach a TRTLLM kernel
+            # (the read path rejects them), so the K half only steers
+            # the capability heuristics here.
+            cache_dtype_k(self.cache_dtype),
             self.q_data_type_prefill,
             is_prefill=True,
             force_use_trtllm=prefill_force_trtllm,
@@ -1271,7 +1318,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 window_left=self.window_left,
                 logits_soft_cap=self.logits_soft_cap,
                 q_data_type=self.q_data_type_prefill,
-                kv_data_type=self.kv_cache_dtype,
+                kv_data_type=self.k_cache_dtype,
             )
             return attn_metadata
 
@@ -1374,7 +1421,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         window_left=self.window_left,
                         logits_soft_cap=self.logits_soft_cap,
                         q_data_type=self.q_data_type_prefill,
-                        kv_data_type=self.kv_cache_dtype,
+                        kv_data_type=self.k_cache_dtype,
+                        # Asymmetric K/V: per-side dtypes make the
+                        # FlashInfer prefill plan pick an asym kernel
+                        # (DTypeK != DTypeV) and let the run-time dtype
+                        # check in prefill_wrapper.run() accept the
+                        # FP8 V tensor. Empty when symmetric.
+                        **self._asym_plan_kwargs,
                         o_data_type=o_dtype,
                         fixed_split_size=self.prefill_fixed_split_size,
                         disable_split_kv=self.disable_split_kv,
@@ -1434,7 +1487,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     window_left=self.window_left,
                     logits_soft_cap=self.logits_soft_cap,
                     q_data_type=self.q_data_type_decode,
-                    kv_data_type=self.kv_cache_dtype,
+                    kv_data_type=self.k_cache_dtype,
+                    # Asymmetric K/V: per-side dtypes make FlashInfer
+                    # JIT an asym kernel (DTypeK != DTypeV) and let the
+                    # dtype check in decode_wrapper.run() accept the
+                    # FP8 V tensor. Empty when symmetric.
+                    **self._asym_plan_kwargs,
                     o_data_type=o_dtype,
                     fixed_split_size=self.decode_fixed_split_size,
                     disable_split_kv=self.disable_split_kv,
@@ -2145,6 +2203,8 @@ def fast_plan_decode(
     logits_soft_cap: float | None = None,
     q_data_type: str | torch.dtype | None = "float16",
     kv_data_type: str | torch.dtype | None = None,
+    k_data_type: str | torch.dtype | None = None,
+    v_data_type: str | torch.dtype | None = None,
     o_data_type: str | torch.dtype | None = None,
     data_type: str | torch.dtype | None = None,
     sm_scale: float | None = None,
@@ -2171,6 +2231,14 @@ def fast_plan_decode(
     # original plan if we run for dynamic shape. For fixed shape (cudagraph),
     # this warm up is to generate the _cached_module for the decode wrapper.
     if not self.is_cuda_graph_enabled or getattr(self, "vllm_first_call", True):
+        # Asymmetric K/V only: stock FlashInfer plan() does not accept
+        # k_data_type/v_data_type, so forward them only when set.
+        asym_kwargs = {}
+        if k_data_type is not None or v_data_type is not None:
+            asym_kwargs = {
+                "k_data_type": k_data_type,
+                "v_data_type": v_data_type,
+            }
         self.plan(
             indptr=indptr_cpu,
             indices=indices,
@@ -2184,6 +2252,7 @@ def fast_plan_decode(
             logits_soft_cap=logits_soft_cap,
             q_data_type=q_data_type,
             kv_data_type=kv_data_type,
+            **asym_kwargs,
             o_data_type=o_data_type,
             data_type=data_type,
             sm_scale=sm_scale,
