@@ -491,7 +491,13 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             batch_size, cu_query_lens, max_query_len, seqlens, max_seq_len, causal
         ):
             cache_dtype = self.cache_config.cache_dtype
-            if is_quantized_kv_cache(cache_dtype):
+            # Asymmetric K/V: cache_dtype may be a (k_dtype, v_dtype) tuple.
+            # The schedule reads the V-side dtype (FlashAttention's FP8 path
+            # is driven by the V quantization).
+            cache_dtype_for_schedule = (
+                cache_dtype[1] if isinstance(cache_dtype, tuple) else cache_dtype
+            )
+            if is_quantized_kv_cache(cache_dtype_for_schedule):
                 qkv_dtype = current_platform.fp8_dtype()
             else:
                 qkv_dtype = self.kv_cache_dtype

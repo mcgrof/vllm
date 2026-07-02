@@ -36,7 +36,7 @@ from vllm.config import (
     set_current_vllm_config,
     update_config,
 )
-from vllm.config.cache import CacheConfig, cache_dtype_k
+from vllm.config.cache import CacheConfig, cache_dtype_k, is_asymmetric_kv
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
@@ -470,6 +470,18 @@ class GPUModelRunner(
         _cache_spec = cache_config.cache_dtype
         _k_str = cache_dtype_k(_cache_spec)
         self.kv_cache_dtype = kv_cache_dtype_str_to_dtype(_k_str, self.model_config)
+        # The asymmetric tuple-cache split is wired through the V2
+        # model runner's spec construction only
+        # (vllm/v1/worker/gpu/attn_utils.py). This runner would
+        # allocate a symmetric cache at the K dtype while the
+        # FlashInfer metadata builder plans with an FP8 V dtype, then
+        # fail at the first forward with a confusing dtype-mismatch
+        # error. Fail closed at init instead.
+        if is_asymmetric_kv(_cache_spec):
+            raise NotImplementedError(
+                "Asymmetric KV cache dtypes require the V2 model "
+                "runner; set VLLM_USE_V2_MODEL_RUNNER=1."
+            )
 
         self.is_pooling_model = model_config.runner_type == "pooling"
         self.enable_prompt_embeds = model_config.enable_prompt_embeds

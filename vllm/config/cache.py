@@ -126,6 +126,15 @@ class CacheConfig:
     For asymmetric K/V, pass a comma-separated or pipe-separated pair via CLI:
     --kv-cache-dtype float16,fp8_e4m3 (FP16 keys, FP8 values).
     """
+    v_cache_dtype: str | None = None
+    """V-side dtype string for asymmetric K/V. Mirrors the V half of
+    ``cache_dtype`` when the spec is a tuple (e.g. "fp8_e4m3"). Read by
+    ``vllm/v1/worker/gpu/attn_utils.py`` to inject ``v_dtype`` into the
+    per-layer ``AttentionSpec`` so the asymmetric tuple-cache split in
+    ``_reshape_kv_cache`` triggers. ``None`` on the symmetric path.
+
+    Wired from the CLI via ``EngineArgs.kv_cache_dtype`` after the
+    tuple parse in ``arg_utils.py``."""
     is_attention_free: bool = False
     """Whether the model is attention-free. This is primarily set in
     `ModelConfig` and that value should be manually duplicated here."""

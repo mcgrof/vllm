@@ -1868,10 +1868,16 @@ class EngineArgs:
         # Resolve kv_cache_dtype: handle comma-separated asymmetric
         # syntax (e.g. "float16,fp8_e4m3") and "auto" resolution.
         raw_spec = parse_cache_dtype_spec(self.kv_cache_dtype)
+        # v_cache_dtype carries the V-half *string* form for the
+        # asymmetric path; `vllm/v1/worker/gpu/attn_utils.py` reads
+        # ``cache_config.v_cache_dtype`` to inject ``v_dtype`` into
+        # per-layer AttentionSpec so the tuple-cache split triggers.
+        v_cache_dtype_str: str | None = None
         if isinstance(raw_spec, tuple):
             k_dt = resolve_kv_cache_dtype_string(raw_spec[0], model_config)
             v_dt = resolve_kv_cache_dtype_string(raw_spec[1], model_config)
             resolved_cache_dtype = (k_dt, v_dt)
+            v_cache_dtype_str = raw_spec[1]
         else:
             resolved_cache_dtype = resolve_kv_cache_dtype_string(raw_spec, model_config)
 
@@ -1889,6 +1895,7 @@ class EngineArgs:
             gpu_memory_utilization=self.gpu_memory_utilization,
             kv_cache_memory_bytes=self.kv_cache_memory_bytes,
             cache_dtype=resolved_cache_dtype,  # type: ignore[arg-type]
+            v_cache_dtype=v_cache_dtype_str,
             is_attention_free=model_config.is_attention_free,
             num_gpu_blocks_override=self.num_gpu_blocks_override,
             sliding_window=sliding_window,

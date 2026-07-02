@@ -759,7 +759,10 @@ def unified_kv_cache_update(
             layer_slot_mapping,
         )
 
-    return torch.empty(0, device=kv_cache.device, dtype=kv_cache.dtype)
+    # Asymmetric K/V: kv_cache is a (k_cache, v_cache) tuple; both
+    # tensors share the same device, so probe via the K half.
+    _cache_for_meta = kv_cache[0] if isinstance(kv_cache, tuple) else kv_cache
+    return torch.empty(0, device=_cache_for_meta.device, dtype=_cache_for_meta.dtype)
 
 
 def unified_kv_cache_update_fake(

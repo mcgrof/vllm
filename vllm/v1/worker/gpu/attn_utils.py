@@ -25,6 +25,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpec,
     MambaSpec,
+    MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
@@ -60,6 +61,29 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
                     indexes = backend.indexes_kv_by_block_stride()
                 spec = replace(spec, indexes_kv_by_block_stride=indexes)
             kv_cache_spec[layer_name] = spec
+
+    # Asymmetric K/V: inject v_dtype from cache_config
+    v_cache_str = vllm_config.cache_config.v_cache_dtype
+    if v_cache_str and v_cache_str.startswith("fp8"):
+        # Function-local import: the backend module is heavyweight and
+        # importing it at module scope would create an import cycle
+        # through the worker utilities.
+        from vllm.v1.attention.backends.flashinfer import FlashInferBackend
+
+        v_torch_dtype = FlashInferBackend.get_dtype_for_flashinfer(v_cache_str)
+        for name, spec in kv_cache_spec.items():
+            if isinstance(spec, MLAAttentionSpec):
+                # MLA specs have their own page-size accounting with
+                # no asymmetric branch; injecting v_dtype would make
+                # the allocator and the reshaper disagree.
+                raise NotImplementedError(
+                    "Asymmetric KV cache dtypes are not supported for "
+                    "MLA attention layers."
+                )
+            if isinstance(spec, AttentionSpec) and spec.v_dtype is None:
+                # Frozen dataclass — need to reconstruct
+                kv_cache_spec[name] = replace(spec, v_dtype=v_torch_dtype)
+
     return kv_cache_spec
 
 
