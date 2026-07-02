@@ -550,12 +550,29 @@ class Attention(nn.Module, AttentionLayerBase):
         return output.view(-1, hidden_size)
 
     def calc_kv_scales(self, query, key, value):
-        self._q_scale.copy_(torch.abs(query).max() / self.q_range)
-        self._k_scale.copy_(torch.abs(key).max() / self.k_range)
-        self._v_scale.copy_(torch.abs(value).max() / self.v_range)
-        self._q_scale_float = self._q_scale.item()
-        self._k_scale_float = self._k_scale.item()
-        self._v_scale_float = self._v_scale.item()
+        # Asymmetric K/V: only calibrate tensors whose cache dtype is
+        # actually quantized. On the asymmetric FP16-K/FP8-V path, K
+        # is stored at native precision: no consumer ever dequantizes
+        # K with a scale, but a calibrated k/q scale still flows into
+        # the attention kernels' scale arguments, rescaling the Q.K
+        # path with nothing to cancel it. Q is only meaningful to
+        # rescale against a quantized K; skip it alongside K.
+        spec = self.kv_cache_dtype
+        if isinstance(spec, tuple):
+            k_dtype, v_dtype = spec
+        else:
+            k_dtype = v_dtype = spec
+        k_is_quantized = k_dtype.startswith("fp8")
+        v_is_quantized = v_dtype.startswith("fp8")
+
+        if k_is_quantized:
+            self._q_scale.copy_(torch.abs(query).max() / self.q_range)
+            self._k_scale.copy_(torch.abs(key).max() / self.k_range)
+            self._q_scale_float = self._q_scale.item()
+            self._k_scale_float = self._k_scale.item()
+        if v_is_quantized:
+            self._v_scale.copy_(torch.abs(value).max() / self.v_range)
+            self._v_scale_float = self._v_scale.item()
         # We only calculate the scales once
         self.calculate_kv_scales = False
 
