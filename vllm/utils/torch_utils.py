@@ -21,6 +21,7 @@ from vllm.utils.platform_utils import is_pin_memory_available
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
+    from vllm.config.cache import CacheDTypeSpec
     from vllm.sequence import IntermediateTensors
 else:
     ModelConfig = object
@@ -498,6 +499,18 @@ def nvfp4_kv_cache_split_views(kv_cache: torch.Tensor) -> tuple[tuple, tuple]:
     k_data, k_scale = _nvfp4_split_data_scale(kv_cache[:, 0])
     v_data, v_scale = _nvfp4_split_data_scale(kv_cache[:, 1])
     return (k_data, v_data), (k_scale, v_scale)
+
+
+def cache_dtype_is_fp8(spec: "CacheDTypeSpec") -> bool:
+    """Check if any part of the cache dtype spec is FP8.
+
+    Tuple-aware replacement for a bare startswith("fp8") at call
+    sites that receive a CacheDTypeSpec (a tuple has no startswith
+    and would raise AttributeError).
+    """
+    if isinstance(spec, tuple):
+        return spec[0].startswith("fp8") or spec[1].startswith("fp8")
+    return isinstance(spec, str) and spec.startswith("fp8")
 
 
 def create_kv_caches_with_random_flash(
