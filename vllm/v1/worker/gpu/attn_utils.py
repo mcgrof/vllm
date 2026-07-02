@@ -7,6 +7,7 @@ from typing import Any, cast
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import (
     VllmConfig,
     get_layers_from_vllm_config,
@@ -293,6 +294,42 @@ def _reshape_kv_cache(
 
             if isinstance(kv_cache_spec, AttentionSpec):
                 has_attn = True
+
+                # Asymmetric K/V: split the raw int8 tensor into
+                # separate K and V tensors with different dtypes.
+                if (
+                    kv_cache_spec.v_dtype is not None
+                    and kv_cache_spec.v_dtype != kv_cache_spec.dtype
+                ):
+                    # The split below materializes NHD-shaped tensors.
+                    if (envs.VLLM_KV_CACHE_LAYOUT or "NHD") != "NHD":
+                        raise NotImplementedError(
+                            "Asymmetric K/V cache supports only the NHD "
+                            "KV cache layout; got "
+                            f"{envs.VLLM_KV_CACHE_LAYOUT}."
+                        )
+                    k_dtype = kv_cache_spec.dtype
+                    v_dtype = kv_cache_spec.v_dtype
+                    bs = kv_cache_spec.block_size
+                    nh = kv_cache_spec.num_kv_heads
+                    hd = kv_cache_spec.head_size
+                    # V head size may differ from K's; mirror the byte
+                    # accounting in FullAttentionSpec.real_page_size_bytes.
+                    hd_v = getattr(kv_cache_spec, "head_size_v", None) or hd
+                    k_page_bytes = bs * nh * hd * get_dtype_size(k_dtype)
+                    v_page_bytes = bs * nh * hd_v * get_dtype_size(v_dtype)
+                    page_bytes = k_page_bytes + v_page_bytes
+                    # Split raw bytes into K and V per page.
+                    raw_pages = kv_raw_tensor.view(num_blocks, page_bytes)
+                    k_raw = raw_pages[:, :k_page_bytes].contiguous()
+                    v_raw = raw_pages[:, k_page_bytes:].contiguous()
+                    k_cache = k_raw.view(k_dtype).view(num_blocks, bs, nh, hd)
+                    v_cache = v_raw.view(v_dtype).view(num_blocks, bs, nh, hd_v)
+                    # Store as a (k, v) tuple; FlashInfer's paged-KV API
+                    # accepts this format directly on the read side.
+                    kv_caches[layer_name] = (k_cache, v_cache)
+                    continue
+
                 # Use storage_block_size: it equals block_size for uncompressed
                 # specs but is smaller for compressed ones (DeepSeek V4), which
                 # store block_size tokens in block_size // compress_ratio slots.
