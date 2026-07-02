@@ -473,6 +473,17 @@ class TritonAttentionImpl(AttentionImpl):
         else:
             self.sliding_window = (sliding_window - 1, 0)
         self.kv_cache_dtype = kv_cache_dtype
+        # Asymmetric K/V (a (k_dtype, v_dtype) tuple) is not supported by the
+        # Triton backend; the validated asym path runs on FlashInfer, and the
+        # selector auto-routes there when no backend is pinned. Fail closed
+        # with a clear message rather than crashing on the str-only dtype
+        # checks below when a caller force-pins this backend for an asym cache.
+        if isinstance(kv_cache_dtype, tuple):
+            raise RuntimeError(
+                "TritonAttentionImpl does not support asymmetric K/V "
+                f"(kv_cache_dtype={kv_cache_dtype!r}); select the FlashInfer "
+                "backend via --attention-backend FLASHINFER."
+            )
         if current_platform.is_cuda():
             cap = current_platform.get_device_capability()
             cap_str = cap.as_version_str() if cap is not None else "unknown"
