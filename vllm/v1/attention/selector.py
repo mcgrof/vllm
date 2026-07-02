@@ -65,6 +65,7 @@ def get_attn_backend(
 ) -> type[AttentionBackend]:
     """Selects which attention backend to use and lazily imports it."""
 
+    is_asym = False
     if kv_cache_dtype is not None:
         valid_cache_dtypes = get_args(CacheDType)
         # Asymmetric K/V: if the spec is a tuple, validate each
@@ -75,6 +76,7 @@ def get_attn_backend(
                     f"Invalid dtype in asymmetric spec: {dt}. "
                     f"Valid values are: {valid_cache_dtypes}"
                 )
+            is_asym = kv_cache_dtype[0] != kv_cache_dtype[1]
             kv_cache_dtype = kv_cache_dtype[0]  # K dtype
         else:
             assert kv_cache_dtype in valid_cache_dtypes, (
@@ -113,8 +115,19 @@ def get_attn_backend(
         use_kv_connector=use_kv_connector,
     )
 
+    # Asymmetric K/V needs FlashInfer (FlashAttention lacks the tuple
+    # writer and fails closed on a mixed-dtype cache). Auto-selection
+    # otherwise reduces the (K, V) spec to the K dtype, picks
+    # FlashAttention first on the priority list, and fail-closes on the
+    # profiling dummy run. Force FlashInfer when the caller has not
+    # pinned a backend so the asymmetric path is reached.
+    forced_backend = vllm_config.attention_config.backend
+    if is_asym and forced_backend is None:
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        forced_backend = AttentionBackendEnum.FLASHINFER
     return _cached_get_attn_backend(
-        backend=vllm_config.attention_config.backend,
+        backend=forced_backend,
         attn_selector_config=attn_selector_config,
         num_heads=num_heads,
     )
