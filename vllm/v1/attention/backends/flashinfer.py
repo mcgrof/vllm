@@ -1695,7 +1695,13 @@ class FlashInferImpl(AttentionImpl):
 
         if self.bmm2_scale is None:
             self.bmm2_scale = 1.0
-            if is_quantized_kv_cache(self.kv_cache_dtype):
+            # Asymmetric K/V: gate bmm2 (V side) on the V dtype, not K
+            # dtype. self.kv_cache_dtype holds the K dtype after the
+            # tuple unpack in __init__; on FP16-K / FP8-V this is
+            # "auto" even though V is FP8 and its calibration scale
+            # must be compensated in bmm2_scale.
+            v_str = self._v_cache_str or self.kv_cache_dtype
+            if is_quantized_kv_cache(v_str):
                 self.bmm2_scale *= layer._v_scale_float
 
         prefill_use_trtllm = isinstance(attn_metadata.prefill, TRTLLMPrefill)
