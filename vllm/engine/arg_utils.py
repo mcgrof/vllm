@@ -66,11 +66,12 @@ from vllm.config import (
     get_attr_docs,
 )
 from vllm.config.cache import (
-    CacheDType,
     KVOffloadingBackend,
     MambaCacheMode,
     MambaDType,
     PrefixCachingHashAlgo,
+    cache_dtype_k,
+    parse_cache_dtype_spec,
 )
 from vllm.config.device import Device
 from vllm.config.kernel import IrOpPriorityConfig, LinearBackend, MoEBackend
@@ -437,7 +438,7 @@ class EngineArgs:
     load_format: str | LoadFormats = LoadConfig.load_format
     config_format: str = ModelConfig.config_format
     dtype: ModelDType = ModelConfig.dtype
-    kv_cache_dtype: CacheDType = CacheConfig.cache_dtype
+    kv_cache_dtype: str = "auto"  # parsed to CacheDTypeSpec later
     seed: int = ModelConfig.seed
     max_model_len: int = ModelConfig.max_model_len
     cudagraph_capture_sizes: list[int] | None = (
@@ -1152,7 +1153,15 @@ class EngineArgs:
         cache_group.add_argument(
             "--kv-cache-memory-bytes", **cache_kwargs["kv_cache_memory_bytes"]
         )
-        cache_group.add_argument("--kv-cache-dtype", **cache_kwargs["cache_dtype"])
+        # Drop argparse `choices` on --kv-cache-dtype so the asymmetric
+        # pair form (e.g. "float16,fp8_e4m3") reaches parse_cache_dtype_spec
+        # in create_engine_config. Choices are derived from the
+        # single-dtype Literal only and would otherwise reject any
+        # comma-separated value; invalid dtypes are still rejected by
+        # CacheConfig's pydantic validation of each half.
+        _kv_cache_dtype_kwargs = dict(cache_kwargs["cache_dtype"])
+        _kv_cache_dtype_kwargs.pop("choices", None)
+        cache_group.add_argument("--kv-cache-dtype", **_kv_cache_dtype_kwargs)
         cache_group.add_argument(
             "--num-gpu-blocks-override", **cache_kwargs["num_gpu_blocks_override"]
         )
@@ -1856,10 +1865,20 @@ class EngineArgs:
             # global layers in interleaved sliding window models.
             sliding_window = model_config.get_sliding_window()
 
-        # Resolve "auto" kv_cache_dtype to actual value from model config
-        resolved_cache_dtype = resolve_kv_cache_dtype_string(
-            self.kv_cache_dtype, model_config
-        )
+        # Resolve kv_cache_dtype: handle comma-separated asymmetric
+        # syntax (e.g. "float16,fp8_e4m3") and "auto" resolution.
+        raw_spec = parse_cache_dtype_spec(self.kv_cache_dtype)
+        if isinstance(raw_spec, tuple):
+            k_dt = resolve_kv_cache_dtype_string(raw_spec[0], model_config)
+            v_dt = resolve_kv_cache_dtype_string(raw_spec[1], model_config)
+            resolved_cache_dtype = (k_dt, v_dt)
+        else:
+            resolved_cache_dtype = resolve_kv_cache_dtype_string(raw_spec, model_config)
+
+        # TurboQuant is a symmetric packed-KV mode; reduce an asymmetric
+        # (k, v) tuple to its K half for the string checks below (asym K is
+        # never turboquant, so both checks are correctly False).
+        turboquant_probe = cache_dtype_k(resolved_cache_dtype)
 
         assert self.enable_prefix_caching is not None, (
             "enable_prefix_caching must be set by this point"
@@ -1886,7 +1905,7 @@ class EngineArgs:
             kv_offloading_backend=self.kv_offloading_backend,
         )
 
-        if resolved_cache_dtype.startswith("turboquant_"):
+        if turboquant_probe.startswith("turboquant_"):
             from vllm.model_executor.layers.quantization.turboquant.config import (
                 TurboQuantConfig,
             )
@@ -2221,7 +2240,7 @@ class EngineArgs:
 
         # TurboQuant requires FlashAttention 2 — FA3 boundary layers assert
         # FlashAttentionImpl which fails with TurboQuantAttentionImpl.
-        if resolved_cache_dtype.startswith("turboquant_") and (
+        if turboquant_probe.startswith("turboquant_") and (
             attention_config.flash_attn_version is None
             or attention_config.flash_attn_version >= 3
         ):

@@ -853,3 +853,35 @@ class TestDpDeviceIdSharding:
             get_physical_gpu_ids_for_local_dp_rank(
                 evar, local_dp_rank=2, world_size=2, user_assigned_gpu_ids=[4, 5, 6, 7]
             )
+
+
+def test_kv_cache_dtype_asymmetric_pair_parsing():
+    from vllm.config.cache import parse_cache_dtype_spec
+
+    assert parse_cache_dtype_spec("fp8_e4m3") == "fp8_e4m3"
+    assert parse_cache_dtype_spec("float16,fp8_e4m3") == ("float16", "fp8_e4m3")
+    assert parse_cache_dtype_spec("float16|fp8_e4m3") == ("float16", "fp8_e4m3")
+
+
+def test_kv_cache_dtype_argparse_accepts_asymmetric_pair():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(["--kv-cache-dtype", "float16,fp8_e4m3"])
+    assert args.kv_cache_dtype == "float16,fp8_e4m3"
+
+
+def test_cache_config_validates_asymmetric_pairs():
+    from vllm.config import CacheConfig
+
+    # Quantized K half is rejected.
+    with pytest.raises(ValueError):
+        CacheConfig(cache_dtype=("fp8_e4m3", "float16"))
+    # Non-FP8 V half is rejected.
+    with pytest.raises(ValueError):
+        CacheConfig(cache_dtype=("auto", "float16"))
+    # A degenerate equal pair normalizes to the single-string form.
+    assert CacheConfig(cache_dtype=("fp8_e4m3", "fp8_e4m3")).cache_dtype == "fp8_e4m3"
+    # The supported asymmetric shape is accepted as-is.
+    assert CacheConfig(cache_dtype=("auto", "fp8_e4m3")).cache_dtype == (
+        "auto",
+        "fp8_e4m3",
+    )
