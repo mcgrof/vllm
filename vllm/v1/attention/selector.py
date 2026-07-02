@@ -7,7 +7,7 @@ from typing import NamedTuple, cast, get_args
 import torch
 
 import vllm.envs as envs
-from vllm.config.cache import CacheDType
+from vllm.config.cache import CacheDType, CacheDTypeSpec
 from vllm.logger import init_logger
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
@@ -54,7 +54,7 @@ class AttentionSelectorConfig(NamedTuple):
 def get_attn_backend(
     head_size: int,
     dtype: torch.dtype,
-    kv_cache_dtype: str | None,
+    kv_cache_dtype: CacheDTypeSpec | None,
     use_mla: bool = False,
     has_sink: bool = False,
     use_sparse: bool = False,
@@ -67,10 +67,20 @@ def get_attn_backend(
 
     if kv_cache_dtype is not None:
         valid_cache_dtypes = get_args(CacheDType)
-        assert kv_cache_dtype in valid_cache_dtypes, (
-            f"Invalid kv_cache_dtype: {kv_cache_dtype}. "
-            f"Valid values are: {valid_cache_dtypes}"
-        )
+        # Asymmetric K/V: if the spec is a tuple, validate each
+        # element and reduce to the K dtype for selector purposes.
+        if isinstance(kv_cache_dtype, tuple):
+            for dt in kv_cache_dtype:
+                assert dt in valid_cache_dtypes, (
+                    f"Invalid dtype in asymmetric spec: {dt}. "
+                    f"Valid values are: {valid_cache_dtypes}"
+                )
+            kv_cache_dtype = kv_cache_dtype[0]  # K dtype
+        else:
+            assert kv_cache_dtype in valid_cache_dtypes, (
+                f"Invalid kv_cache_dtype: {kv_cache_dtype}. "
+                f"Valid values are: {valid_cache_dtypes}"
+            )
 
     from vllm.config import get_current_vllm_config
 
