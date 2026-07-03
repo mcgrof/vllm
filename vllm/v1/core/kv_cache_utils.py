@@ -1472,6 +1472,11 @@ def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
                     head_size=spec.head_size,
                     head_size_v=spec.head_size_v,
                     dtype=spec.dtype,
+                    # Asymmetric K/V: carry the V dtype through the conversion.
+                    # Dropping it here re-sizes the merged full-attention group
+                    # symmetrically (bf16 V) and silently forfeits the fp8-V
+                    # capacity saving on hybrid (full+sliding) asym models.
+                    v_dtype=spec.v_dtype,
                     kv_quant_mode=spec.kv_quant_mode,
                     sliding_window=spec.sliding_window,
                     page_size_padded=spec.page_size_padded,
@@ -1482,6 +1487,8 @@ def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
                     num_kv_heads=spec.num_kv_heads,
                     head_size=spec.head_size,
                     dtype=spec.dtype,
+                    # Asymmetric K/V: carry the V dtype through (see above).
+                    v_dtype=spec.v_dtype,
                     attention_chunk_size=spec.attention_chunk_size,
                     page_size_padded=spec.page_size_padded,
                 )
