@@ -157,18 +157,20 @@ def test_asym_kv_cache_reshape_splits_raw_buffer_into_bf16_k_and_fp8_v():
     sym_bf16_kv_bytes = elements * 2 * 2  # 2 planes × bf16
     assert expected_total * 4 == sym_bf16_kv_bytes * 3
 
-    # No aliasing: K and V must occupy distinct byte regions.  The
-    # current implementation does .contiguous() on each half, so they
-    # land in separate fresh storages — we just verify they don't
-    # share a data_ptr.
-    assert k_cache.data_ptr() != v_cache.data_ptr()
+    # Region-split zero-copy views: K and V are contiguous slices of the
+    # SAME raw buffer (all-K region then all-V region), not fresh
+    # .contiguous() copies.  This is what lifts the ~2x init peak that
+    # otherwise forced gpu_memory_utilization <= 0.5.  K starts at the
+    # buffer base; V starts exactly where the K region ends.
+    assert k_cache.data_ptr() == raw.data_ptr()
+    assert v_cache.data_ptr() - k_cache.data_ptr() == expected_k_bytes
 
 
 def test_asym_kv_cache_reshape_byte_split_is_k_first_then_v():
-    """Within the raw buffer's per-page layout, K bytes come first then
-    V bytes.  The split direction must match the K-bytes-first
-    accounting in AttentionSpec.real_page_size_bytes; a direction bug
-    would silently hand K bytes to the V view and vice versa."""
+    """The raw buffer is region-split: all K bytes first, then all V
+    bytes.  The split point must match the K-bytes-first accounting in
+    AttentionSpec.real_page_size_bytes; a direction bug would silently
+    hand K bytes to the V view and vice versa."""
     spec = FullAttentionSpec(
         block_size=BLOCK_SIZE,
         num_kv_heads=NUM_KV_HEADS,
@@ -179,16 +181,12 @@ def test_asym_kv_cache_reshape_byte_split_is_k_first_then_v():
     cfg, raw_tensors = _build_kv_cache_config(spec)
     raw = raw_tensors[LAYER]
 
-    # Stamp the K region with one byte pattern and the V region with
-    # another, then verify K and V views see the right halves.
+    # Stamp the all-K region with one byte pattern and the all-V region
+    # with another, then verify each view sees the right region.
     elements = NUM_BLOCKS * BLOCK_SIZE * NUM_KV_HEADS * HEAD_SIZE
-    k_bytes = elements * 2
-    v_bytes = elements * 1
-    page_bytes = (k_bytes + v_bytes) // NUM_BLOCKS
-
-    raw_pages = raw.view(NUM_BLOCKS, page_bytes)
-    raw_pages[:, : page_bytes - (v_bytes // NUM_BLOCKS)] = 0x11
-    raw_pages[:, page_bytes - (v_bytes // NUM_BLOCKS) :] = 0x22
+    k_bytes = elements * 2  # bf16 K
+    raw[:k_bytes] = 0x11
+    raw[k_bytes:] = 0x22
 
     kv_caches = _reshape(cfg, spec, raw_tensors)
     k_cache, v_cache = kv_caches[LAYER]

@@ -342,13 +342,31 @@ def _reshape_kv_cache(
                     hd_v = getattr(kv_cache_spec, "head_size_v", None) or hd
                     k_page_bytes = bs * nh * hd * get_dtype_size(k_dtype)
                     v_page_bytes = bs * nh * hd_v * get_dtype_size(v_dtype)
-                    page_bytes = k_page_bytes + v_page_bytes
-                    # Split raw bytes into K and V per page.
-                    raw_pages = kv_raw_tensor.view(num_blocks, page_bytes)
-                    k_raw = raw_pages[:, :k_page_bytes].contiguous()
-                    v_raw = raw_pages[:, k_page_bytes:].contiguous()
-                    k_cache = k_raw.view(k_dtype).view(num_blocks, bs, nh, hd)
-                    v_cache = v_raw.view(v_dtype).view(num_blocks, bs, nh, hd_v)
+                    # Region-split (all-K | all-V) zero-copy views. The raw
+                    # byte buffer holds all K pages followed by all V pages, so
+                    # each half is a *contiguous* slice and k_cache/v_cache are
+                    # zero-copy views into the raw storage. This replaces a
+                    # per-page K|V interleave that needed .contiguous() on each
+                    # half, materializing two fresh full-cache tensors beside
+                    # the raw buffer at init (~2x peak -> forced
+                    # gpu_memory_utilization <= 0.5, else OOM at the copy).
+                    # Both halves are contiguous with EQUAL block strides
+                    # (bs*nh*hd elements), so FlashInfer's decode
+                    # k_strides == v_strides assert holds; decode output is
+                    # bit-identical to the copy form (verified on H100).
+                    k_total_bytes = num_blocks * k_page_bytes
+                    v_total_bytes = num_blocks * v_page_bytes
+                    assert kv_raw_tensor.numel() == k_total_bytes + v_total_bytes
+                    k_cache = (
+                        kv_raw_tensor[:k_total_bytes]
+                        .view(k_dtype)
+                        .view(num_blocks, bs, nh, hd)
+                    )
+                    v_cache = (
+                        kv_raw_tensor[k_total_bytes:]
+                        .view(v_dtype)
+                        .view(num_blocks, bs, nh, hd_v)
+                    )
                     # Store as a (k, v) tuple; FlashInfer's paged-KV API
                     # accepts this format directly on the read side.
                     kv_caches[layer_name] = (k_cache, v_cache)
