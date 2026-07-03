@@ -1040,8 +1040,14 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 paged_kv_last_page_len_buffer=paged_kv_last_page_len,
                 # Tensor cores are enabled by default because the perf would be
                 # at least as good as cuda cores for all attention ops in latest
-                # gpus.
-                use_tensor_cores=True,
+                # gpus.  EXCEPTION: the asymmetric (DTypeK != DTypeV) decode
+                # kernel is CUDA-core only.  FlashInfer fail-closes an asym
+                # cache + use_tensor_cores with NotImplementedError in decode.py
+                # plan(); under FULL-cudagraph capture (a pure-decode batch that
+                # bypasses the prefill-population guard) that raise fires at
+                # boot.  Force cuda cores for asym so the supported kernel is
+                # selected and capture reaches the clean prefill guard instead.
+                use_tensor_cores=not self._is_asymmetric,
                 backend=backend,
             )
 

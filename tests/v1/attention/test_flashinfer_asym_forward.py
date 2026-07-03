@@ -17,11 +17,14 @@ GPU required (importing the backend module does require the
 flashinfer package; skip otherwise).
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 pytest.importorskip("flashinfer")
 
+import vllm.v1.attention.backends.flashinfer as fi
 from vllm.v1.attention.backends.flashinfer import (
     _derive_4d_stride_order_from_5d,
     _is_asym_paged_kv_cache,
@@ -126,3 +129,53 @@ def test_prepare_symmetric_rejects_wrong_ndim(default_vllm_config):
     t = torch.zeros(4, 16, 8, 128)  # 4-D not allowed for symmetric
     with pytest.raises(AssertionError):
         _prepare_flashinfer_paged_kv_cache(t)
+
+
+# ---------------------------------------------------------------------------
+# Decode-wrapper backend/tensor-core selection (asym is CUDA-core only).
+#
+# The asymmetric (DTypeK != DTypeV) decode kernel lives on the CUDA-core
+# path.  FlashInfer fail-closes an asym cache + use_tensor_cores with
+# NotImplementedError in decode.py plan(), so _get_decode_wrapper must build
+# the asym wrapper with use_tensor_cores=False (and backend="fa2").  Under
+# FULL-cudagraph capture the decode wrapper is planned on a pure-decode batch
+# that bypasses the prefill-population guard, so an unconditional True would
+# raise at boot.  Drive the unbound method with a fake self so the check runs
+# on CPU without a GPU workspace or a real FlashInfer wrapper.
+# ---------------------------------------------------------------------------
+
+
+def _capture_decode_wrapper(monkeypatch, *, is_asymmetric, is_nvfp4=False):
+    captured = {}
+
+    class _FakeDecodeWrapper:
+        def __init__(self, *args, use_tensor_cores=None, backend=None, **kwargs):
+            captured["use_tensor_cores"] = use_tensor_cores
+            captured["backend"] = backend
+
+    monkeypatch.setattr(fi, "BatchDecodeWithPagedKVCacheWrapper", _FakeDecodeWrapper)
+    monkeypatch.setattr(fi, "get_kv_cache_layout", lambda: "NHD")
+
+    fake_self = SimpleNamespace(
+        _decode_wrapper=None,
+        is_kvcache_nvfp4=is_nvfp4,
+        _is_asymmetric=is_asymmetric,
+        _get_workspace_buffer=lambda: torch.empty(0, dtype=torch.uint8),
+    )
+    fi.FlashInferMetadataBuilder._get_decode_wrapper(
+        fake_self, batch_size=1, use_cudagraph=False
+    )
+    return captured
+
+
+def test_decode_wrapper_asym_forces_cuda_cores(monkeypatch):
+    captured = _capture_decode_wrapper(monkeypatch, is_asymmetric=True)
+    assert captured["backend"] == "fa2"
+    # CUDA-core only: True would fail-close in FlashInfer decode.py plan().
+    assert captured["use_tensor_cores"] is False
+
+
+def test_decode_wrapper_symmetric_keeps_tensor_cores(monkeypatch):
+    captured = _capture_decode_wrapper(monkeypatch, is_asymmetric=False)
+    assert captured["backend"] == "auto"
+    assert captured["use_tensor_cores"] is True
