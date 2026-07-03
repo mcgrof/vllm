@@ -17,11 +17,14 @@ GPU required (importing the backend module does require the
 flashinfer package; skip otherwise).
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 pytest.importorskip("flashinfer")
 
+import vllm.v1.attention.backends.flashinfer as fi
 from vllm.v1.attention.backends.flashinfer import (
     _derive_4d_stride_order_from_5d,
     _is_asym_paged_kv_cache,
@@ -126,3 +129,88 @@ def test_prepare_symmetric_rejects_wrong_ndim(default_vllm_config):
     t = torch.zeros(4, 16, 8, 128)  # 4-D not allowed for symmetric
     with pytest.raises(AssertionError):
         _prepare_flashinfer_paged_kv_cache(t)
+
+
+# ---------------------------------------------------------------------------
+# Decode-wrapper backend/tensor-core selection (asym decode is SM90-gated).
+#
+# The asymmetric (DTypeK != DTypeV) decode dispatch depends on the GPU:
+#   * On SM90 (Hopper/H100) asym decode routes onto the tensor-core
+#     prefill-as-decode kernel — the same 16-bit fa2/fa3 family the prefill
+#     wrapper uses for asym, which loads fp8 V and dequantizes to 16-bit
+#     before the PV MMA.  Requires the FlashInfer decode.py guard-lift.
+#     => backend="auto", use_tensor_cores=True.
+#   * Off SM90 there is no tensor-core asym decode kernel, so it stays on the
+#     CUDA-core path.  FlashInfer fail-closes an asym cache + use_tensor_cores
+#     with NotImplementedError in decode.py plan(), so the wrapper must be
+#     built with use_tensor_cores=False and backend="fa2".
+#
+# The selection hinges on current_platform.is_device_capability(90), so the
+# test mocks it (default SM90=True) rather than depending on the host GPU.
+# Under FULL-cudagraph capture the decode wrapper is planned on a pure-decode
+# batch that bypasses the prefill-population guard; drive the unbound method
+# with a fake self so the check runs on CPU without a GPU workspace or a real
+# FlashInfer wrapper.
+# ---------------------------------------------------------------------------
+
+
+def _capture_decode_wrapper(
+    monkeypatch, *, is_asymmetric, is_nvfp4=False, is_sm90=True
+):
+    captured = {}
+
+    class _FakeDecodeWrapper:
+        def __init__(self, *args, use_tensor_cores=None, backend=None, **kwargs):
+            captured["use_tensor_cores"] = use_tensor_cores
+            captured["backend"] = backend
+
+    monkeypatch.setattr(fi, "BatchDecodeWithPagedKVCacheWrapper", _FakeDecodeWrapper)
+    monkeypatch.setattr(fi, "get_kv_cache_layout", lambda: "NHD")
+    # asym decode is SM90-gated: mock the capability probe so the test is
+    # independent of the host GPU (the H100 CI target would otherwise take the
+    # tensor-core branch for every case).
+    monkeypatch.setattr(
+        fi.current_platform,
+        "is_device_capability",
+        lambda cap: bool(is_sm90) and cap == 90,
+    )
+
+    fake_self = SimpleNamespace(
+        _decode_wrapper=None,
+        is_kvcache_nvfp4=is_nvfp4,
+        _is_asymmetric=is_asymmetric,
+        _get_workspace_buffer=lambda: torch.empty(0, dtype=torch.uint8),
+    )
+    fi.FlashInferMetadataBuilder._get_decode_wrapper(
+        fake_self, batch_size=1, use_cudagraph=False
+    )
+    return captured
+
+
+def test_decode_wrapper_asym_sm90_uses_tensor_cores(monkeypatch):
+    # On SM90 asym decode joins the tensor-core prefill-as-decode kernel.
+    captured = _capture_decode_wrapper(
+        monkeypatch, is_asymmetric=True, is_sm90=True
+    )
+    assert captured["backend"] == "auto"
+    assert captured["use_tensor_cores"] is True
+
+
+def test_decode_wrapper_asym_off_sm90_forces_cuda_cores(monkeypatch):
+    # Off SM90 there is no tensor-core asym decode kernel: stay CUDA-core.
+    # True would fail-close in FlashInfer decode.py plan().
+    captured = _capture_decode_wrapper(
+        monkeypatch, is_asymmetric=True, is_sm90=False
+    )
+    assert captured["backend"] == "fa2"
+    assert captured["use_tensor_cores"] is False
+
+
+def test_decode_wrapper_symmetric_keeps_tensor_cores(monkeypatch):
+    # Symmetric caches always use tensor cores regardless of SM version.
+    for is_sm90 in (True, False):
+        captured = _capture_decode_wrapper(
+            monkeypatch, is_asymmetric=False, is_sm90=is_sm90
+        )
+        assert captured["backend"] == "auto"
+        assert captured["use_tensor_cores"] is True
