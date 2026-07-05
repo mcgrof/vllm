@@ -765,6 +765,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         can_use_xqa_or_trtllm_gen_decode = can_use_trtllm_attention(
             self.num_qo_heads, self.num_kv_heads, is_prefill=False
         )
+        # Asymmetric K/V (DTypeK != DTypeV): the TRTLLM/XQA decode kernels do
+        # not support a mixed-dtype cache and fail loud in the TRTLLM decode
+        # path. Force the FlashInfer CUDA-core decode path, mirroring the decode
+        # wrapper's backend="fa2" / use_tensor_cores=False selection.
+        if self._is_asymmetric:
+            can_use_xqa_or_trtllm_gen_decode = False
         # Page sizes >= 128 require the trtllm-gen GQA/MQA path (guaranteed by
         # get_supported_kernel_block_sizes).
         assert self.page_size <= 64 or (
