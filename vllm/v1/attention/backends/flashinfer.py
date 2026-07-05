@@ -982,21 +982,14 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             else:
                 # NVFP4 KV cache requires the trtllm-gen backend inside
                 # the wrapper; fa2/fa3 do not support nvfp4.
-                # Asymmetric K/V: FlashInfer's mixed-dtype (DTypeK !=
-                # DTypeV) kernels live on the FA2 path; the SM90
-                # (Hopper) prefill kernel auto-selected on H100 does
-                # not support a mixed-dtype cache and additionally
-                # requires equal K/V page strides (batch_prefill_sm90.cu:
-                # "K and V must have same page stride for sparse
-                # attention").  Force the FA2 backend in asym mode, at
-                # a ~10-20% prefill throughput cost on H100.  Symmetric
-                # callers keep backend="auto" and continue to get SM90.
-                if self.is_kvcache_nvfp4:
-                    backend = "trtllm-gen"
-                elif self._is_asymmetric:
-                    backend = "fa2"
-                else:
-                    backend = "auto"
+                # Asymmetric K/V (DTypeK != DTypeV): FlashInfer's mixed-dtype
+                # prefill kernels now cover both the FA2 path (SM80/89) and the
+                # FA3 SM90/Hopper path, and the region-split reshape lays K and
+                # V out with equal page strides (satisfying
+                # batch_prefill_sm90.cu's "K and V must have same page stride"
+                # assert).  So asym uses backend="auto" like symmetric callers
+                # and gets the faster native SM90 kernel on H100.
+                backend = "trtllm-gen" if self.is_kvcache_nvfp4 else "auto"
                 self._prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
                     self._get_workspace_buffer(),
                     get_kv_cache_layout(),
