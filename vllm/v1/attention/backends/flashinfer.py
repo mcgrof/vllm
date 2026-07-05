@@ -1522,7 +1522,16 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     # FP8 V tensor. Empty when symmetric.
                     **self._asym_plan_kwargs,
                     o_data_type=o_dtype,
-                    fixed_split_size=self.decode_fixed_split_size,
+                    # Asymmetric K/V decode: pass fixed_split_size=None. Off
+                    # SM90 it runs on the CUDA-core kernel, which rejects
+                    # fixed_split_size (a tensor-core-only feature). On SM90 it
+                    # runs on the tensor-core prefill-as-decode kernel, which
+                    # does support split-KV, but we keep it off here to match
+                    # the validated dispatch (enabling it is a possible future
+                    # optimization). See _get_decode_wrapper.
+                    fixed_split_size=(
+                        None if self._is_asymmetric else self.decode_fixed_split_size
+                    ),
                     disable_split_kv=self.disable_split_kv,
                 )
                 attn_metadata.decode = FIDecode(wrapper=decode_wrapper)
