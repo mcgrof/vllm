@@ -1353,18 +1353,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # Step 3: Handle prefill and decode pathways case by case
         ## PREFILL PATHWAY
         if num_prefills > 0:
-            # Asymmetric K/V is decode-only for now: FlashInfer's paged
-            # prefill kernels use a unified K/V dtype (the prefill plan()
-            # has no k_data_type/v_data_type), so an FP16-K / FP8-V cache
-            # cannot be prefilled until FlashInfer's asymmetric prefill
-            # (DTypeK/DTypeV template split) lands. Fail loud rather than
-            # mis-plan a symmetric kernel over a mixed-dtype cache.
-            if self._is_asymmetric:
-                raise NotImplementedError(
-                    "Asymmetric K/V (mixed K/V dtype) is currently supported "
-                    "on the FlashInfer decode path only; paged prefill is "
-                    "pending FlashInfer's asymmetric prefill kernels."
-                )
             # Slices for shared prefill metadata
             prefill_start = num_decodes
             qo_indptr_prefill_cpu = (
@@ -1462,6 +1450,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         logits_soft_cap=self.logits_soft_cap,
                         q_data_type=self.q_data_type_prefill,
                         kv_data_type=self.k_cache_dtype,
+                        # Asymmetric K/V: per-side dtypes make the FlashInfer
+                        # prefill plan pick the asym kernel (DTypeK != DTypeV)
+                        # and let the run-time dtype check in
+                        # prefill_wrapper.run() accept the FP8 V tensor.
+                        # Empty dict when symmetric, so symmetric callers are
+                        # unchanged.  Mirrors the decode plan() call below.
+                        **self._asym_plan_kwargs,
                         o_data_type=o_dtype,
                         fixed_split_size=self.prefill_fixed_split_size,
                         disable_split_kv=self.disable_split_kv,
