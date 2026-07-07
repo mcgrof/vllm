@@ -40,7 +40,10 @@ from vllm.config.cache import CacheConfig, cache_dtype_k, is_asymmetric_kv
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
-from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
+from vllm.distributed.kv_transfer.kv_connector.utils import (
+    copy_kv_blocks,
+    verify_connector_supports_kv_caches,
+)
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
@@ -7387,6 +7390,7 @@ class GPUModelRunner(
                     self.cross_layers_kv_cache, self.cross_layers_attn_backend
                 )
             else:
+                verify_connector_supports_kv_caches(kv_transfer_group, kv_caches)
                 kv_transfer_group.register_kv_caches(kv_caches)
             kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
 

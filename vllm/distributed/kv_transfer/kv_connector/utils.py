@@ -35,6 +35,48 @@ EngineId = str
 BlockIds = tuple[list[int], ...] | list[list[int]]
 
 
+def kv_caches_contain_asymmetric_kv(kv_caches: dict[str, Any]) -> bool:
+    """True if any per-layer value is an asymmetric ``(k_cache, v_cache)`` tuple.
+
+    Asymmetric K/V (bf16 K + fp8 V) is the only case where
+    attn_utils._reshape_kv_cache stores a 2-tuple of tensors as the per-layer
+    value. A ``list[torch.Tensor]`` (Mamba/hybrid state) is deliberately NOT
+    treated as asymmetric.
+    """
+    return any(
+        isinstance(v, tuple)
+        and len(v) == 2
+        and all(isinstance(t, torch.Tensor) for t in v)
+        for v in kv_caches.values()
+    )
+
+
+def verify_connector_supports_kv_caches(
+    connector: Any, kv_caches: dict[str, Any]
+) -> None:
+    """Fail loud before a connector's ``register_kv_caches`` is handed an
+    asymmetric ``(k_cache, v_cache)`` tuple it did not opt into.
+
+    This is a register-time backstop for
+    ``VllmConfig._verify_kv_transfer_compat``: it covers connectors constructed
+    outside config validation (tests, embeddings) and every direct register
+    call site. It matches the ``isinstance(kv_cache, tuple)`` fail-loud style of
+    the attention backends' asymmetric-K/V guards (see flash_attn / triton_attn).
+    """
+    if not kv_caches_contain_asymmetric_kv(kv_caches):
+        return
+    if getattr(connector, "runtime_supports_asymmetric_kv", False) is True:
+        return
+    raise RuntimeError(
+        f"{type(connector).__name__}.register_kv_caches received an asymmetric "
+        "(k_cache, v_cache) KV cache tuple (bf16 K + fp8 V), but this connector "
+        "does not support asymmetric K/V. It assumes a single tensor per layer "
+        "and would crash or corrupt the cache. This should have been "
+        "rejected by VllmConfig._verify_kv_transfer_compat; use a symmetric "
+        "--kv-cache-dtype or disable the KV connector."
+    )
+
+
 def get_kv_connector_cache_layout():
     # NOTE (NickLucche) When running disaggregated PD with NIXL, HND layout is
     # used for faster transfer.

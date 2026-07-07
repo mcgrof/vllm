@@ -43,7 +43,7 @@ The class provides the following primitives:
 import enum
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import torch
 
@@ -173,6 +173,29 @@ class KVConnectorBase_V1(ABC):
     Base class for KV connectors.
     """
 
+    # Class-level admission flag: True ONLY if this connector can consume the
+    # asymmetric ``(k_cache, v_cache)`` tuple that attn_utils._reshape_kv_cache
+    # stores as a per-layer ``register_kv_caches`` value for asymmetric K/V
+    # (bf16 K + fp8 V). False is the safe default every in-tree connector
+    # inherits, so asymmetric K/V is rejected at config-verify time
+    # (VllmConfig._verify_kv_transfer_compat, via
+    # KVConnectorFactory.supports_asymmetric_kv_config) before a tuple can reach
+    # a worker-side register path that assumes one tensor per layer. Setting
+    # this True is a promise that ``register_kv_caches`` accepts a tuple(K, V)
+    # value; it does not, by itself, define a mixed-dtype transfer wire shape.
+    supports_asymmetric_kv: ClassVar[bool] = False
+
+    @property
+    def runtime_supports_asymmetric_kv(self) -> bool:
+        """Instance-level asymmetric-KV admission, read by register-time guards.
+
+        Defaults to the class ``supports_asymmetric_kv`` flag. MultiConnector
+        overrides this to AND its children, so a tuple is admitted only when
+        every child connector accepts it. Kept distinct from the class flag so
+        a class-level read never returns a truthy descriptor object.
+        """
+        return type(self).supports_asymmetric_kv is True
+
     @property
     def prefer_cross_layer_blocks(self) -> bool:
         """
@@ -253,8 +276,21 @@ class KVConnectorBase_V1(ABC):
         Initialize with the KV caches. Useful for pre-registering the
         KV Caches in the KVConnector (e.g. for NIXL).
 
+        The ``dict[str, torch.Tensor]`` annotation is kept for backward
+        compatibility with every existing connector override, but each value
+        may at runtime be one of:
+          * a single ``torch.Tensor`` -- the common symmetric per-layer cache;
+          * a ``list[torch.Tensor]`` -- per-state tensors for Mamba/hybrid
+            layers (see attn_utils._reshape_kv_cache);
+          * a ``tuple(k_cache, v_cache)`` -- an *asymmetric* K/V layer whose K
+            and V planes use different dtypes (bf16 K + fp8 V). A connector
+            receives this shape ONLY if it sets ``supports_asymmetric_kv =
+            True``; the default is False and vLLM rejects unsupported
+            connector configs before worker startup, so most connectors never
+            see a tuple.
+
         Args:
-            kv_caches: dictionary of layer names, kv cache
+            kv_caches: dictionary of layer names -> kv cache value.
         """
         return
 

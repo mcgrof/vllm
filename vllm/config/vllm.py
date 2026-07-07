@@ -829,6 +829,47 @@ class VllmConfig:
         ):
             return
 
+        # Asymmetric K/V (K and V stored at different dtypes) hands each layer a
+        # (k_cache, v_cache) tuple as its register_kv_caches value. KV connectors
+        # iterate kv_caches.values() as a single tensor per layer
+        # (.device / .untyped_storage() / CudaIPCWrapper), so a tuple crashes
+        # registration; a connector that blindly re-viewed the bytes would
+        # reinterpret bf16 K as fp8 and silently corrupt the cache. Reject the
+        # combination unless the connector opts in via supports_asymmetric_kv.
+        # This runs before KV allocation / model load / worker spawn, and covers
+        # both the ActiveKVConnector and the direct register_kv_caches paths.
+        if self.cache_config is not None:
+            from vllm.config.cache import is_asymmetric_kv
+            from vllm.distributed.kv_transfer.kv_connector.factory import (
+                KVConnectorFactory,
+            )
+
+            # A cache materializes the asymmetric (k_cache, v_cache) tuple when
+            # kv_cache_dtype parses to a differing (K, V) pair, OR the V-side
+            # dtype is an fp8 string -- the exact condition attn_utils uses to
+            # inject v_dtype and split the tuple (see _reshape_kv_cache). Check
+            # both so the config-time error fires wherever a tuple would be
+            # built, not only on the tuple-typed cache_dtype path.
+            v_cache_dtype = getattr(self.cache_config, "v_cache_dtype", None)
+            cache_is_asymmetric = is_asymmetric_kv(self.cache_config.cache_dtype) or (
+                bool(v_cache_dtype) and v_cache_dtype.startswith("fp8")
+            )
+            if (
+                cache_is_asymmetric
+                and not KVConnectorFactory.supports_asymmetric_kv_config(
+                    self.kv_transfer_config
+                )
+            ):
+                raise ValueError(
+                    f"KV connector {self.kv_transfer_config.kv_connector} does "
+                    "not support asymmetric K/V (kv_cache_dtype="
+                    f"{self.cache_config.cache_dtype!r}, v_cache_dtype="
+                    f"{v_cache_dtype!r}). Asymmetric K/V hands the connector a "
+                    "(k_cache, v_cache) tuple with mixed dtypes that the "
+                    "KV-transfer path cannot serialize. Use a symmetric "
+                    "--kv-cache-dtype, or disable the KV connector."
+                )
+
         # PyTorch's expandable_segments allocator uses CUDA VMM, which can
         # remap a virtual address range to different physical pages over the
         # engine's lifetime. KV connectors that pin KV cache memory (e.g.

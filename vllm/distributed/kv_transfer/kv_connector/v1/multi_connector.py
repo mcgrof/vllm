@@ -166,6 +166,24 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
                 return False
         return True
 
+    @classmethod
+    def all_children_support_asymmetric_kv(
+        cls, kv_transfer_config: "KVTransferConfig"
+    ) -> bool:
+        """True only if every configured child connector admits asymmetric K/V."""
+        connectors_config = kv_transfer_config.kv_connector_extra_config.get(
+            "connectors", []
+        )
+        if not connectors_config:
+            return False
+        for conn_config in connectors_config:
+            child_config = KVTransferConfig(
+                **{"engine_id": kv_transfer_config.engine_id, **conn_config}
+            )
+            if not KVConnectorFactory.supports_asymmetric_kv_config(child_config):
+                return False
+        return True
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -208,6 +226,12 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         if not self._connectors:
             return False
         return all(c.prefer_cross_layer_blocks for c in self._connectors)
+
+    @property
+    def runtime_supports_asymmetric_kv(self) -> bool:
+        if not self._connectors:
+            return False
+        return all(c.runtime_supports_asymmetric_kv for c in self._connectors)
 
     @classmethod
     def _get_connector_classes_and_configs(

@@ -144,6 +144,34 @@ class KVConnectorFactory:
 
         return MultiConnector.all_children_support_hma(kv_transfer_config)
 
+    @staticmethod
+    def _class_supports_asymmetric_kv(connector_cls: type) -> bool:
+        # Exact ``is True`` only. A connector that overrides
+        # ``supports_asymmetric_kv`` with a @property/descriptor would otherwise
+        # read as the (truthy) descriptor object here and fail *open*; the class
+        # admission flag must be a plain ``ClassVar[bool]`` set to True.
+        return getattr(connector_cls, "supports_asymmetric_kv", False) is True
+
+    @classmethod
+    def supports_asymmetric_kv_config(
+        cls, kv_transfer_config: "KVTransferConfig"
+    ) -> bool:
+        """Return whether this KV transfer config can consume an asymmetric
+        ``(k_cache, v_cache)`` tuple in register_kv_caches.
+
+        MultiConnector is a special case: effective support is the AND of every
+        configured child connector.
+        """
+        connector_cls = cls.get_connector_class(kv_transfer_config)
+        if kv_transfer_config.kv_connector != "MultiConnector":
+            return cls._class_supports_asymmetric_kv(connector_cls)
+
+        from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
+            MultiConnector,
+        )
+
+        return MultiConnector.all_children_support_asymmetric_kv(kv_transfer_config)
+
 
 # Register various connectors here.
 # The registration should not be done in each individual file, as we want to

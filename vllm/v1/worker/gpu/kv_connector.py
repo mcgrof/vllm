@@ -10,7 +10,10 @@ from vllm.distributed.kv_transfer import (
     has_kv_transfer_group,
     kv_transfer_state,
 )
-from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
+from vllm.distributed.kv_transfer.kv_connector.utils import (
+    copy_kv_blocks,
+    verify_connector_supports_kv_caches,
+)
 from vllm.forward_context import (
     get_forward_context,
     is_forward_context_available,
@@ -53,6 +56,7 @@ class ActiveKVConnector(KVConnector):
         # Register kv caches with KV Connector if applicable.
         # TODO: support cross_layers_kv_cache
         # (see https://github.com/vllm-project/vllm/pull/27743)
+        verify_connector_supports_kv_caches(self.kv_connector, kv_caches_dict)
         self.kv_connector.register_kv_caches(kv_caches_dict)
         self.kv_connector.set_host_xfer_buffer_ops(copy_kv_blocks)
 
