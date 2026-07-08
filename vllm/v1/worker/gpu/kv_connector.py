@@ -12,6 +12,8 @@ from vllm.distributed.kv_transfer import (
 )
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     copy_kv_blocks,
+    split_asymmetric_kv_planes,
+    verify_asymmetric_kv_unit_scale,
     verify_connector_supports_kv_caches,
 )
 from vllm.forward_context import (
@@ -56,8 +58,27 @@ class ActiveKVConnector(KVConnector):
         # Register kv caches with KV Connector if applicable.
         # TODO: support cross_layers_kv_cache
         # (see https://github.com/vllm-project/vllm/pull/27743)
-        verify_connector_supports_kv_caches(self.kv_connector, kv_caches_dict)
-        self.kv_connector.register_kv_caches(kv_caches_dict)
+        #
+        # Attention was already bound to the per-layer (k_cache, v_cache) tuples
+        # in init_kv_cache (via bind_kv_cache), so kv_caches_dict is untouched
+        # here. A connector that opts into asymmetric K/V instead receives a
+        # fresh, register-scoped dict in which each asymmetric tuple is split
+        # into two single-dtype plane entries. That split dict is never bound,
+        # stored on self, or returned, so attention / prefix-cache hashing /
+        # KVCacheConfig accounting never observe the split. A connector that has
+        # NOT opted in receives the original tuple dict, so
+        # verify_connector_supports_kv_caches fails loud before register (the
+        # fail-closed contract is preserved).
+        if getattr(self.kv_connector, "runtime_supports_asymmetric_kv", False) is True:
+            # Byte-through fp8 V offload is only bit-exact at a unit V scale;
+            # check the original tuple dict before the split collapses it into
+            # single-dtype plane entries.
+            verify_asymmetric_kv_unit_scale(self.vllm_config, kv_caches_dict)
+            connector_kv_caches = split_asymmetric_kv_planes(kv_caches_dict)
+        else:
+            connector_kv_caches = kv_caches_dict
+        verify_connector_supports_kv_caches(self.kv_connector, connector_kv_caches)
+        self.kv_connector.register_kv_caches(connector_kv_caches)
         self.kv_connector.set_host_xfer_buffer_ops(copy_kv_blocks)
 
         self._disabled = False

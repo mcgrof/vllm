@@ -4,6 +4,7 @@
 KV cache helper for store.
 """
 
+import enum
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -75,6 +76,167 @@ def verify_connector_supports_kv_caches(
         "rejected by VllmConfig._verify_kv_transfer_compat; use a symmetric "
         "--kv-cache-dtype or disable the KV connector."
     )
+
+
+def verify_asymmetric_kv_unit_scale(
+    vllm_config: VllmConfig, kv_caches: dict[str, Any]
+) -> None:
+    """Fail loud before offloading an asymmetric K/V layer at a non-unit V scale.
+
+    A connector that offloads the fp8 V cache byte-through copies the raw e4m3
+    codes with no stored scale, so the codes only mean the same values in
+    another process when the per-layer V scale is exactly 1.0. A non-unit scale
+    would make a cross-process reload silently wrong. The two ways a V scale
+    becomes non-unit are the deprecated ``--calculate-kv-scales`` (which derives
+    a scale from the activations at runtime) and a checkpoint-provided V scale;
+    both are refused here for the asymmetric K/V path.
+
+    A no-op when no layer is asymmetric.
+    """
+    asym_layer_names = [
+        name
+        for name, v in kv_caches.items()
+        if isinstance(v, tuple)
+        and len(v) == 2
+        and all(isinstance(t, torch.Tensor) for t in v)
+    ]
+    if not asym_layer_names:
+        return
+
+    if vllm_config.cache_config.calculate_kv_scales:
+        raise RuntimeError(
+            "Asymmetric K/V (bf16 K + fp8 V) offload requires a unit V scale, "
+            "but --calculate-kv-scales is enabled, which derives a non-unit "
+            "per-layer V scale from the activations at runtime. The byte-through "
+            "fp8 V offload copies raw e4m3 codes with no stored scale and would "
+            "reload the wrong values. Disable --calculate-kv-scales for the "
+            "asymmetric K/V path."
+        )
+
+    layers = get_layers_from_vllm_config(vllm_config, AttentionLayerBase)
+    for name in asym_layer_names:
+        layer = layers.get(name)
+        if layer is None:
+            continue
+        # ``_v_scale_float`` is the host-side float copy of the per-layer V
+        # scale (default 1.0). A missing attribute means no scale was ever set,
+        # which is unit.
+        v_scale = getattr(layer, "_v_scale_float", 1.0)
+        if v_scale != 1.0:
+            raise RuntimeError(
+                f"Asymmetric K/V layer {name!r} has a non-unit V scale "
+                f"({v_scale}); the byte-through fp8 V offload copies raw e4m3 "
+                "codes with no stored scale and requires the per-layer V scale "
+                "to be exactly 1.0. A non-unit scale comes from "
+                "--calculate-kv-scales or a checkpoint-provided V scale, "
+                "neither of which is supported on this path."
+            )
+
+
+# Reserved separator between a layer name and its asymmetric-KV plane suffix.
+# vLLM module-path layer names use only ``[A-Za-z0-9_.]`` (dots/digits/letters/
+# underscores), so a colon-bearing token cannot occur inside one; ``asym_plane_key``
+# validates this at encode time, so a collision fails loud at register rather than
+# silently mislabelling a plane.
+_ASYM_PLANE_DELIMITER = "::kv_plane::"
+
+
+class KVPlane(enum.Enum):
+    """The plane of an asymmetric ``(k_cache, v_cache)`` KV-cache layer.
+
+    An asymmetric layer stores keys and values at different dtypes (bf16 K,
+    fp8 V), so a KV connector that opts into asymmetric K/V receives the two
+    planes as separate single-dtype entries rather than one tensor.
+    """
+
+    K = "k"
+    V = "v"
+
+
+def asym_plane_key(layer_name: str, plane: KVPlane) -> str:
+    """Build the connector-facing key for one plane of an asymmetric-KV layer.
+
+    Args:
+        layer_name: The original per-layer key (a vLLM module path).
+        plane: Which plane (K or V) the returned key addresses.
+
+    Returns:
+        ``f"{layer_name}{_ASYM_PLANE_DELIMITER}{plane.value}"``.
+
+    Raises:
+        ValueError: If ``layer_name`` already contains the reserved plane
+            delimiter, which would make the encoding ambiguous.
+    """
+    if _ASYM_PLANE_DELIMITER in layer_name:
+        raise ValueError(
+            f"Layer name {layer_name!r} contains the reserved asymmetric-KV "
+            f"plane delimiter {_ASYM_PLANE_DELIMITER!r}"
+        )
+    return f"{layer_name}{_ASYM_PLANE_DELIMITER}{plane.value}"
+
+
+def parse_asym_plane_key(key: str) -> tuple[str, KVPlane] | None:
+    """Decode a plane key produced by :func:`asym_plane_key`.
+
+    Args:
+        key: A connector-facing key that may or may not be a plane key.
+
+    Returns:
+        ``(layer_name, plane)`` if ``key`` is a plane key, otherwise ``None``
+        for a plain (non-asymmetric) key.
+
+    Raises:
+        ValueError: If ``key`` carries the plane delimiter but its suffix is
+            not a valid :class:`KVPlane` value.
+    """
+    if _ASYM_PLANE_DELIMITER not in key:
+        return None
+    layer_name, _, suffix = key.rpartition(_ASYM_PLANE_DELIMITER)
+    try:
+        return layer_name, KVPlane(suffix)
+    except ValueError:
+        raise ValueError(
+            f"Malformed asymmetric-KV plane key {key!r}: suffix {suffix!r} is "
+            "not a valid plane"
+        ) from None
+
+
+def split_asymmetric_kv_planes(kv_caches: dict[str, Any]) -> dict[str, Any]:
+    """Split asymmetric ``(k_cache, v_cache)`` tuples into single-dtype planes.
+
+    A connector that opts into asymmetric K/V (``supports_asymmetric_kv``)
+    cannot consume the ``(k_cache, v_cache)`` tuple that ``_reshape_kv_cache``
+    stores per layer, because its transfer path assumes one dtype per entry.
+    This returns a fresh dict in which every asymmetric layer is replaced by two
+    single-dtype plane entries keyed via :func:`asym_plane_key`; every other
+    value (a single tensor, or a Mamba/hybrid ``list[Tensor]``, or a shared
+    alias) passes through by identity under its original key.
+
+    The tuple-detection predicate is identical to
+    :func:`kv_caches_contain_asymmetric_kv`, so the splitter and the register
+    guard agree on exactly which values are asymmetric. The input is not
+    mutated: attention keeps using the original tuple-valued dict.
+
+    Args:
+        kv_caches: The per-layer KV cache dict handed to ``register_kv_caches``.
+
+    Returns:
+        A new dict with asymmetric layers expanded into ``::k``/``::v`` plane
+        entries and all other entries preserved by identity.
+    """
+    split: dict[str, Any] = {}
+    for layer_name, value in kv_caches.items():
+        if (
+            isinstance(value, tuple)
+            and len(value) == 2
+            and all(isinstance(t, torch.Tensor) for t in value)
+        ):
+            k_cache, v_cache = value
+            split[asym_plane_key(layer_name, KVPlane.K)] = k_cache
+            split[asym_plane_key(layer_name, KVPlane.V)] = v_cache
+        else:
+            split[layer_name] = value
+    return split
 
 
 def get_kv_connector_cache_layout():
