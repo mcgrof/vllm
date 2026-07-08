@@ -170,7 +170,14 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
     def all_children_support_asymmetric_kv(
         cls, kv_transfer_config: "KVTransferConfig"
     ) -> bool:
-        """True only if every configured child connector admits asymmetric K/V."""
+        """True only if every configured child connector is asymmetric-KV capable.
+
+        The ``asymmetric_kv`` opt-in is a single top-level deployment decision
+        checked once on the MultiConnector config (in
+        ``supports_asymmetric_kv_config``); children only need to *declare the
+        capability*, so this checks the child class flag rather than re-running
+        the opt-in gate per child.
+        """
         connectors_config = kv_transfer_config.kv_connector_extra_config.get(
             "connectors", []
         )
@@ -180,7 +187,8 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
             child_config = KVTransferConfig(
                 **{"engine_id": kv_transfer_config.engine_id, **conn_config}
             )
-            if not KVConnectorFactory.supports_asymmetric_kv_config(child_config):
+            child_cls = KVConnectorFactory.get_connector_class(child_config)
+            if not KVConnectorFactory._class_supports_asymmetric_kv(child_cls):
                 return False
         return True
 

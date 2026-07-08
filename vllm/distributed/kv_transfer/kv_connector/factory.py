@@ -159,18 +159,47 @@ class KVConnectorFactory:
         """Return whether this KV transfer config can consume an asymmetric
         ``(k_cache, v_cache)`` tuple in register_kv_caches.
 
-        MultiConnector is a special case: effective support is the AND of every
+        Asymmetric-KV (bf16 K + fp8 V) offload is a workload-dependent perf
+        trade-off: byte-through fp8-V halves the V transfer/store bytes, but each
+        layer offloads as two single-dtype transfer groups with a reload re-pair,
+        and fp8-V decode runs ~0.8x bf16. It is therefore OFF by default and
+        enabled per deployment via the ``asymmetric_kv`` opt-in in
+        ``kv_connector_extra_config``, even for a connector that declares the
+        capability. Without the opt-in this returns False, so an asymmetric cache
+        is rejected fail-closed at config-verify (there is deliberately no
+        dequantize-to-bf16 fallback: that would materialize a bf16 V buffer and
+        destroy the capacity win the feature exists for).
+
+        MultiConnector is a special case: capability is the AND of every
         configured child connector.
         """
+        opt_in = bool(
+            (kv_transfer_config.kv_connector_extra_config or {}).get(
+                "asymmetric_kv", False
+            )
+        )
+        if not opt_in:
+            return False
+
         connector_cls = cls.get_connector_class(kv_transfer_config)
         if kv_transfer_config.kv_connector != "MultiConnector":
-            return cls._class_supports_asymmetric_kv(connector_cls)
+            supported = cls._class_supports_asymmetric_kv(connector_cls)
+        else:
+            from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
+                MultiConnector,
+            )
 
-        from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
-            MultiConnector,
-        )
-
-        return MultiConnector.all_children_support_asymmetric_kv(kv_transfer_config)
+            supported = MultiConnector.all_children_support_asymmetric_kv(
+                kv_transfer_config
+            )
+        if supported:
+            logger.warning_once(
+                "Asymmetric-KV offload enabled (asymmetric_kv=true): byte-through "
+                "fp8-V halves V transfer/store bytes but splits each layer into two "
+                "transfer groups with a reload re-pair, and fp8-V decode runs ~0.8x "
+                "bf16. Benefit is workload-dependent."
+            )
+        return supported
 
 
 # Register various connectors here.

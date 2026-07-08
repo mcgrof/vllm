@@ -61,18 +61,44 @@ def test_class_check_property_override_fails_closed():
     assert KVConnectorFactory._class_supports_asymmetric_kv(_AsymProp) is False
 
 
-def test_supports_config_reads_class_flag_for_non_multi():
-    class _AsymOK(KVConnectorBase_V1):
-        supports_asymmetric_kv = True
+class _AsymOK(KVConnectorBase_V1):
+    supports_asymmetric_kv = True
 
+
+def _ktc(kv_connector="Whatever", asymmetric_kv=None):
+    extra: dict = {}
+    if asymmetric_kv is not None:
+        extra["asymmetric_kv"] = asymmetric_kv
+    return SimpleNamespace(kv_connector=kv_connector, kv_connector_extra_config=extra)
+
+
+def test_supports_config_reads_class_flag_for_non_multi():
+    # A capable connector is admitted only once the deployment opts in.
     class _Default(KVConnectorBase_V1):
         pass
 
-    ktc = SimpleNamespace(kv_connector="Whatever")
+    ktc = _ktc(asymmetric_kv=True)
     with patch.object(KVConnectorFactory, "get_connector_class", return_value=_AsymOK):
         assert KVConnectorFactory.supports_asymmetric_kv_config(ktc) is True
     with patch.object(KVConnectorFactory, "get_connector_class", return_value=_Default):
         assert KVConnectorFactory.supports_asymmetric_kv_config(ktc) is False
+
+
+def test_opt_in_required_even_for_capable_connector():
+    # Without the asymmetric_kv opt-in the gate is False (off by default), so an
+    # asymmetric cache is rejected fail-closed even though the connector supports it.
+    with patch.object(KVConnectorFactory, "get_connector_class", return_value=_AsymOK):
+        assert KVConnectorFactory.supports_asymmetric_kv_config(_ktc()) is False
+        assert (
+            KVConnectorFactory.supports_asymmetric_kv_config(
+                _ktc(asymmetric_kv=False)
+            )
+            is False
+        )
+        assert (
+            KVConnectorFactory.supports_asymmetric_kv_config(_ktc(asymmetric_kv=True))
+            is True
+        )
 
 
 def test_multiconnector_empty_children_is_false():
