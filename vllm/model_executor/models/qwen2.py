@@ -29,6 +29,8 @@ from collections.abc import Iterable
 from itertools import islice
 from typing import Any
 
+import os
+
 import torch
 from torch import nn
 from transformers import Qwen2Config
@@ -155,6 +157,12 @@ class Qwen2Attention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.dual_chunk_attention_config = dual_chunk_attention_config
         self.qk_norm = qk_norm
+        # Pre-bias FP8 K caching: store RoPE(x W_k) in the cache and
+        # let the attention kernel restore the rotated bias.  Only
+        # valid without qk_norm (the norm is nonlinear in k).
+        self.prebias_k = (
+            os.environ.get("VLLM_PREBIAS_K") == "1" and not qk_norm
+        )
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -230,6 +238,13 @@ class Qwen2Attention(nn.Module):
             q = q.view(total_tokens, self.q_size)
             k = k.view(total_tokens, self.kv_size)
 
+        if self.prebias_k and self.qkv_proj.bias is not None:
+            k_bias = self.qkv_proj.bias[
+                self.q_size : self.q_size + self.kv_size
+            ]
+            k = k - k_bias
+            if not hasattr(self.attn, "_prebias_k_bias"):
+                self.attn._prebias_k_bias = k_bias.detach()
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)

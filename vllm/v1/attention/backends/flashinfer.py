@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlashInfer."""
 
+import os
+
 from dataclasses import dataclass
 from functools import partial
 from typing import ClassVar
@@ -72,6 +74,40 @@ FP8_DTYPE = current_platform.fp8_dtype()
 FP4_DTYPE = torch.uint8
 
 logger = init_logger(__name__)
+
+# Pre-bias FP8 K caching: when enabled, model layers subtract the
+# key-projection bias before rotary so the cache stores the residual,
+# and the FlashInfer kernels reconstruct the rotated bias from
+# per-head coefficients derived here.  See VLLM_PREBIAS_K.
+PREBIAS_K_ENABLED = os.environ.get("VLLM_PREBIAS_K") == "1"
+
+
+_PREBIAS_ROPE_THETA = [10000.0]
+
+
+def _prebias_coeff_for_layer(layer, num_kv_heads: int, head_dim: int):
+    cached = getattr(layer, "_prebias_coeff_cache", False)
+    if cached is not False:
+        return cached
+    bias = getattr(layer, "_prebias_k_bias", None)
+    if bias is None:
+        layer._prebias_coeff_cache = None
+        return None
+    b = bias.detach().float().reshape(num_kv_heads, head_dim)
+    half = head_dim // 2
+    c = torch.zeros(
+        num_kv_heads, head_dim, 2, dtype=torch.float32, device=b.device
+    )
+    c[:, :half, 0] = b[:, :half]
+    c[:, :half, 1] = -b[:, half:]
+    c[:, half:, 0] = b[:, half:]
+    c[:, half:, 1] = b[:, :half]
+    k_scale = getattr(layer, "_k_scale_float", 1.0) or 1.0
+    coeff = (c / k_scale).contiguous()
+    layer._prebias_coeff_cache = coeff
+    return coeff
+
+
 
 trtllm_gen_workspace_buffer = None
 
@@ -534,6 +570,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.cache_config = vllm_config.cache_config
         self.model_config = vllm_config.model_config
+        # the pre-bias kernel reconstructs the rotated key bias and
+        # must use the model's actual rotary base, not a default
+        self.prebias_rope_theta = float(
+            getattr(self.model_config.hf_config, "rope_theta", 10000.0)
+        )
+        _PREBIAS_ROPE_THETA[0] = self.prebias_rope_theta
         self.attention_config = vllm_config.attention_config
         self._workspace_buffer = None
         self._prefill_wrapper: (
@@ -881,7 +923,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # - Cascade attention (distinct mode)
         # - Prefill (FI native or TRTLLM)
         # - Decode (FI native or TRTLLM)
-        use_cascade = common_prefix_len > 0
+        use_cascade = common_prefix_len > 0 and not PREBIAS_K_ENABLED
         uses_spec_reorder = self.reorder_batch_threshold > 1
         prefill_use_trtllm = use_trtllm_attention(
             self.num_qo_heads,
@@ -1138,6 +1180,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         o_data_type=self.model_config.dtype,
                         fixed_split_size=self.prefill_fixed_split_size,
                         disable_split_kv=self.disable_split_kv,
+                        use_prebias=PREBIAS_K_ENABLED,
+                        rope_scale=1.0,
+                        rope_theta=_PREBIAS_ROPE_THETA[0],
                     )
                 attn_metadata.prefill = FIPrefill(wrapper=prefill_wrapper)
 
@@ -1190,11 +1235,16 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     o_data_type=self.model_config.dtype,
                     fixed_split_size=self.decode_fixed_split_size,
                     disable_split_kv=self.disable_split_kv,
+                    rope_scale=1.0,
+                    rope_theta=self.prebias_rope_theta,
                 )
                 attn_metadata.decode = FIDecode(wrapper=decode_wrapper)
         return attn_metadata
 
     def use_cascade_attention(self, *args, **kwargs) -> bool:
+        if PREBIAS_K_ENABLED:
+            # the cascade wrapper has no coefficient restore path
+            return False
         if self.kv_cache_spec.dtype != self.vllm_config.model_config.dtype:
             # TODO: The cascade wrapper currently does not support setting
             # kv cache dtype to something different from query dtype.
@@ -1483,6 +1533,11 @@ class FlashInferImpl(AttentionImpl):
                         k_scale=layer._k_scale_float,
                         v_scale=layer._v_scale_float,
                         out=output[num_decode_tokens:],
+                        prebias_coeff=_prebias_coeff_for_layer(
+                            layer, self.num_kv_heads, self.head_size
+                        )
+                        if PREBIAS_K_ENABLED
+                        else None,
                     )
             else:
                 assert isinstance(attn_metadata.prefill, TRTLLMPrefill)
@@ -1609,6 +1664,11 @@ class FlashInferImpl(AttentionImpl):
                         k_scale=layer._k_scale_float,
                         v_scale=layer._v_scale_float,
                         out=output[:num_decode_tokens],
+                        prebias_coeff=_prebias_coeff_for_layer(
+                            layer, self.num_kv_heads, self.head_size
+                        )
+                        if PREBIAS_K_ENABLED
+                        else None,
                     )
             else:
                 # decode_query may be non-contiguous or have degenerate strides
@@ -1784,6 +1844,7 @@ def fast_plan_decode(
             seq_lens=None,
             fixed_split_size=fixed_split_size,
             disable_split_kv=disable_split_kv,
+            use_prebias=PREBIAS_K_ENABLED,
         )
         self.vllm_first_call = False
         return
