@@ -85,6 +85,39 @@ PREBIAS_K_ENABLED = os.environ.get("VLLM_PREBIAS_K") == "1"
 _PREBIAS_ROPE_THETA = [10000.0]
 
 
+def _check_prebias_supported(model_config, vllm_config) -> None:
+    """Refuse layouts where a cache slot is not its own logical position.
+
+    The correction rotates the key bias at the key's logical position. It
+    reads that position from the slot index, which is correct only when a
+    request's cache begins at its own position zero. That holds for the
+    ordinary paged layout and fails for anything that windows or trims the
+    cache, and the failure is silent: scores are wrong, nothing raises.
+
+    So the unsupported cases are rejected here rather than served. The
+    kernel accepts an explicit position base; until that is supplied from
+    this layer, these configurations must not run.
+    """
+    reasons = []
+    if getattr(model_config.hf_config, "sliding_window", None):
+        reasons.append("sliding window trims the cache, so a slot index is "
+                       "not a logical position")
+    if getattr(model_config, "is_encoder_decoder", False):
+        reasons.append("encoder-decoder cross attention has its own "
+                       "position semantics")
+    qk_norm = getattr(model_config.hf_config, "use_qk_norm", False)
+    if qk_norm:
+        reasons.append("query-key normalisation changes what the bias means")
+    if reasons:
+        raise ValueError(
+            "VLLM_PREBIAS_K is set but this configuration cannot be served "
+            "correctly by the pre-bias key representation:\n  - "
+            + "\n  - ".join(reasons)
+            + "\nRefusing rather than producing silently wrong attention. "
+            "Use a 16-bit key cache for this configuration."
+        )
+
+
 def _prebias_coeff_for_layer(layer, num_kv_heads: int, head_dim: int):
     cached = getattr(layer, "_prebias_coeff_cache", False)
     if cached is not False:
@@ -576,6 +609,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             getattr(self.model_config.hf_config, "rope_theta", 10000.0)
         )
         _PREBIAS_ROPE_THETA[0] = self.prebias_rope_theta
+        if PREBIAS_K_ENABLED:
+            _check_prebias_supported(self.model_config, vllm_config)
         self.attention_config = vllm_config.attention_config
         self._workspace_buffer = None
         self._prefill_wrapper: (
