@@ -147,8 +147,12 @@ def _prebias_position_base(num_requests: int, device) -> torch.Tensor:
     Layouts where slot zero is not position zero are refused at construction
     by _check_prebias_supported, so any of them appearing here is a bug in
     that guard rather than a case to handle silently.
+
+    Integer, because a position is one. Carrying it as float worked only
+    below two to the twenty-fourth and made the contract depend on where
+    floating point stops counting exactly.
     """
-    return torch.zeros(num_requests, dtype=torch.float32, device=device)
+    return torch.zeros(num_requests, dtype=torch.int32, device=device)
 
 
 def _prebias_coeff_for_layer(layer, num_kv_heads: int, head_dim: int):
