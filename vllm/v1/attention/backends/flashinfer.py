@@ -79,7 +79,23 @@ logger = init_logger(__name__)
 # key-projection bias before rotary so the cache stores the residual,
 # and the FlashInfer kernels reconstruct the rotated bias from
 # per-head coefficients derived here.  See VLLM_PREBIAS_K.
-PREBIAS_K_ENABLED = os.environ.get("VLLM_PREBIAS_K") == "1"
+def _prebias_enabled() -> bool:
+    """Resolved through the registry so the value is a recognised setting.
+
+    Reading the raw environment made the engine warn that the name was
+    unknown, which left it ambiguous whether the setting had taken effect
+    at all -- ambiguity that cost a certification run's credibility until
+    the compiled module could be inspected to prove it had.
+    """
+    try:
+        import vllm.envs as _envs
+
+        return bool(getattr(_envs, "VLLM_PREBIAS_K", False))
+    except Exception:
+        return os.environ.get("VLLM_PREBIAS_K") == "1"
+
+
+PREBIAS_K_ENABLED = _prebias_enabled()
 
 
 _PREBIAS_ROPE_THETA = [10000.0]
@@ -116,6 +132,23 @@ def _check_prebias_supported(model_config, vllm_config) -> None:
             + "\nRefusing rather than producing silently wrong attention. "
             "Use a 16-bit key cache for this configuration."
         )
+
+
+
+def _prebias_position_base(num_requests: int, device) -> torch.Tensor:
+    """The absolute rotary position of the key held in each request's slot zero.
+
+    In the ordinary paged layout a request's block table starts at its own
+    first token, so that position is zero -- and it is passed explicitly as
+    zero rather than omitted, because the kernel refuses omission. Omission
+    would mean the same thing today and something different the moment a
+    layout trims or windows the cache.
+
+    Layouts where slot zero is not position zero are refused at construction
+    by _check_prebias_supported, so any of them appearing here is a bug in
+    that guard rather than a case to handle silently.
+    """
+    return torch.zeros(num_requests, dtype=torch.float32, device=device)
 
 
 def _prebias_coeff_for_layer(layer, num_kv_heads: int, head_dim: int):
@@ -1573,6 +1606,11 @@ class FlashInferImpl(AttentionImpl):
                         )
                         if PREBIAS_K_ENABLED
                         else None,
+                        prebias_pos_base=_prebias_position_base(
+                            attn_metadata.num_prefills, query.device
+                        )
+                        if PREBIAS_K_ENABLED
+                        else None,
                     )
             else:
                 assert isinstance(attn_metadata.prefill, TRTLLMPrefill)
@@ -1701,6 +1739,11 @@ class FlashInferImpl(AttentionImpl):
                         out=output[:num_decode_tokens],
                         prebias_coeff=_prebias_coeff_for_layer(
                             layer, self.num_kv_heads, self.head_size
+                        )
+                        if PREBIAS_K_ENABLED
+                        else None,
+                        prebias_pos_base=_prebias_position_base(
+                            attn_metadata.num_decodes, decode_query.device
                         )
                         if PREBIAS_K_ENABLED
                         else None,

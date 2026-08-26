@@ -75,6 +75,7 @@ if TYPE_CHECKING:
     VLLM_MAIN_CUDA_VERSION: str = "12.9"
     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
     VLLM_BATCH_INVARIANT: bool = False
+    VLLM_PREBIAS_K: bool = False
     MAX_JOBS: str | None = None
     NVCC_THREADS: str | None = None
     VLLM_USE_PRECOMPILED: bool = False
@@ -498,6 +499,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable batch-invariant mode: deterministic results regardless of
     # batch composition. Requires NVIDIA GPU with compute capability >= 9.0.
     "VLLM_BATCH_INVARIANT": lambda: bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0"))),
+    # Store the pre-bias rotary residual in a one-byte key cache and have
+    # the attention kernel reconstruct the rotated key-projection bias at
+    # read time. Registered here so the setting is a recognised option
+    # whose resolved value appears in the run manifest, rather than an
+    # unrecognised name the engine warns about and ignores.
+    "VLLM_PREBIAS_K": lambda: bool(int(os.getenv("VLLM_PREBIAS_K", "0"))),
     # Maximum number of compilation jobs to run in parallel.
     # By default this is the number of CPUs
     "MAX_JOBS": lambda: os.getenv("MAX_JOBS", None),
