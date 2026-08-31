@@ -6632,7 +6632,8 @@ class GPUModelRunner(
                         except (AttributeError, NotImplementedError):
                             full_order = (0, 1, 2, 3, 4)
                         # drop the key/value axis; each half stands alone
-                        half_order = tuple(i - 1 for i in full_order if i != 1)
+                        # remove the key/value axis; only the axes after it shift down
+                        half_order = tuple(i if i < 1 else i - 1 for i in full_order if i != 1)
                         inv_half = [half_order.index(i) for i in range(4)]
                         raw_tensor = kv_cache_raw_tensors[layer_name]
                         generic = (

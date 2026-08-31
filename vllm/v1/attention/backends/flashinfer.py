@@ -1558,7 +1558,8 @@ class FlashInferImpl(AttentionImpl):
         stride_order = FlashInferBackend.get_kv_cache_stride_order()
         if isinstance(kv_cache, tuple):
             # each half has its own dtype and no leading key/value axis
-            half_order = tuple(i - 1 for i in stride_order if i != 1)
+            # remove the key/value axis; only the axes after it shift down
+            half_order = tuple(i if i < 1 else i - 1 for i in stride_order if i != 1)
             kv_cache_permute = tuple(h.permute(*half_order) for h in kv_cache)
         else:
             kv_cache_permute = kv_cache.permute(*stride_order)
