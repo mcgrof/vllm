@@ -1907,6 +1907,8 @@ def fast_plan_decode(
     kv_data_type: str | torch.dtype | None = None,
     o_data_type: str | torch.dtype | None = None,
     data_type: str | torch.dtype | None = None,
+    k_data_type: str | torch.dtype | None = None,
+    v_data_type: str | torch.dtype | None = None,
     sm_scale: float | None = None,
     rope_scale: float | None = None,
     rope_theta: float | None = None,
@@ -1946,6 +1948,8 @@ def fast_plan_decode(
             kv_data_type=kv_data_type,
             o_data_type=o_data_type,
             data_type=data_type,
+            k_data_type=k_data_type,
+            v_data_type=v_data_type,
             sm_scale=sm_scale,
             rope_scale=rope_scale,
             rope_theta=rope_theta,
@@ -1960,6 +1964,38 @@ def fast_plan_decode(
         return
 
     assert self.is_cuda_graph_enabled, "Should be cudagraph only here"
+
+    if v_data_type is not None and v_data_type != (k_data_type or kv_data_type):
+        # The fast path reproduces the plan for a single cache dtype. A
+        # pair of dtypes is planned by the wrapper itself, which knows
+        # both; this rewrites host-side metadata only, so it is safe to
+        # call every step under graph capture, just slower to reach.
+        self.plan(
+            indptr_cpu,
+            indices,
+            last_page_len_cpu,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            pos_encoding_mode=pos_encoding_mode,
+            window_left=window_left,
+            logits_soft_cap=logits_soft_cap,
+            q_data_type=q_data_type,
+            kv_data_type=kv_data_type,
+            o_data_type=o_data_type,
+            data_type=data_type,
+            k_data_type=k_data_type,
+            v_data_type=v_data_type,
+            sm_scale=sm_scale,
+            rope_scale=rope_scale,
+            rope_theta=rope_theta,
+            non_blocking=non_blocking,
+            fixed_split_size=fixed_split_size,
+            disable_split_kv=disable_split_kv,
+            use_prebias=PREBIAS_K_ENABLED,
+        )
+        return
 
     fast_decode_plan(
         self,
