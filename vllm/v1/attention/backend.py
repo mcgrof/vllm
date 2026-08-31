@@ -861,7 +861,7 @@ class MLAAttentionImpl(AttentionImplBase[T], Generic[T]):
         kv_cache_dtype: str,
         k_scale: torch.Tensor,
     ) -> None:
-        if kv_cache.numel() == 0:
+        if (kv_cache[0] if isinstance(kv_cache, tuple) else kv_cache).numel() == 0:
             return
         from vllm import _custom_ops as ops
 
@@ -928,7 +928,7 @@ class SparseMLAAttentionImpl(AttentionImplBase[T], Generic[T]):
         kv_cache_dtype: str,
         k_scale: torch.Tensor,
     ) -> None:
-        if kv_cache.numel() == 0:
+        if (kv_cache[0] if isinstance(kv_cache, tuple) else kv_cache).numel() == 0:
             return
         from vllm import _custom_ops as ops
 

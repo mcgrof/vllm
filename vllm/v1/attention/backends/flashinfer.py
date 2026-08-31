@@ -262,6 +262,10 @@ def trtllm_prefill_attn_kvfp8_dequant(
     dequant_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     batch_size, num_of_page_per_token = block_tables_prefill.shape
+    if isinstance(kv_cache, tuple):
+        raise NotImplementedError(
+            "dequantising a mock cache is not defined for an asymmetric pair"
+        )
     s = kv_cache.shape
     assert s[1] == 2
     assert dequant_dtype in (torch.bfloat16, torch.float16)
@@ -1552,7 +1556,12 @@ class FlashInferImpl(AttentionImpl):
         num_prefill_tokens = attn_metadata.num_prefill_tokens
 
         stride_order = FlashInferBackend.get_kv_cache_stride_order()
-        kv_cache_permute = kv_cache.permute(*stride_order)
+        if isinstance(kv_cache, tuple):
+            # each half has its own dtype and no leading key/value axis
+            half_order = tuple(i - 1 for i in stride_order if i != 1)
+            kv_cache_permute = tuple(h.permute(*half_order) for h in kv_cache)
+        else:
+            kv_cache_permute = kv_cache.permute(*stride_order)
 
         use_dcp = self.dcp_world_size > 1
 

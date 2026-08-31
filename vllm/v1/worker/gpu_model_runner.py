@@ -6602,20 +6602,54 @@ class GPUModelRunner(
                         kv_cache_spec.v_dtype is not None
                         and kv_cache_spec.v_dtype != dtype
                     ):
-                        # The buffer below is viewed with one dtype for both
-                        # halves. An asymmetric spec would be allocated at the
-                        # pair's size and then viewed as if both halves were
-                        # the key dtype, serving the value half at the wrong
-                        # width under an asymmetric label. Until the pair is
-                        # viewed as two tensors, refuse rather than mislabel.
-                        raise NotImplementedError(
-                            f"layer {layer_name}: asymmetric key/value cache "
-                            f"({dtype} keys, {kv_cache_spec.v_dtype} values) "
-                            "is parsed and routed on this branch but not yet "
-                            "allocated as two views; it would be served as "
-                            f"{dtype} for both halves. Use a symmetric cache "
-                            "dtype until the asymmetric allocation is ported."
+                        # An asymmetric cache holds keys and values at two
+                        # widths in one page: the key half first, then the
+                        # value half. One buffer cannot be viewed with one
+                        # dtype for both, so each half is a strided view of
+                        # its own dtype over the same pages, the way the
+                        # Mamba branch below lays out its state tensors. The
+                        # backend receives the pair and writes and reads
+                        # each half at its own width.
+                        # The layout below places the whole key half of a
+                        # kv block before its value half. A kv block that
+                        # spans several kernel blocks would need the halves
+                        # interleaved per kernel block instead, which one
+                        # uniform stride cannot express.
+                        if num_blocks_per_kv_block != 1:
+                            raise NotImplementedError(
+                                f"layer {layer_name}: asymmetric key/value "
+                                f"cache needs the kv block size "
+                                f"({kv_cache_spec.block_size}) to equal the "
+                                f"kernel block size ({kernel_block_size})"
+                            )
+                        raw_tensor = kv_cache_raw_tensors[layer_name]
+                        per_half_shape = (
+                            kv_cache_spec.block_size,
+                            kv_cache_spec.num_kv_heads,
+                            kv_cache_spec.head_size,
                         )
+                        halves = []
+                        storage_offset_bytes = 0
+                        for half_dtype in (dtype, kv_cache_spec.v_dtype):
+                            dtype_size = get_dtype_size(half_dtype)
+                            num_element_per_page = (
+                                kv_cache_spec.page_size_bytes // dtype_size
+                            )
+                            target_shape = (num_blocks, *per_half_shape)
+                            half_stride = torch.empty(target_shape).stride()
+                            target_stride = (num_element_per_page, *half_stride[1:])
+                            assert storage_offset_bytes % dtype_size == 0
+                            halves.append(
+                                torch.as_strided(
+                                    raw_tensor.view(half_dtype),
+                                    size=target_shape,
+                                    stride=target_stride,
+                                    storage_offset=storage_offset_bytes // dtype_size,
+                                )
+                            )
+                            storage_offset_bytes += half_stride[0] * dtype_size
+                        kv_caches[layer_name] = tuple(halves)
+                        continue
                     try:
                         kv_cache_stride_order = attn_backend.get_kv_cache_stride_order()
                         assert len(kv_cache_stride_order) == len(kv_cache_shape)
@@ -6687,7 +6721,11 @@ class GPUModelRunner(
             kv_cache_spec = group.kv_cache_spec
             for layer_name in group.layer_names:
                 kv_cache = kv_caches[layer_name]
-                if isinstance(kv_cache_spec, AttentionSpec) and kv_cache.shape[0] == 2:
+                if (
+                    isinstance(kv_cache_spec, AttentionSpec)
+                    and not isinstance(kv_cache, tuple)
+                    and kv_cache.shape[0] == 2
+                ):
                     assert kv_cache.shape[1] != 2, (
                         "Fail to determine whether the layout is "
                         "(2, num_blocks, ...) or (num_blocks, 2, ...) for "

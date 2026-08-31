@@ -751,7 +751,9 @@ def unified_kv_cache_update(
             layer_slot_mapping,
         )
 
-    return torch.empty(0, device=kv_cache.device, dtype=kv_cache.dtype)
+    # an asymmetric cache is a (key, value) pair; either half will do here
+    _kc = kv_cache[0] if isinstance(kv_cache, tuple) else kv_cache
+    return torch.empty(0, device=_kc.device, dtype=_kc.dtype)
 
 
 def unified_kv_cache_update_fake(
