@@ -242,10 +242,22 @@ class Attention(nn.Module, AttentionLayerBase):
 
         # Asymmetric K/V: extract K dtype for the torch dtype and
         # keep the full spec for downstream backends.
-        from vllm.config.cache import cache_dtype_k
+        from vllm.config.cache import cache_dtype_k, cache_dtype_v, is_asymmetric_kv
         _k_str = cache_dtype_k(kv_cache_dtype)
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             _k_str, vllm_config.model_config
+        )
+        # The value half of an asymmetric cache has its own dtype. The
+        # cache spec sizes a page from it, so a spec built without it is
+        # sized as though both halves were the key dtype: a 16-bit key
+        # with an 8-bit value then reserves exactly what a 16-bit cache
+        # does and saves nothing.
+        self.kv_cache_torch_dtype_v = (
+            kv_cache_dtype_str_to_dtype(
+                cache_dtype_v(kv_cache_dtype), vllm_config.model_config
+            )
+            if is_asymmetric_kv(kv_cache_dtype)
+            else None
         )
         self.kv_cache_dtype = kv_cache_dtype
         self.calculate_kv_scales = calculate_kv_scales
@@ -612,6 +624,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 head_size=self.head_size,
                 head_size_v=self.head_size_v,
                 dtype=self.kv_cache_torch_dtype,
+                v_dtype=self.kv_cache_torch_dtype_v,
                 shadow_bytes_per_block=shadow,
                 num_kv_planes=num_planes,
             )

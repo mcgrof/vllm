@@ -6598,6 +6598,24 @@ class GPUModelRunner(
                         cache_dtype_str=self.cache_config.cache_dtype,
                     )
                     dtype = kv_cache_spec.dtype
+                    if (
+                        kv_cache_spec.v_dtype is not None
+                        and kv_cache_spec.v_dtype != dtype
+                    ):
+                        # The buffer below is viewed with one dtype for both
+                        # halves. An asymmetric spec would be allocated at the
+                        # pair's size and then viewed as if both halves were
+                        # the key dtype, serving the value half at the wrong
+                        # width under an asymmetric label. Until the pair is
+                        # viewed as two tensors, refuse rather than mislabel.
+                        raise NotImplementedError(
+                            f"layer {layer_name}: asymmetric key/value cache "
+                            f"({dtype} keys, {kv_cache_spec.v_dtype} values) "
+                            "is parsed and routed on this branch but not yet "
+                            "allocated as two views; it would be served as "
+                            f"{dtype} for both halves. Use a symmetric cache "
+                            "dtype until the asymmetric allocation is ported."
+                        )
                     try:
                         kv_cache_stride_order = attn_backend.get_kv_cache_stride_order()
                         assert len(kv_cache_stride_order) == len(kv_cache_shape)
