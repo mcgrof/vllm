@@ -184,6 +184,7 @@ class FullAttentionSpec(AttentionSpec):
             head_size=specs[0].head_size,
             head_size_v=specs[0].head_size_v,
             dtype=specs[0].dtype,
+            v_dtype=specs[0].v_dtype,
             page_size_padded=specs[0].page_size_padded,
             shadow_bytes_per_block=specs[0].shadow_bytes_per_block,
             num_kv_planes=specs[0].num_kv_planes,
@@ -252,6 +253,7 @@ class MLAAttentionSpec(FullAttentionSpec):
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
             dtype=specs[0].dtype,
+            v_dtype=specs[0].v_dtype,
             page_size_padded=specs[0].page_size_padded,
             cache_dtype_str=cache_dtype_str_set.pop(),
         )
@@ -384,6 +386,7 @@ class SinkFullAttentionSpec(FullAttentionSpec):
             head_size_v=specs[0].head_size_v,
             sink_len=specs[0].sink_len,
             dtype=specs[0].dtype,
+            v_dtype=specs[0].v_dtype,
             page_size_padded=specs[0].page_size_padded,
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
