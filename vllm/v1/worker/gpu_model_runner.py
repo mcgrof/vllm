@@ -6622,12 +6622,27 @@ class GPUModelRunner(
                                 f"({kv_cache_spec.block_size}) to equal the "
                                 f"kernel block size ({kernel_block_size})"
                             )
+                        # Resolve the backend's layout here, inside the
+                        # config context: the symmetric path below does so
+                        # through the stride-order call, and a first call
+                        # later, from the decode wrapper during graph
+                        # capture, has no context to read from.
+                        try:
+                            full_order = attn_backend.get_kv_cache_stride_order()
+                        except (AttributeError, NotImplementedError):
+                            full_order = (0, 1, 2, 3, 4)
+                        # drop the key/value axis; each half stands alone
+                        half_order = tuple(i - 1 for i in full_order if i != 1)
+                        inv_half = [half_order.index(i) for i in range(4)]
                         raw_tensor = kv_cache_raw_tensors[layer_name]
-                        per_half_shape = (
+                        generic = (
+                            num_blocks,
                             kv_cache_spec.block_size,
                             kv_cache_spec.num_kv_heads,
                             kv_cache_spec.head_size,
                         )
+                        # memory follows the backend's order; the view is generic
+                        mem_shape = tuple(generic[i] for i in half_order)
                         halves = []
                         storage_offset_bytes = 0
                         for half_dtype in (dtype, kv_cache_spec.v_dtype):
@@ -6635,19 +6650,16 @@ class GPUModelRunner(
                             num_element_per_page = (
                                 kv_cache_spec.page_size_bytes // dtype_size
                             )
-                            target_shape = (num_blocks, *per_half_shape)
-                            half_stride = torch.empty(target_shape).stride()
-                            target_stride = (num_element_per_page, *half_stride[1:])
+                            inner = torch.empty(mem_shape, device="meta").stride()
                             assert storage_offset_bytes % dtype_size == 0
-                            halves.append(
-                                torch.as_strided(
-                                    raw_tensor.view(half_dtype),
-                                    size=target_shape,
-                                    stride=target_stride,
-                                    storage_offset=storage_offset_bytes // dtype_size,
-                                )
-                            )
-                            storage_offset_bytes += half_stride[0] * dtype_size
+                            half = torch.as_strided(
+                                raw_tensor.view(half_dtype),
+                                size=mem_shape,
+                                stride=(num_element_per_page, *inner[1:]),
+                                storage_offset=storage_offset_bytes // dtype_size,
+                            ).permute(*inv_half)
+                            halves.append(half)
+                            storage_offset_bytes += inner[0] * dtype_size
                         kv_caches[layer_name] = tuple(halves)
                         continue
                     try:
