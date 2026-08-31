@@ -360,9 +360,13 @@ class Attention(nn.Module, AttentionLayerBase):
 
         # for attn backends supporting query quantization
         self.query_quant = None
-        if self.impl.supports_quant_query_input and self.kv_cache_dtype.startswith(
-            "fp8"
-        ):
+        # An asymmetric cache carries a dtype per half, so this is a pair
+        # rather than a string. The query multiplies against the keys, so
+        # it is the key half that decides whether quantising the query
+        # applies at all.
+        _kv_dt = self.kv_cache_dtype
+        _k_dt = _kv_dt[0] if isinstance(_kv_dt, tuple) else _kv_dt
+        if self.impl.supports_quant_query_input and _k_dt.startswith("fp8"):
             is_per_head = (
                 hasattr(self, "q_scale") and self.q_scale.numel() == self.num_kv_heads
             )

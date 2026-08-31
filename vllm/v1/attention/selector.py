@@ -59,6 +59,7 @@ def get_attn_backend(
 ) -> type[AttentionBackend]:
     """Selects which attention backend to use and lazily imports it."""
 
+    is_asymmetric = False
     if kv_cache_dtype is not None:
         # Asymmetric K/V: if the spec is a tuple, validate each
         # element and reduce to the K dtype for selector purposes.
@@ -67,6 +68,13 @@ def get_attn_backend(
             for dt in kv_cache_dtype:
                 assert dt in valid, (
                     f"Invalid dtype in asymmetric spec: {dt}")
+            # Reducing to the key dtype makes an asymmetric cache look
+            # symmetric to the selector, so a 16-bit key with an 8-bit
+            # value reads as plain 16-bit and can be handed to a backend
+            # that writes the cache with a single dtype. That backend
+            # then rejects the pair at the first write, after the model
+            # has loaded. Remember that it was a pair.
+            is_asymmetric = kv_cache_dtype[0] != kv_cache_dtype[1]
             kv_cache_dtype = kv_cache_dtype[0]  # K dtype
         else:
             valid_cache_dtypes = get_args(CacheDType)
@@ -98,8 +106,24 @@ def get_attn_backend(
         attn_type=attn_type or AttentionType.DECODER,
     )
 
+    requested = vllm_config.attention_config.backend
+    if is_asymmetric and requested is None:
+        # Writing a key and a value at different dtypes takes two calls,
+        # which only some backends do. Choosing by the key dtype alone
+        # picks one that cannot, so name the one that can rather than
+        # failing at the first cache write.
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        requested = AttentionBackendEnum.FLASHINFER
+        logger.info(
+            "Asymmetric key/value cache dtypes %s: selecting the "
+            "%s backend, which writes the halves separately.",
+            attn_selector_config.kv_cache_dtype,
+            requested.name,
+        )
+
     return _cached_get_attn_backend(
-        backend=vllm_config.attention_config.backend,
+        backend=requested,
         attn_selector_config=attn_selector_config,
         num_heads=num_heads,
     )
@@ -122,13 +146,14 @@ def _cached_get_attn_backend(
         raise ValueError(
             f"Invalid attention backend for {current_platform.device_name}"
         )
+    requested_name = backend.name if backend is not None else "auto"
     backend = resolve_obj_by_qualname(attention_cls)
 
     # Backend verification logging — machine-readable for benchmark manifests
     logger.info(
         "Backend manifest: requested_backend=%s, selected_backend=%s, "
         "kv_cache_dtype=%s, head_size=%s, dtype=%s",
-        attn_selector_config.kv_cache_dtype,
+        requested_name,
         backend.get_name(),
         attn_selector_config.kv_cache_dtype,
         attn_selector_config.head_size,
