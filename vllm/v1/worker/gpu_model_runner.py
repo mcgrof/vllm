@@ -6610,57 +6610,48 @@ class GPUModelRunner(
                         # Mamba branch below lays out its state tensors. The
                         # backend receives the pair and writes and reads
                         # each half at its own width.
-                        # The layout below places the whole key half of a
-                        # kv block before its value half. A kv block that
-                        # spans several kernel blocks would need the halves
-                        # interleaved per kernel block instead, which one
-                        # uniform stride cannot express.
-                        if num_blocks_per_kv_block != 1:
-                            raise NotImplementedError(
-                                f"layer {layer_name}: asymmetric key/value "
-                                f"cache needs the kv block size "
-                                f"({kv_cache_spec.block_size}) to equal the "
-                                f"kernel block size ({kernel_block_size})"
-                            )
-                        # Resolve the backend's layout here, inside the
-                        # config context: the symmetric path below does so
-                        # through the stride-order call, and a first call
-                        # later, from the decode wrapper during graph
-                        # capture, has no context to read from.
+                        # The kernel requires the key and value caches to
+                        # have identical element strides in every dimension,
+                        # which two halves sharing a page cannot have when
+                        # their widths differ. So the two halves are not
+                        # interleaved per page: the buffer is split into a
+                        # key region and a value region, each a contiguous
+                        # cache of its own dtype with the same shape, and
+                        # therefore the same strides. The page size on the
+                        # spec still counts both halves, so block accounting
+                        # is unchanged; only the arrangement in memory is.
                         try:
                             full_order = attn_backend.get_kv_cache_stride_order()
                         except (AttributeError, NotImplementedError):
                             full_order = (0, 1, 2, 3, 4)
-                        # drop the key/value axis; each half stands alone
                         # remove the key/value axis; only the axes after it shift down
                         half_order = tuple(i if i < 1 else i - 1 for i in full_order if i != 1)
                         inv_half = [half_order.index(i) for i in range(4)]
                         raw_tensor = kv_cache_raw_tensors[layer_name]
                         generic = (
-                            num_blocks,
-                            kv_cache_spec.block_size,
+                            kernel_num_blocks,
+                            kernel_block_size,
                             kv_cache_spec.num_kv_heads,
                             kv_cache_spec.head_size,
                         )
-                        # memory follows the backend's order; the view is generic
                         mem_shape = tuple(generic[i] for i in half_order)
+                        per_block_elems = (
+                            kernel_block_size
+                            * kv_cache_spec.num_kv_heads
+                            * kv_cache_spec.head_size
+                        )
                         halves = []
-                        storage_offset_bytes = 0
+                        offset_bytes = 0
                         for half_dtype in (dtype, kv_cache_spec.v_dtype):
-                            dtype_size = get_dtype_size(half_dtype)
-                            num_element_per_page = (
-                                kv_cache_spec.page_size_bytes // dtype_size
+                            nbytes = kernel_num_blocks * per_block_elems * get_dtype_size(half_dtype)
+                            region = raw_tensor[offset_bytes : offset_bytes + nbytes]
+                            halves.append(
+                                region.view(half_dtype).view(mem_shape).permute(*inv_half)
                             )
-                            inner = torch.empty(mem_shape, device="meta").stride()
-                            assert storage_offset_bytes % dtype_size == 0
-                            half = torch.as_strided(
-                                raw_tensor.view(half_dtype),
-                                size=mem_shape,
-                                stride=(num_element_per_page, *inner[1:]),
-                                storage_offset=storage_offset_bytes // dtype_size,
-                            ).permute(*inv_half)
-                            halves.append(half)
-                            storage_offset_bytes += inner[0] * dtype_size
+                            offset_bytes += nbytes
+                        assert offset_bytes <= raw_tensor.numel(), (
+                            layer_name, offset_bytes, raw_tensor.numel()
+                        )
                         kv_caches[layer_name] = tuple(halves)
                         continue
                     try:
