@@ -207,17 +207,27 @@ class FullAttentionSpec(AttentionSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
-        if self.num_kv_planes == 1:
-            # K-only paged cache (V in quantized shadow cache)
-            kv_size = self.head_size
-        else:
-            kv_size = self.head_size + self.head_size_v
-        return (
+        # This override shadows the base class, so it has to size the
+        # value half from the value dtype itself: a 16-bit key with an
+        # 8-bit value otherwise reserves a page sized for two 16-bit
+        # halves, and the block count never moves.
+        k_bytes = (
             self.block_size
             * self.num_kv_heads
-            * kv_size
+            * self.head_size
             * get_dtype_size(self.dtype)
         )
+        if self.num_kv_planes == 1:
+            # K-only paged cache (V in quantized shadow cache)
+            return k_bytes
+        v_dtype = self.v_dtype if self.v_dtype is not None else self.dtype
+        v_bytes = (
+            self.block_size
+            * self.num_kv_heads
+            * self.head_size_v
+            * get_dtype_size(v_dtype)
+        )
+        return k_bytes + v_bytes
 
 
 @dataclass(frozen=True, kw_only=True)
