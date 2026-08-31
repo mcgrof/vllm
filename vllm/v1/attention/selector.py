@@ -107,6 +107,31 @@ def get_attn_backend(
     )
 
     requested = vllm_config.attention_config.backend
+    from vllm import envs as _envs
+
+    if getattr(_envs, "VLLM_PREBIAS_K", False) and not use_mla:
+        # The model subtracts the key bias before caching and only the
+        # FlashInfer kernel reconstructs it. Any other backend serves
+        # attention with the bias missing and reports nothing wrong, so
+        # this cannot be left to the default choice.
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        if requested is None:
+            requested = AttentionBackendEnum.FLASHINFER
+            logger.info(
+                "VLLM_PREBIAS_K is set: selecting the %s backend, the "
+                "only one that reconstructs the subtracted key bias.",
+                requested.name,
+            )
+        elif requested != AttentionBackendEnum.FLASHINFER:
+            raise ValueError(
+                f"VLLM_PREBIAS_K is set but the {requested.name} backend "
+                "was requested. Only FLASHINFER reconstructs the key bias "
+                "the model subtracts; any other backend would serve wrong "
+                "attention silently. Unset VLLM_PREBIAS_K or request "
+                "FLASHINFER."
+            )
+
     if is_asymmetric and requested is None:
         # Writing a key and a value at different dtypes takes two calls,
         # which only some backends do. Choosing by the key dtype alone
