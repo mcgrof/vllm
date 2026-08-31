@@ -1529,13 +1529,27 @@ class FlashInferImpl(AttentionImpl):
 
         # The FlashInfer api requires data to be in fp8_e4m3 or fp8_e5m2
         # to process the cache when the kv_cache_dtype is fp8
-        if self.kv_sharing_target_layer_name is None and self.kv_cache_dtype.startswith(
-            "fp8"
-        ):
-            torch_dtype = FlashInferBackend.get_fp8_dtype_for_flashinfer(
-                self.kv_cache_dtype
-            )
-            kv_cache = kv_cache.view(torch_dtype)
+        if self.kv_sharing_target_layer_name is None:
+            if isinstance(kv_cache, tuple):
+                # each half is stored as bytes and carries its own dtype
+                # string; reinterpret the halves independently, or the
+                # wrapper reads a byte-typed value half as a packed 4-bit
+                # cache and asks for scales that do not exist
+                halves = []
+                for half, half_str in zip(
+                    kv_cache, (self.kv_cache_dtype, self._v_cache_str or "auto")
+                ):
+                    if half_str.startswith("fp8"):
+                        half = half.view(
+                            FlashInferBackend.get_fp8_dtype_for_flashinfer(half_str)
+                        )
+                    halves.append(half)
+                kv_cache = tuple(halves)
+            elif self.kv_cache_dtype.startswith("fp8"):
+                torch_dtype = FlashInferBackend.get_fp8_dtype_for_flashinfer(
+                    self.kv_cache_dtype
+                )
+                kv_cache = kv_cache.view(torch_dtype)
 
         # Inputs and outputs may be padded for CUDA graphs
         query = query[:num_actual_tokens]
