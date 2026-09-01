@@ -981,7 +981,17 @@ class EngineArgs:
         cache_group.add_argument(
             "--kv-cache-memory-bytes", **cache_kwargs["kv_cache_memory_bytes"]
         )
-        cache_group.add_argument("--kv-cache-dtype", **cache_kwargs["cache_dtype"])
+        # The cache dtype accepts a comma-separated pair for an asymmetric
+        # cache ("auto,fp8_e4m3"), which a choices list generated from the
+        # scalar literal would reject before the pair parser ever ran. The
+        # values are validated after parsing instead, element by element.
+        _kv_dtype_kwargs = {**cache_kwargs["cache_dtype"]}
+        _kv_choices = _kv_dtype_kwargs.pop("choices", None)
+        if _kv_choices:
+            _kv_dtype_kwargs["metavar"] = (
+                "{" + ",".join(str(c) for c in _kv_choices) + "}[,V_DTYPE]"
+            )
+        cache_group.add_argument("--kv-cache-dtype", **_kv_dtype_kwargs)
         cache_group.add_argument(
             "--num-gpu-blocks-override", **cache_kwargs["num_gpu_blocks_override"]
         )
