@@ -49,6 +49,20 @@ except ImportError:
         ParallelStrategy,
     )
 
+try:
+    from lmcache.v1.multiprocess.custom_types import ExternalKVKeys
+
+    _HAS_EXTERNAL_KV_KEYS = True
+except ImportError:
+    _HAS_EXTERNAL_KV_KEYS = False
+
+    @dataclass(frozen=True)
+    class ExternalKVKeys:  # type: ignore[no-redef]
+        """Import-safe placeholder for older LMCache installations."""
+
+        keys: tuple[bytes, ...]
+
+
 if TYPE_CHECKING:
     from vllm.distributed.kv_events import KVCacheEvent
     from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
@@ -81,6 +95,18 @@ def reformat_block_ids(block_ids: tuple[list[int], ...] | None) -> list[int]:
         )
 
     return block_ids[0]
+
+
+def get_bound_external_kv_keys(request: "Request") -> ExternalKVKeys | None:
+    """Read keys bound by the engine's resolved-contract integration."""
+    keys = getattr(request, "kv_provenance_keys", None)
+    if keys is None:
+        return None
+    if not _HAS_EXTERNAL_KV_KEYS:
+        raise RuntimeError(
+            "the installed LMCache does not support descriptor-issued KV keys"
+        )
+    return ExternalKVKeys(keys)
 
 
 def extract_world_size_and_kv_rank(
@@ -218,16 +244,70 @@ class LMCacheMPRequestTracker:
 
     cache_salt: str = ""
 
-    def __init__(self, request: "Request"):
+    external_keys: ExternalKVKeys | None = None
+    require_provenance: bool = False
+
+    def __init__(
+        self,
+        request: "Request",
+        *,
+        blocks_in_chunk: int = 1,
+        vllm_block_size: int = 1,
+        require_provenance: bool = False,
+    ):
         self.request_id = request.request_id
         self.cache_salt: str = request.cache_salt or ""
         self.all_token_ids = request.all_token_ids
         self.block_hashes = ConstantList(request.block_hashes)
+        self.require_provenance = require_provenance
+        self.external_keys = get_bound_external_kv_keys(request)
+        if blocks_in_chunk < 1 or vllm_block_size < 1:
+            raise ValueError("KV cache block and chunk sizes must be positive")
+        if require_provenance and self.external_keys is None:
+            raise ValueError(
+                "LMCache provenance mode requires descriptor-issued external keys"
+            )
+        if self.external_keys is not None:
+            tokens_in_chunk = blocks_in_chunk * vllm_block_size
+            expected = len(self.all_token_ids) // tokens_in_chunk
+            if len(self.external_keys.keys) != expected:
+                raise ValueError(
+                    "external KV key count does not match the request's full "
+                    f"LMCache chunks: expected {expected}, got "
+                    f"{len(self.external_keys.keys)}"
+                )
         self.allocated_block_ids = []
         self.num_stored_blocks = 0
         self.num_vllm_hit_blocks = 0
         self.num_lmcache_hit_blocks = 0
         self.state = LMCacheMPRequestState.PREFETCHING
+
+    def external_keys_for_blocks(
+        self,
+        start: int,
+        end: int,
+        blocks_in_chunk: int,
+    ) -> ExternalKVKeys | None:
+        """Return keys covering one chunk-aligned vLLM block range."""
+        if blocks_in_chunk < 1:
+            raise ValueError("blocks_in_chunk must be positive")
+        if self.external_keys is None:
+            if self.require_provenance:
+                raise ValueError(
+                    "provenance-required request lost its external KV keys"
+                )
+            return None
+        if not 0 <= start <= end:
+            raise ValueError("external KV key block range must be ordered")
+        if start % blocks_in_chunk != 0 or end % blocks_in_chunk != 0:
+            raise ValueError("external KV key block range must be chunk aligned")
+        chunk_start = start // blocks_in_chunk
+        chunk_end = end // blocks_in_chunk
+        if chunk_end > len(self.external_keys.keys):
+            raise ValueError(
+                "request produced a chunk with no descriptor-issued external key"
+            )
+        return ExternalKVKeys(self.external_keys.keys[chunk_start:chunk_end])
 
     ####
     # Check the state of the request
@@ -349,11 +429,20 @@ class LMCacheMPRequestMetadata:
             start_token_idx = start * vllm_block_size
             end_token_idx = end * vllm_block_size
             token_ids = list(tracker.all_token_ids)
+            provenance: dict[str, Any] = {}
+            if tracker.external_keys is not None or tracker.require_provenance:
+                provenance = {
+                    "external_keys": tracker.external_keys_for_blocks(
+                        start, end, blocks_in_chunk
+                    ),
+                    "require_provenance": tracker.require_provenance,
+                }
             op = LoadStoreOp(
                 token_ids=token_ids,
                 block_ids=block_ids,
                 start=start_token_idx,
                 end=end_token_idx,
+                **provenance,
             )
 
             ret = LMCacheMPRequestMetadata(
@@ -415,12 +504,21 @@ class LMCacheMPRequestMetadata:
             apc_overlap_blocks = tracker.num_vllm_hit_blocks - start
             skip_first_n_tokens = apc_overlap_blocks * vllm_block_size
 
+            provenance: dict[str, Any] = {}
+            if tracker.external_keys is not None or tracker.require_provenance:
+                provenance = {
+                    "external_keys": tracker.external_keys_for_blocks(
+                        start, end, blocks_in_chunk
+                    ),
+                    "require_provenance": tracker.require_provenance,
+                }
             op = LoadStoreOp(
                 token_ids=token_ids,
                 block_ids=block_ids,
                 start=start_token_idx,
                 end=end_token_idx,
                 skip_first_n_tokens=skip_first_n_tokens,
+                **provenance,
             )
 
             ret = LMCacheMPRequestMetadata(
@@ -471,6 +569,8 @@ class LMCacheMPConnectorUpstream(KVConnectorBase_V1):
     - lmcache.mp.mq_timeout: timeout (seconds) for message queue requests.
     - lmcache.mp.heartbeat_interval: interval (seconds) between server
       heartbeat pings.
+    - lmcache.mp.require_provenance: require descriptor-issued external keys
+      for every request and fail instead of using legacy token keying.
     """
 
     def __init__(
@@ -522,6 +622,16 @@ class LMCacheMPConnectorUpstream(KVConnectorBase_V1):
             raise ValueError(f"Unknown KVConnectorRole: {self.role}")
 
         self.vllm_block_size = vllm_config.cache_config.block_size
+        require_provenance = vllm_config.kv_transfer_config.get_from_extra_config(
+            "lmcache.mp.require_provenance", False
+        )
+        if not isinstance(require_provenance, bool):
+            raise TypeError("lmcache.mp.require_provenance must be a boolean")
+        if require_provenance and not _HAS_EXTERNAL_KV_KEYS:
+            raise RuntimeError(
+                "LMCache provenance mode requires ExternalKVKeys protocol support"
+            )
+        self.require_provenance = require_provenance
 
     @property
     def role(self) -> KVConnectorRole:
@@ -771,6 +881,16 @@ class LMCacheMPConnectorUpstream(KVConnectorBase_V1):
             request.request_id,
             token_ids=list(request.all_token_ids),
             cache_salt=tracker.cache_salt,
+            external_keys=tracker.external_keys_for_blocks(
+                0,
+                len(tracker.all_token_ids)
+                // (
+                    self.vllm_block_size * self.scheduler_adapter.num_blocks_per_chunk()
+                )
+                * self.scheduler_adapter.num_blocks_per_chunk(),
+                self.scheduler_adapter.num_blocks_per_chunk(),
+            ),
+            require_provenance=tracker.require_provenance,
         )
 
         ret = self.scheduler_adapter.check_lookup_result(request.request_id)
@@ -869,6 +989,13 @@ class LMCacheMPConnectorUpstream(KVConnectorBase_V1):
                         start=0,
                         end=free_end,
                         request_id=request.request_id,
+                        cache_salt=tracker.cache_salt,
+                        external_keys=tracker.external_keys_for_blocks(
+                            0,
+                            free_end // self.vllm_block_size,
+                            self.scheduler_adapter.num_blocks_per_chunk(),
+                        ),
+                        require_provenance=tracker.require_provenance,
                     )
                     logger.debug(
                         "Free locks of tokens %d-%d since it is cached by vLLM.",
@@ -1174,7 +1301,12 @@ class LMCacheMPConnectorUpstream(KVConnectorBase_V1):
                 self.request_trackers.pop(request_id)
 
         if request_id not in self.request_trackers:
-            new_tracker = LMCacheMPRequestTracker(request)
+            new_tracker = LMCacheMPRequestTracker(
+                request,
+                blocks_in_chunk=self.scheduler_adapter.num_blocks_per_chunk(),
+                vllm_block_size=self.vllm_block_size,
+                require_provenance=self.require_provenance,
+            )
             self.request_trackers[request_id] = new_tracker
         return self.request_trackers[request_id]
 

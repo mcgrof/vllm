@@ -101,6 +101,9 @@ class Request:
 
         # P/D: Connector-specific KV transfer parameters.
         self.kv_transfer_params: dict[str, Any] | None = None
+        # Engine-internal, descriptor-issued external KV keys. This is not
+        # populated from EngineCoreRequest or client-controlled transfer params.
+        self._kv_provenance_keys: tuple[bytes, ...] | None = None
         # E/P/D: Connector-specific encoder-cache transfer parameters.
         self.ec_transfer_params: dict[str, Any] | None = None
 
@@ -274,6 +277,27 @@ class Request:
             self._all_token_ids.extend(token_ids)
 
         self.update_block_hashes()
+
+    @property
+    def kv_provenance_keys(self) -> tuple[bytes, ...] | None:
+        """Return the engine-internal descriptor-issued cache keys."""
+        return self._kv_provenance_keys
+
+    def bind_kv_provenance_keys(self, keys: tuple[bytes, ...]) -> None:
+        """Bind opaque descriptor-issued keys exactly once.
+
+        This method is for the engine's resolved-contract integration, after it
+        has validated the registration handle. Client request fields do not
+        reach this binding.
+        """
+        if self._kv_provenance_keys is not None:
+            raise RuntimeError("KV provenance keys are already bound")
+        if not isinstance(keys, tuple):
+            raise TypeError("KV provenance keys must be a tuple")
+        for key in keys:
+            if not isinstance(key, bytes) or len(key) != 32:
+                raise ValueError("KV provenance keys must be 32-byte values")
+        self._kv_provenance_keys = keys
 
     def update_block_hashes(self) -> None:
         """Compute block hashes for any new full blocks and append them."""
