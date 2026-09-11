@@ -16,6 +16,7 @@ methods end-to-end without a GPU:
 import os
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -36,7 +37,10 @@ pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
 
 def _make_cartridge_pt(path, num_layers=2, num_kv_heads=2, num_tokens=32, head_dim=4):
     """Create a minimal TrainableCache .pt file."""
-    cache = {"trainable_keys": [], "trainable_values": []}
+    cache: dict[str, list[torch.Tensor]] = {
+        "trainable_keys": [],
+        "trainable_values": [],
+    }
     for _ in range(num_layers):
         cache["trainable_keys"].append(
             torch.nn.Parameter(torch.randn(1, num_kv_heads, num_tokens, head_dim))
@@ -47,7 +51,12 @@ def _make_cartridge_pt(path, num_layers=2, num_kv_heads=2, num_tokens=32, head_d
     torch.save(cache, path)
 
 
-def _make_connector(cartridge_path, block_size=16):
+def _make_connector(
+    cartridge_path,
+    block_size=16,
+    attention_mode="inject",
+    attention_backend="FLASHINFER",
+):
     """Create a CartridgeConnector through the real __init__.
 
     The VllmConfig is mocked, but every field the connector reads is
@@ -56,7 +65,10 @@ def _make_connector(cartridge_path, block_size=16):
     """
     vllm_config = MagicMock()
     vllm_config.cache_config.block_size = block_size
+    vllm_config.cache_config.cache_dtype = "auto"
     vllm_config.parallel_config.tensor_parallel_size = 1
+    vllm_config.model_config.dtype = torch.bfloat16
+    vllm_config.attention_config.backend = SimpleNamespace(name=attention_backend)
 
     extra_config = {
         "cartridge_path": cartridge_path,
@@ -64,7 +76,10 @@ def _make_connector(cartridge_path, block_size=16):
         # unbounded capacity, CPU tier (no GPU required).
         "gpu_capacity_bytes": 1 << 40,
         "gpu_residency_device": "cpu",
+        "cartridge_attention_mode": attention_mode,
     }
+    if attention_mode == "separate_asymmetric":
+        extra_config["cartridge_num_tokens"] = 32
 
     def get_from_extra_config(key, default=None):
         return extra_config.get(key, default)
@@ -285,3 +300,38 @@ class TestBuildConnectorMeta:
         # Block 5: slots 80-95, Block 10: slots 160-175
         assert sm[0].item() == 5 * 16  # = 80
         assert sm[16].item() == 10 * 16  # = 160
+
+
+class TestSeparateAsymmetricMode:
+    def setup_method(self):
+        fd, self._tmppath = tempfile.mkstemp(suffix=".pt")
+        os.close(fd)
+        _make_cartridge_pt(self._tmppath, num_tokens=32)
+
+    def teardown_method(self):
+        Path(self._tmppath).unlink()
+
+    def test_external_mode_builds_metadata_without_injection_slots(self):
+        connector = _make_connector(
+            self._tmppath,
+            attention_mode="separate_asymmetric",
+        )
+        connector._request_cartridge_ids["r1"] = "default"
+        connector._request_num_tokens["r1"] = 32
+        connector._requests_need_load.add("r1")
+        scheduled = MagicMock(req_id="r1", block_ids=[[-1, -1, 7]])
+        output = MagicMock(scheduled_new_reqs=[scheduled])
+
+        metadata = connector.build_connector_meta(output)
+
+        assert connector.owns_external_kv_prefix is True
+        assert len(metadata.requests) == 1
+        assert metadata.requests[0].slot_mapping.numel() == 0
+
+    def test_external_mode_requires_explicit_flashinfer_backend(self):
+        with pytest.raises(ValueError, match="FlashInfer backend"):
+            _make_connector(
+                self._tmppath,
+                attention_mode="separate_asymmetric",
+                attention_backend="FLASH_ATTN",
+            )

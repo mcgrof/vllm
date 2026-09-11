@@ -53,6 +53,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.config.cache import cache_dtype_k, cache_dtype_v, is_asymmetric_kv
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
@@ -141,7 +142,7 @@ def load_cartridge(path: str) -> dict:
     # get overwritten with trained values that were optimized assuming
     # the frozen BOS prefix would be present, which catastrophically
     # corrupts attention and produces garbage output.
-    kv_data = []
+    kv_data: list[tuple[torch.Tensor, torch.Tensor]] = []
     for layer_idx in range(num_layers):
         k_trn = trainable_keys[layer_idx]
         v_trn = trainable_values[layer_idx]
@@ -242,6 +243,31 @@ def inject_kv_into_paged_cache(
 
     slot_mapping = slot_mapping.to(torch.int64)
 
+    # A native asymmetric cartridge can already carry its V plane as
+    # FP8. The asymmetric allocator guarantees NHD tuple views, so a
+    # direct page/offset scatter preserves those bytes exactly and
+    # avoids expanding FP8 -> BF16 only to quantize it again in the
+    # normal cache writer.
+    if isinstance(kv_cache_layer, (tuple, list)) and len(kv_cache_layer) == 2:
+        key_cache, value_cache = kv_cache_layer
+        if (
+            key_cache.dtype != value_cache.dtype
+            and src_key.dtype == key_cache.dtype
+            and src_value.dtype == value_cache.dtype
+        ):
+            if key_cache.ndim != 4 or value_cache.ndim != 4:
+                raise ValueError(
+                    "prequantized asymmetric cartridge injection requires 4-D "
+                    f"NHD caches; got K={tuple(key_cache.shape)}, "
+                    f"V={tuple(value_cache.shape)}"
+                )
+            block_size = key_cache.shape[1]
+            block_indices = torch.div(slot_mapping, block_size, rounding_mode="floor")
+            block_offsets = torch.remainder(slot_mapping, block_size)
+            key_cache[block_indices, block_offsets] = src_key
+            value_cache[block_indices, block_offsets] = src_value
+            return
+
     # Backend-native write path. The paged-cache byte layout is owned
     # by the attention backend and is not always the flat token-major
     # layout the fallback below writes: ROCM_ATTN keeps KV
@@ -256,12 +282,16 @@ def inject_kv_into_paged_cache(
     # not (key, value)); the isinstance check on the standard
     # AttentionImpl base rules them out.
     impl = getattr(attn_layer, "impl", None)
+    update_cache = getattr(impl, "do_kv_cache_update", None)
     if (
         isinstance(impl, AttentionImpl)
-        and isinstance(kv_cache_layer, torch.Tensor)
-        and callable(getattr(impl, "do_kv_cache_update", None))
+        and (
+            isinstance(kv_cache_layer, torch.Tensor)
+            or (isinstance(kv_cache_layer, (tuple, list)) and len(kv_cache_layer) == 2)
+        )
+        and callable(update_cache)
     ):
-        impl.do_kv_cache_update(
+        update_cache(
             attn_layer,
             src_key,
             src_value,
@@ -364,6 +394,8 @@ class CartridgeConnector(KVConnectorBase_V1):
       cross-contamination.
     """
 
+    supports_asymmetric_kv = True
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -377,6 +409,32 @@ class CartridgeConnector(KVConnectorBase_V1):
         )
         self._block_size = vllm_config.cache_config.block_size
         self._tp_size = vllm_config.parallel_config.tensor_parallel_size
+        attention_mode = self._kv_transfer_config.get_from_extra_config(
+            "cartridge_attention_mode", "inject"
+        )
+        if attention_mode not in ("inject", "separate_asymmetric"):
+            raise ValueError(
+                "cartridge_attention_mode must be 'inject' or "
+                f"'separate_asymmetric', got {attention_mode!r}"
+            )
+        self._separate_asymmetric_attention = attention_mode == "separate_asymmetric"
+        if (
+            self._separate_asymmetric_attention
+            and getattr(vllm_config.attention_config.backend, "name", None)
+            != "FLASHINFER"
+        ):
+            raise ValueError(
+                "separate_asymmetric cartridge attention requires an explicit "
+                "FlashInfer backend; pass --attention-backend FLASHINFER"
+            )
+        if (
+            self._separate_asymmetric_attention
+            and vllm_config.model_config.dtype not in (torch.bfloat16, torch.float16)
+        ):
+            raise ValueError(
+                "separate_asymmetric cartridge attention requires a BF16 or "
+                f"FP16 model dtype, got {vllm_config.model_config.dtype}"
+            )
         # tp_rank is resolved lazily on the worker side (not available
         # at scheduler-side init). Set to 0 as default; overridden in
         # start_load_kv when the distributed runtime is initialized.
@@ -394,7 +452,40 @@ class CartridgeConnector(KVConnectorBase_V1):
         self._requests_need_load: set[str] = set()
 
         self._load_cartridges_from_config()
+        if self._separate_asymmetric_attention:
+            if len(self._cartridge_meta) != 1:
+                raise NotImplementedError(
+                    "separate_asymmetric cartridge attention currently requires "
+                    "singleton cartridge routing"
+                )
+            only_meta = next(iter(self._cartridge_meta.values()))
+            configured_num_tokens = int(
+                self._kv_transfer_config.get_from_extra_config(
+                    "cartridge_num_tokens", 0
+                )
+            )
+            if configured_num_tokens != only_meta["num_tokens"]:
+                raise ValueError(
+                    "cartridge_num_tokens must exactly match the loaded "
+                    "cartridge in separate_asymmetric mode: "
+                    f"configured={configured_num_tokens}, "
+                    f"loaded={only_meta['num_tokens']}"
+                )
+            if only_meta["num_tokens"] % self._block_size != 0:
+                raise ValueError(
+                    "separate_asymmetric cartridge length must be page aligned; "
+                    f"tokens={only_meta['num_tokens']}, "
+                    f"block_size={self._block_size}"
+                )
         self._router: CartridgeRouter = self._build_router_from_config()
+        if self._separate_asymmetric_attention and not isinstance(
+            self._router, StaticCartridgeRouter
+        ):
+            raise NotImplementedError(
+                "separate_asymmetric cartridge attention currently requires "
+                "homogeneous singleton routing; use injection mode for mixed "
+                "cartridge/non-cartridge or multi-cartridge batches"
+            )
         self._residency: GPUResidencyManager = self._build_residency()
         self._preload_cartridges_if_configured()
 
@@ -405,6 +496,10 @@ class CartridgeConnector(KVConnectorBase_V1):
             type(self._router).__name__,
             self._residency is not None,
         )
+
+    @property
+    def owns_external_kv_prefix(self) -> bool:
+        return self._separate_asymmetric_attention
 
     # ------------------------------------------------------------------
     # Init helpers: cartridge loading + router construction
@@ -560,6 +655,8 @@ class CartridgeConnector(KVConnectorBase_V1):
         # tier is bounded/LRU/refcounted by the residency manager.
 
         residency = self._store.get_residency(cart_id)
+        if residency is None:
+            raise RuntimeError(f"cartridge {cart_id!r} has no CPU residency")
         num_tokens = residency.num_tokens
         num_blocks = num_tokens // self._block_size
         self._cartridge_meta[cart_id] = {
@@ -655,6 +752,7 @@ class CartridgeConnector(KVConnectorBase_V1):
             return
         if not isinstance(preload, list):
             raise ValueError("'preload' must be a list of cartridge_ids")
+        target_dtype = self._configured_residency_dtype()
         for cart_id in preload:
             if cart_id not in self._cartridge_meta:
                 logger.warning(
@@ -662,12 +760,31 @@ class CartridgeConnector(KVConnectorBase_V1):
                     cart_id,
                 )
                 continue
-            ok = self._residency.prefetch(str(cart_id))
+            ok = self._residency.prefetch(str(cart_id), dtype=target_dtype)
             logger.info(
                 "preload: cartridge=%s resident=%s",
                 cart_id,
                 ok,
             )
+
+    def _configured_residency_dtype(
+        self,
+    ) -> torch.dtype | tuple[torch.dtype, torch.dtype] | None:
+        """Resolve a cache-compatible dtype for eager GPU preloads."""
+        if self._separate_asymmetric_attention:
+            return self._vllm_config.model_config.dtype, torch.float8_e4m3fn
+        cache_dtype = self._vllm_config.cache_config.cache_dtype
+        if not is_asymmetric_kv(cache_dtype):
+            return None
+
+        def resolve(dtype_name: str) -> torch.dtype:
+            if dtype_name in ("fp8", "fp8_e4m3"):
+                return torch.float8_e4m3fn
+            if dtype_name == "fp8_e5m2":
+                return torch.float8_e5m2
+            return self._vllm_config.model_config.dtype
+
+        return resolve(cache_dtype_k(cache_dtype)), resolve(cache_dtype_v(cache_dtype))
 
     def _build_router_from_config(self) -> CartridgeRouter:
         """Build the CartridgeRouter from extra_config.
@@ -844,15 +961,21 @@ class CartridgeConnector(KVConnectorBase_V1):
                 )
                 continue
 
-            num_blocks = num_tokens // self._block_size
-            block_ids = new_req.block_ids[0]
-            cartridge_block_ids = block_ids[:num_blocks]
-            block_ids_tensor = torch.tensor(cartridge_block_ids, dtype=torch.long)
-            block_offsets = torch.arange(0, self._block_size, dtype=torch.long)
-            slot_mapping = (
-                block_offsets.reshape(1, self._block_size)
-                + block_ids_tensor.reshape(-1, 1) * self._block_size
-            ).flatten()
+            if self._separate_asymmetric_attention:
+                # These logical prefix positions have already been replaced by
+                # null blocks. The shared cache is addressed by its own fixed
+                # page table, so there is intentionally no injection mapping.
+                slot_mapping = torch.empty(0, dtype=torch.long)
+            else:
+                num_blocks = num_tokens // self._block_size
+                block_ids = new_req.block_ids[0]
+                cartridge_block_ids = block_ids[:num_blocks]
+                block_ids_tensor = torch.tensor(cartridge_block_ids, dtype=torch.long)
+                block_offsets = torch.arange(0, self._block_size, dtype=torch.long)
+                slot_mapping = (
+                    block_offsets.reshape(1, self._block_size)
+                    + block_ids_tensor.reshape(-1, 1) * self._block_size
+                ).flatten()
 
             meta.requests.append(
                 CartridgeReqMeta(
@@ -916,6 +1039,11 @@ class CartridgeConnector(KVConnectorBase_V1):
         # promotion; from then on all requests for that cartridge hit
         # the tier without re-converting.
         target_device, target_dtype = self._peek_target_device_dtype(forward_context)
+        if self._separate_asymmetric_attention:
+            target_dtype = (
+                self._vllm_config.model_config.dtype,
+                torch.float8_e4m3fn,
+            )
 
         # Acquire GPU residency per unique cartridge — this is the
         # pin. Promotion happens here on first use; subsequent
@@ -936,6 +1064,17 @@ class CartridgeConnector(KVConnectorBase_V1):
                 # the finally block; request will fall through.
 
         try:
+            if self._separate_asymmetric_attention:
+                if len(acquired_ids) != 1:
+                    raise RuntimeError(
+                        "separate_asymmetric attention requires exactly one "
+                        "resident singleton cartridge"
+                    )
+                self._bind_external_cartridge(
+                    cartridge_id=acquired_ids[0],
+                    forward_context=forward_context,
+                )
+                return
             for request in metadata.requests:
                 cart_id = request.cartridge_id
                 if cart_id not in acquired_ids:
@@ -958,6 +1097,56 @@ class CartridgeConnector(KVConnectorBase_V1):
             for cart_id in acquired_ids:
                 self._residency.release(cart_id)
 
+    def _bind_external_cartridge(
+        self,
+        cartridge_id: str,
+        forward_context: "ForwardContext",
+    ) -> None:
+        """Bind singleton cartridge pages directly to attention layers.
+
+        K remains in the model dtype and V remains FP8. The regular vLLM
+        cache contains only the live suffix; FlashInfer reads both regions in
+        one online-softmax attention kernel.
+        """
+        num_layers = self._cartridge_meta[cartridge_id]["num_layers"]
+        num_tokens = self._cartridge_meta[cartridge_id]["num_tokens"]
+        num_pages = num_tokens // self._block_size
+
+        for layer_name, layer in forward_context.no_compile_layers.items():
+            layer_idx = self._extract_layer_idx(layer_name)
+            if layer_idx is None or layer_idx >= num_layers:
+                continue
+            src_kv = self._fetch_source_kv(cartridge_id, layer_idx)
+            if src_kv is None or not isinstance(src_kv, tuple):
+                raise RuntimeError(
+                    "separate_asymmetric residency must return split K/V planes"
+                )
+            src_key, src_value = src_kv
+            if self._tp_size > 1:
+                n_heads = src_key.shape[-2]
+                heads_per_rank = n_heads // self._tp_size
+                h_start = self._tp_rank * heads_per_rank
+                h_end = h_start + heads_per_rank
+                src_key = src_key[..., h_start:h_end, :]
+                src_value = src_value[..., h_start:h_end, :]
+            num_heads = src_key.shape[-2]
+            head_dim = src_key.shape[-1]
+            external_kv = (
+                src_key.contiguous().view(
+                    num_pages,
+                    self._block_size,
+                    num_heads,
+                    head_dim,
+                ),
+                src_value.contiguous().view(
+                    num_pages,
+                    self._block_size,
+                    num_heads,
+                    head_dim,
+                ),
+            )
+            layer.cartridge_kv_cache = external_kv
+
     # ------------------------------------------------------------------
     # Injection helpers (separated so the fetch tier can evolve
     # without touching the slot-mapping/write path)
@@ -970,9 +1159,10 @@ class CartridgeConnector(KVConnectorBase_V1):
         """Infer the paged-cache device + dtype from the first layer
         in the forward context.
 
-        Returns ``(device, dtype)``; both may be None if no layer
-        has a populated ``kv_cache``. The residency manager tolerates
-        ``dtype=None`` (means "keep store dtype").
+        Returns ``(device, dtype_spec)``; asymmetric caches return a
+        ``(k_dtype, v_dtype)`` pair so cartridge residency preserves
+        the native split layout instead of expanding V back to BF16.
+        Both may be None if no layer has a populated ``kv_cache``.
         """
         for layer_name in forward_context.no_compile_layers:
             layer = forward_context.no_compile_layers[layer_name]
@@ -988,6 +1178,15 @@ class CartridgeConnector(KVConnectorBase_V1):
             else:
                 if len(kv_cache_attr) == 0:
                     continue
+                if (
+                    len(kv_cache_attr) == 2
+                    and isinstance(kv_cache_attr[0], torch.Tensor)
+                    and isinstance(kv_cache_attr[1], torch.Tensor)
+                    and kv_cache_attr[0].dim() == 4
+                    and kv_cache_attr[1].dim() == 4
+                ):
+                    key_cache, value_cache = kv_cache_attr
+                    return key_cache.device, (key_cache.dtype, value_cache.dtype)
                 kv = kv_cache_attr[0]
             return kv.device, kv.dtype
         return None, None
@@ -1085,9 +1284,12 @@ class CartridgeConnector(KVConnectorBase_V1):
         self,
         cartridge_id: str,
         layer_idx: int,
-    ) -> "torch.Tensor | None":
-        """Return the device-correct (K,V) stacked tensor for one
-        layer.
+    ) -> "torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None":
+        """Return the device-correct K/V chunk for one layer.
+
+        Symmetric residency returns a stacked tensor; asymmetric
+        residency returns separate K and V planes so FP8 V remains
+        physically FP8 all the way into the cache writer.
 
         Delegates to the residency manager. No CPU->GPU copy on the
         hot path: promotion happened at acquire() time and every

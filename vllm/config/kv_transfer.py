@@ -83,9 +83,20 @@ class KVTransferConfig:
         excluding anything before input ids/embeddings and after
         the final hidden states.
         """
-        # no factors to consider.
-        # this config will not affect the computation graph.
         factors: list[Any] = []
+        # Most connectors only move bytes into the ordinary KV cache and do not
+        # alter the model graph. Cartridge-only asymmetric attention adds a
+        # second attention source whose fixed prefix length sizes its plan, so
+        # those two deployment knobs must distinguish compilation hashes.
+        if self.kv_connector == "CartridgeConnector":
+            mode = self.kv_connector_extra_config.get(
+                "cartridge_attention_mode", "inject"
+            )
+            factors.append(mode)
+            if mode == "separate_asymmetric":
+                factors.append(
+                    int(self.kv_connector_extra_config.get("cartridge_num_tokens", 0))
+                )
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
 

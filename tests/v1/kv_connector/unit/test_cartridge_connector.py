@@ -21,6 +21,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from vllm.config import KVTransferConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.cartridge_connector import (
     align_to_block_size,
     inject_kv_into_paged_cache,
@@ -29,6 +30,41 @@ from vllm.distributed.kv_transfer.kv_connector.v1.cartridge_connector import (
 from vllm.v1.attention.backend import AttentionImpl
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
+
+
+def test_separate_asymmetric_configuration_affects_compilation_hash():
+    inject = KVTransferConfig(
+        kv_connector="CartridgeConnector",
+        kv_role="kv_both",
+    )
+    separate_632 = KVTransferConfig(
+        kv_connector="CartridgeConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={
+            "cartridge_attention_mode": "separate_asymmetric",
+            "cartridge_num_tokens": 632,
+        },
+    )
+    separate_640 = KVTransferConfig(
+        kv_connector="CartridgeConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={
+            "cartridge_attention_mode": "separate_asymmetric",
+            "cartridge_num_tokens": 640,
+        },
+    )
+
+    assert (
+        len(
+            {
+                inject.compute_hash(),
+                separate_632.compute_hash(),
+                separate_640.compute_hash(),
+            }
+        )
+        == 3
+    )
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -44,7 +80,7 @@ def _make_trainable_cache(
     include_frozen=True,
 ):
     """Create a TrainableCache-style checkpoint dict."""
-    cache = {
+    cache: dict[str, list[torch.Tensor]] = {
         "trainable_keys": [],
         "trainable_values": [],
     }
@@ -388,6 +424,63 @@ class TestInjectWritePathDispatch:
         assert torch.equal(key, src_key)
         assert torch.equal(value, src_value)
         assert sm.dtype == torch.int64
+        flat_write.assert_not_called()
+
+    def test_backend_native_hook_used_for_asymmetric_cache_tuple(self):
+        src_key, src_value = self._srcs()
+        key_cache = torch.empty(4, 16, 2, 4, dtype=torch.bfloat16)
+        value_cache = torch.empty(4, 16, 2, 4, dtype=torch.float8_e4m3fn)
+        slot_mapping = torch.arange(0, 16, dtype=torch.int64)
+        impl = _StubAttentionImpl()
+        attn_layer = SimpleNamespace(impl=impl)
+
+        with patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1."
+            "cartridge_connector.ops.reshape_and_cache_flash"
+        ) as flat_write:
+            inject_kv_into_paged_cache(
+                src_key=src_key,
+                src_value=src_value,
+                kv_cache_layer=(key_cache, value_cache),
+                slot_mapping=slot_mapping,
+                attn_layer=attn_layer,
+            )
+
+        assert len(impl.calls) == 1
+        key, value, cache, sm = impl.calls[0]
+        assert isinstance(cache, tuple)
+        assert cache[0] is key_cache
+        assert cache[1] is value_cache
+        assert torch.equal(key, src_key)
+        assert torch.equal(value, src_value)
+        assert torch.equal(sm, slot_mapping)
+        flat_write.assert_not_called()
+
+    def test_prequantized_asymmetric_tuple_is_scattered_without_requantizing(self):
+        src_key = torch.arange(16 * 2 * 4, dtype=torch.float32).reshape(16, 2, 4)
+        src_key = src_key.to(torch.bfloat16)
+        src_value = (src_key.float() / 8).to(torch.float8_e4m3fn)
+        key_cache = torch.zeros(4, 16, 2, 4, dtype=torch.bfloat16)
+        value_cache = torch.zeros(4, 16, 2, 4, dtype=torch.float8_e4m3fn)
+        slot_mapping = torch.arange(32, 48, dtype=torch.int64)
+        impl = _StubAttentionImpl()
+        attn_layer = SimpleNamespace(impl=impl)
+
+        with patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1."
+            "cartridge_connector.ops.reshape_and_cache_flash"
+        ) as flat_write:
+            inject_kv_into_paged_cache(
+                src_key=src_key,
+                src_value=src_value,
+                kv_cache_layer=(key_cache, value_cache),
+                slot_mapping=slot_mapping,
+                attn_layer=attn_layer,
+            )
+
+        assert impl.calls == []
+        assert torch.equal(key_cache[2], src_key)
+        assert torch.equal(value_cache[2], src_value)
         flat_write.assert_not_called()
 
     def test_non_standard_impl_falls_back_to_flat_write(self):

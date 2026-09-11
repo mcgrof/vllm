@@ -5,7 +5,7 @@
 from dataclasses import dataclass
 from enum import Enum
 from functools import partial
-from typing import ClassVar
+from typing import ClassVar, cast
 
 import numpy as np
 import torch
@@ -29,6 +29,7 @@ from vllm.config import (
 )
 from vllm.config.cache import (
     CacheDType,
+    CacheDTypeSpec,
     cache_dtype_k,
     cache_dtype_v,
     is_asymmetric_kv,
@@ -94,6 +95,12 @@ FP4_DTYPE = torch.uint8
 logger = init_logger(__name__)
 
 trtllm_workspace_buffer = None
+
+_CARTRIDGE_ATTENTION_VARIANT = r"""
+#include <flashinfer/attention/hopper/variants.cuh>
+using CartridgeAttention =
+    flashinfer::DefaultAttention<USE_LOGITS_SOFT_CAP>;
+"""
 
 
 def _get_trtllm_workspace_buffer():
@@ -363,8 +370,8 @@ class FlashInferBackend(AttentionBackend):
                 and can_use_trtllm_attention(num_qo_heads, num_kv_heads)
             )
         if not use_large_pages:
-            return [16, 32, 64]
-        return [16, 32, 64, 128, 256, 512, 1024]
+            return [8, 16, 32, 64]
+        return [8, 16, 32, 64, 128, 256, 512, 1024]
 
     @staticmethod
     def get_name() -> str:
@@ -418,7 +425,7 @@ class FlashInferBackend(AttentionBackend):
         return stride_order
 
     @staticmethod
-    def get_dtype_for_flashinfer(kv_cache_dtype: str) -> torch.dtype:
+    def get_dtype_for_flashinfer(kv_cache_dtype: CacheDType) -> torch.dtype:
         if kv_cache_dtype in ("fp8", "fp8_e4m3"):
             return torch.float8_e4m3fn
         elif kv_cache_dtype == "fp8_e5m2":
@@ -429,7 +436,7 @@ class FlashInferBackend(AttentionBackend):
             raise ValueError(f"Unrecognized dtype: {kv_cache_dtype}")
 
     @classmethod
-    def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
+    def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDTypeSpec | None) -> bool:
         if kv_cache_dtype == "nvfp4":
             return (
                 current_platform.is_device_capability_family(100)
@@ -591,6 +598,15 @@ class FlashInferMetadata:
     Will be `None` if `num_decode_tokens == 0`.
     """
 
+    cartridge_prefill: FIPrefill | None
+    """Marker for fused cartridge/live prefill using ``prefill``'s wrapper."""
+
+    cartridge_decode: FIDecode | None
+    """Marker for fused cartridge/live decode using ``decode``'s wrapper."""
+
+    cartridge_num_tokens: int
+    """Length of the external cartridge prefix, or zero when disabled."""
+
     # --- Special Case: Cascade Attention ---
 
     use_cascade: bool
@@ -624,6 +640,25 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             None  # Wrapper for non-causal prefill (DFlash)
         )
         self._decode_wrapper = None  # Wrapper for decode (general shape)
+        self._cartridge_prefill_wrapper = None
+        self._cartridge_decode_wrapper = None
+
+        kv_transfer_config = vllm_config.kv_transfer_config
+        cartridge_extra = (
+            kv_transfer_config.kv_connector_extra_config
+            if kv_transfer_config is not None
+            and kv_transfer_config.kv_connector == "CartridgeConnector"
+            else {}
+        )
+        self._separate_asymmetric_cartridge = (
+            cartridge_extra.get("cartridge_attention_mode") == "separate_asymmetric"
+        )
+        self._cartridge_num_tokens = int(cartridge_extra.get("cartridge_num_tokens", 0))
+        if self._separate_asymmetric_cartridge and self._cartridge_num_tokens <= 0:
+            raise ValueError(
+                "separate_asymmetric cartridge attention requires the exact "
+                "cartridge_num_tokens in kv_connector_extra_config"
+            )
 
         if envs.VLLM_BATCH_INVARIANT:
             self.decode_fixed_split_size = 2048
@@ -686,6 +721,27 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.head_dim = self.kv_cache_spec.head_size
         self.page_size = self.kv_cache_spec.block_size
 
+        if self._separate_asymmetric_cartridge:
+            if self._cartridge_num_tokens % self.page_size != 0:
+                raise ValueError(
+                    "separate asymmetric cartridge length must be page aligned: "
+                    f"tokens={self._cartridge_num_tokens}, page_size={self.page_size}"
+                )
+            if self.use_dcp:
+                raise NotImplementedError(
+                    "separate asymmetric cartridge attention does not support DCP"
+                )
+            if self.enable_cuda_graph:
+                raise NotImplementedError(
+                    "separate asymmetric cartridge attention currently requires "
+                    "eager execution"
+                )
+            if num_spec_tokens:
+                raise NotImplementedError(
+                    "separate asymmetric cartridge attention does not support "
+                    "speculative decoding"
+                )
+
         self.cache_dtype = self.cache_config.cache_dtype
         # Asymmetric K/V (bf16/fp16 K + fp8 V): resolve separate K and V
         # dtypes.  Mutually exclusive with nvfp4 and symmetric quantization,
@@ -696,7 +752,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             k_dtype_str = cache_dtype_k(self.cache_dtype)
             v_dtype_str = cache_dtype_v(self.cache_dtype)
 
-            def _resolve_one(dt_str):
+            def _resolve_one(dt_str: CacheDType) -> torch.dtype:
                 if isinstance(dt_str, str) and dt_str.startswith("fp8"):
                     return FlashInferBackend.get_dtype_for_flashinfer(dt_str)
                 assert self.kv_cache_spec.dtype == self.model_config.dtype
@@ -725,6 +781,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 # which is passed to FlashInferImpl
                 self.kv_cache_dtype = self.cache_dtype
             else:
+                assert not isinstance(self.cache_dtype, tuple)
                 self.kv_cache_dtype = FlashInferBackend.get_dtype_for_flashinfer(
                     self.cache_dtype
                 )
@@ -772,6 +829,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # kernel on SM90 and the CUDA-core kernel off SM90 (see
         # _get_decode_wrapper).
         if self._is_asymmetric:
+            can_use_xqa_or_trtllm_gen_decode = False
+        if self._separate_asymmetric_cartridge:
             can_use_xqa_or_trtllm_gen_decode = False
         # Page sizes >= 128 require the trtllm-gen GQA/MQA path (guaranteed by
         # get_supported_kernel_block_sizes).
@@ -908,6 +967,17 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         specdec CUDA graphs limited to trtllm-gen until vLLM wires the XQA
         specdec mask.
         """
+        kv_transfer_config = vllm_config.kv_transfer_config
+        if (
+            kv_transfer_config is not None
+            and kv_transfer_config.kv_connector == "CartridgeConnector"
+            and kv_transfer_config.get_from_extra_config(
+                "cartridge_attention_mode", "inject"
+            )
+            == "separate_asymmetric"
+        ):
+            return AttentionCGSupport.NEVER
+
         if current_platform.is_device_capability(90):
             return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
 
@@ -1058,6 +1128,89 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
         return decode_wrapper
 
+    def _get_cartridge_prefill_wrapper(
+        self,
+    ) -> BatchPrefillWithPagedKVCacheWrapper:
+        if self._cartridge_prefill_wrapper is None:
+            jit_args, jit_kwargs = self._cartridge_jit_config(
+                self.q_data_type_prefill, "prefill"
+            )
+            self._cartridge_prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                self._get_workspace_buffer(),
+                get_kv_cache_layout(),
+                backend="fa3",
+                jit_args=jit_args,
+                jit_kwargs=jit_kwargs,
+            )
+        return self._cartridge_prefill_wrapper
+
+    def _get_cartridge_decode_wrapper(self) -> BatchDecodeWithPagedKVCacheWrapper:
+        if self._cartridge_decode_wrapper is None:
+            jit_args, jit_kwargs = self._cartridge_jit_config(
+                self.q_data_type_decode, "decode"
+            )
+            self._cartridge_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
+                self._get_workspace_buffer(),
+                get_kv_cache_layout(),
+                use_tensor_cores=True,
+                backend="fa3",
+                jit_args=jit_args,
+                jit_kwargs=jit_kwargs,
+            )
+        return self._cartridge_decode_wrapper
+
+    def _cartridge_jit_config(
+        self, q_dtype: torch.dtype, phase: str
+    ) -> tuple[tuple, dict[str, torch.dtype]]:
+        """Build the one-pass mixed cartridge/live FA3 specialization."""
+        if not current_platform.is_device_capability(90):
+            raise NotImplementedError(
+                "fused asymmetric cartridge attention currently requires an "
+                "SM90 GPU and the FlashInfer FA3 backend"
+            )
+        if torch.float8_e4m3fn != FP8_DTYPE:
+            raise NotImplementedError(
+                "fused cartridge V currently supports FP8 E4M3 storage only"
+            )
+        live_v_name = str(self.v_cache_dtype).removeprefix("torch.")
+        q_name = str(q_dtype).removeprefix("torch.")
+        uri = f"vllm_cartridge_mixed_{phase}_{q_name}_{live_v_name}_h{self.head_dim}"
+        scalar_names = [
+            "cartridge_num_tokens",
+            "cartridge_k_page_stride",
+            "cartridge_v_page_stride",
+            "logits_soft_cap",
+            "sm_scale",
+        ]
+        scalar_dtypes = ["int64_t", "int64_t", "int64_t", "double", "double"]
+        if phase == "decode":
+            scalar_names.append("cartridge_decode_marker")
+            scalar_dtypes.append("int64_t")
+        jit_args = (
+            uri,
+            q_dtype,
+            self.k_cache_dtype,
+            self.model_config.dtype,
+            torch.int32,
+            self.head_dim,
+            self.head_dim,
+            ["cartridge_k_ptr", "cartridge_v_ptr"],
+            ["DTypeK", "__nv_fp8_e4m3"],
+            scalar_names,
+            scalar_dtypes,
+            "CartridgeAttention",
+            _CARTRIDGE_ATTENTION_VARIANT,
+            0,  # no in-kernel positional encoding; vLLM applies RoPE
+            False,  # sliding window
+            bool(self.logits_soft_cap),
+            False,  # fp16 qk reduction
+            False,  # FP8 Q
+        )
+        return jit_args, {
+            "dtype_k": self.k_cache_dtype,
+            "dtype_v": self.v_cache_dtype,
+        }
+
     def _get_cascade_wrapper(self):
         if self._cascade_wrapper is None:
             self._cascade_wrapper = MultiLevelCascadeAttentionWrapper(
@@ -1072,6 +1225,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         block_table_tensor: torch.Tensor,
         num_reqs: int,
         page_size: int,
+        cartridge_num_pages: int = 0,
     ) -> torch.Tensor:
         """
         Compute paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len for FlashInfer
@@ -1083,8 +1237,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         Returns paged_kv_indices, a GPU tensor with shape [num_actual_pages].
         """
         # write self.paged_kv_indptr_cpu inplace (0-index is always 0)
+        planned_num_blocks_np = num_blocks_np + cartridge_num_pages
         np.cumsum(
-            num_blocks_np,
+            planned_num_blocks_np,
             dtype=np.int32,
             out=self.paged_kv_indptr.np[1 : num_reqs + 1],
         )
@@ -1102,13 +1257,23 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # write self.paged_kv_indices inplace
         num_actual_pages = self.paged_kv_indptr.np[num_reqs]
         paged_kv_indices = self.paged_kv_indices.gpu[:num_actual_pages]
-        _copy_page_indices_kernel[(num_reqs,)](
-            paged_kv_indices,
-            block_table_tensor,
-            block_table_tensor.stride(0),
-            paged_kv_indptr,
-            BLOCK_SIZE=1024,
-        )
+        if cartridge_num_pages:
+            _copy_cartridge_page_indices_kernel[(num_reqs,)](
+                paged_kv_indices,
+                block_table_tensor,
+                block_table_tensor.stride(0),
+                paged_kv_indptr,
+                cartridge_num_pages,
+                BLOCK_SIZE=1024,
+            )
+        else:
+            _copy_page_indices_kernel[(num_reqs,)](
+                paged_kv_indices,
+                block_table_tensor,
+                block_table_tensor.stride(0),
+                paged_kv_indptr,
+                BLOCK_SIZE=1024,
+            )
 
         # write self.paged_kv_last_page_len_cpu inplace
         paged_kv_last_page_len_np = seq_lens_np % page_size
@@ -1154,6 +1319,50 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         qo_indptr = common_attn_metadata.query_start_loc
         qo_indptr_cpu = common_attn_metadata.query_start_loc_cpu
 
+        # Engine/kernel warm-up builds ordinary synthetic sequences even when
+        # the connector is configured for an external cartridge.  A real
+        # cartridge request has the full externally-computed prefix in its
+        # logical sequence length; the synthetic rows do not.  Keep those rows
+        # on the regular attention path.  Runtime batches are homogeneous in
+        # the current singleton connector mode.
+        use_external_cartridge = (
+            self._separate_asymmetric_cartridge
+            and max_seq_len > self._cartridge_num_tokens
+        )
+
+        if use_external_cartridge:
+            if not causal:
+                raise NotImplementedError(
+                    "separate asymmetric cartridge attention requires causal "
+                    "decoder attention"
+                )
+            if common_prefix_len > 0:
+                raise RuntimeError(
+                    "separate asymmetric cartridge attention cannot be combined "
+                    "with vLLM cascade/prefix-cache attention"
+                )
+            if num_decode_tokens != num_decodes:
+                raise NotImplementedError(
+                    "separate asymmetric cartridge attention currently requires "
+                    "one query token per decode request"
+                )
+            cartridge_num_pages = self._cartridge_num_tokens // page_size
+            if block_table_tensor.shape[1] < cartridge_num_pages:
+                raise RuntimeError(
+                    "block table is shorter than the external cartridge prefix: "
+                    f"columns={block_table_tensor.shape[1]}, "
+                    f"cartridge_pages={cartridge_num_pages}"
+                )
+            # The scheduler retained these logical positions as null blocks but
+            # returned their physical pages to the ordinary cache pool. FlashInfer
+            # must see only the live suffix in its regular-cache plan.
+            block_table_tensor = block_table_tensor[:, cartridge_num_pages:]
+            max_seq_len -= self._cartridge_num_tokens
+            if max_seq_len <= 0:
+                raise RuntimeError(
+                    "a cartridge request must contain at least one live token"
+                )
+
         # Step 1: Decide which dispatch modes to use:
         # - Cascade attention (distinct mode)
         # - Prefill (FI native or TRTLLM)
@@ -1181,6 +1390,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             has_sinks=self.has_sinks,
             has_spec=uses_spec_reorder,
         )
+        if use_external_cartridge:
+            prefill_use_trtllm = False
         decode_with_flashinfer_trtllm_api = (
             causal and self.use_trtllm_decode_attention and self.dcp_world_size <= 1
         )
@@ -1236,6 +1447,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             use_cascade=use_cascade,
             prefill=None,
             decode=None,
+            cartridge_prefill=None,
+            cartridge_decode=None,
+            cartridge_num_tokens=(
+                self._cartridge_num_tokens if use_external_cartridge else 0
+            ),
             cascade_wrapper=None,
         )
 
@@ -1246,6 +1462,14 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # (block_tables, seq_lens) directly.
         needs_seq_lens_cpu = self.use_dcp or use_cascade or not all_uses_trtllm
         seq_lens_cpu = common_attn_metadata.seq_lens_cpu if needs_seq_lens_cpu else None
+        if use_external_cartridge:
+            assert seq_lens_cpu is not None
+            seq_lens_cpu = seq_lens_cpu.clone()
+            seq_lens_cpu -= self._cartridge_num_tokens
+            if bool((seq_lens_cpu[:num_reqs] <= 0).any()):
+                raise RuntimeError(
+                    "every separate-cartridge request must have a live suffix"
+                )
         seq_lens_np = seq_lens_cpu.numpy() if seq_lens_cpu is not None else None
         num_blocks_np = (
             (seq_lens_np + (page_size - 1)) // page_size
@@ -1294,6 +1518,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 block_table_tensor,
                 num_reqs,
                 page_size,
+                cartridge_num_pages=(
+                    self._cartridge_num_tokens // page_size
+                    if use_external_cartridge
+                    else 0
+                ),
             )
         else:
             paged_kv_indices = None
@@ -1393,7 +1622,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     max_seq_len=max_seq_len,
                 )
             else:
-                prefill_wrapper = self._get_prefill_wrapper(causal=attn_metadata.causal)
+                prefill_wrapper = (
+                    self._get_cartridge_prefill_wrapper()
+                    if use_external_cartridge
+                    else self._get_prefill_wrapper(causal=attn_metadata.causal)
+                )
                 # Slicing CPU buffers that are only needed for FI native prefills
                 paged_kv_last_page_len_prefill_cpu = self.paged_kv_last_page_len.cpu[
                     prefill_start:num_reqs
@@ -1458,7 +1691,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         **self._asym_plan_kwargs,
                         o_data_type=o_dtype,
                         fixed_split_size=self.prefill_fixed_split_size,
-                        disable_split_kv=self.disable_split_kv,
+                        disable_split_kv=(
+                            True if use_external_cartridge else self.disable_split_kv
+                        ),
                     )
                 attn_metadata.prefill = FIPrefill(wrapper=prefill_wrapper)
 
@@ -1486,8 +1721,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 )
                 num_input_tokens = num_decode_tokens
 
-                decode_wrapper = self._get_decode_wrapper(
-                    num_input_tokens, use_cudagraph
+                decode_wrapper = (
+                    self._get_cartridge_decode_wrapper()
+                    if use_external_cartridge
+                    else self._get_decode_wrapper(num_input_tokens, use_cudagraph)
                 )
                 # Use the persistent buffer with padding length,
                 # instead of the same address but chunked version
@@ -1522,7 +1759,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     # FP8 V tensor. Empty when symmetric.
                     **self._asym_plan_kwargs,
                     o_data_type=o_dtype,
-                    # Asymmetric K/V decode: pass fixed_split_size=None. Off
+                    # Asymmetric K/V decode: pass fixed_split_size=-1. Off
                     # SM90 it runs on the CUDA-core kernel, which rejects
                     # fixed_split_size (a tensor-core-only feature). On SM90 it
                     # runs on the tensor-core prefill-as-decode kernel, which
@@ -1530,11 +1767,28 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     # the validated dispatch (enabling it is a possible future
                     # optimization). See _get_decode_wrapper.
                     fixed_split_size=(
-                        None if self._is_asymmetric else self.decode_fixed_split_size
+                        -1
+                        if self._is_asymmetric or use_external_cartridge
+                        else self.decode_fixed_split_size
                     ),
-                    disable_split_kv=self.disable_split_kv,
+                    disable_split_kv=(
+                        True if use_external_cartridge else self.disable_split_kv
+                    ),
                 )
                 attn_metadata.decode = FIDecode(wrapper=decode_wrapper)
+
+        # Mark the phases whose ordinary FIPrefill/FIDecode wrapper is the
+        # custom one-pass mixed-tier kernel.  These aliases carry no second
+        # plan: forward() uses them only to append the external cartridge
+        # pointers to that single wrapper invocation.
+        if use_external_cartridge:
+            if num_prefills > 0:
+                assert isinstance(attn_metadata.prefill, FIPrefill)
+                attn_metadata.cartridge_prefill = attn_metadata.prefill
+
+            if num_decodes > 0:
+                assert isinstance(attn_metadata.decode, FIDecode)
+                attn_metadata.cartridge_decode = attn_metadata.decode
         return attn_metadata
 
     def use_cascade_attention(self, *args, **kwargs) -> bool:
@@ -1649,7 +1903,7 @@ class FlashInferImpl(AttentionImpl):
         num_kv_heads: int,
         alibi_slopes: list[float] | None,
         sliding_window: int | None,
-        kv_cache_dtype: str,
+        kv_cache_dtype: CacheDTypeSpec,
         logits_soft_cap: float | None = None,
         attn_type: AttentionType = AttentionType.DECODER,
         kv_sharing_target_layer_name: int | None = None,
@@ -1671,6 +1925,7 @@ class FlashInferImpl(AttentionImpl):
         )
         # Asymmetric: extract K dtype string for FP8 checks,
         # store V dtype for the cache write path.
+        self._v_cache_str: CacheDType | None
         if isinstance(kv_cache_dtype, tuple):
             self.kv_cache_dtype = kv_cache_dtype[0]
             self._v_cache_str = kv_cache_dtype[1]
@@ -1903,17 +2158,36 @@ class FlashInferImpl(AttentionImpl):
         # no `.dtype`) and the asym read-prep branch is taken instead. This
         # is a cheap isinstance check; safe on the eager-mode hot path.
         is_asym = _is_asym_paged_kv_cache(kv_cache)
+        has_external_cartridge = attn_metadata.cartridge_num_tokens > 0
+        cartridge_paged_kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None
+        if has_external_cartridge:
+            cartridge_kv_cache = getattr(layer, "cartridge_kv_cache", None)
+            if not _is_asym_paged_kv_cache(cartridge_kv_cache):
+                raise RuntimeError(
+                    "CartridgeConnector did not bind the external asymmetric "
+                    f"cartridge cache for layer {getattr(layer, 'layer_name', '?')}"
+                )
+            cartridge_paged_kv_cache = cast(
+                tuple[torch.Tensor, torch.Tensor],
+                _prepare_flashinfer_paged_kv_cache(cartridge_kv_cache),
+            )
 
         # FlashInfer treats uint8 KV cache as NVFP4. vLLM stores FP8 KV cache
         # as uint8 bytes, so pass FP8 caches with their logical dtype.
-        if not is_asym and not self.is_kvcache_nvfp4 and kv_cache.dtype == torch.uint8:
+        symmetric_kv_cache = cast(torch.Tensor, kv_cache) if not is_asym else None
+        if (
+            symmetric_kv_cache is not None
+            and not self.is_kvcache_nvfp4
+            and symmetric_kv_cache.dtype == torch.uint8
+        ):
             fp8_view_dtype = None
             if self.kv_cache_dtype in ("fp8", "fp8_e4m3", torch.float8_e4m3fn):
                 fp8_view_dtype = torch.float8_e4m3fn
             elif self.kv_cache_dtype in ("fp8_e5m2", torch.float8_e5m2):
                 fp8_view_dtype = torch.float8_e5m2
             if fp8_view_dtype is not None:
-                kv_cache = kv_cache.view(fp8_view_dtype)
+                symmetric_kv_cache = symmetric_kv_cache.view(fp8_view_dtype)
+                kv_cache = symmetric_kv_cache
 
         # Inputs and outputs may be padded for CUDA graphs
         query = query[:num_actual_tokens]
@@ -1954,8 +2228,11 @@ class FlashInferImpl(AttentionImpl):
         if is_asym:
             paged_kv_cache = _prepare_flashinfer_paged_kv_cache(kv_cache)
         else:
+            assert symmetric_kv_cache is not None
             stride_order = FlashInferBackend.get_kv_cache_stride_order()
-            paged_kv_cache = kv_cache.permute(*stride_order)  # HND and contiguous
+            paged_kv_cache = symmetric_kv_cache.permute(
+                *stride_order
+            )  # HND and contiguous
             # Fix degenerate strides on any size-1 dimension (e.g. num_kv_heads=1
             # with TP=8).  PyTorch permits non-canonical strides on size-1 dims;
             # CUDA TMA requires ≥16-byte alignment on all non-outermost strides.
@@ -2066,9 +2343,27 @@ class FlashInferImpl(AttentionImpl):
                     else:
                         out_prefill = output[num_decode_tokens:]
 
+                    fused_cartridge_prefill = (
+                        attn_metadata.cartridge_prefill is not None
+                    )
+                    if fused_cartridge_prefill:
+                        assert cartridge_paged_kv_cache is not None
+                        prefill_cartridge_args: tuple[object, ...] = (
+                            cartridge_paged_kv_cache[0],
+                            cartridge_paged_kv_cache[1],
+                            attn_metadata.cartridge_num_tokens,
+                            cartridge_paged_kv_cache[0].stride(0),
+                            cartridge_paged_kv_cache[1].stride(0),
+                            self.logits_soft_cap or 0.0,
+                            self.scale,
+                        )
+                    else:
+                        prefill_cartridge_args = ()
+
                     prefill_wrapper.run(
                         prefill_query,
                         paged_kv_cache,
+                        *prefill_cartridge_args,
                         q_scale=layer._q_scale_float,
                         k_scale=layer._k_scale_float,
                         v_scale=layer._v_scale_float,
@@ -2245,9 +2540,25 @@ class FlashInferImpl(AttentionImpl):
                         get_dcp_group(),
                     )
                 else:
+                    fused_cartridge_decode = attn_metadata.cartridge_decode is not None
+                    if fused_cartridge_decode:
+                        assert cartridge_paged_kv_cache is not None
+                        decode_cartridge_args: tuple[object, ...] = (
+                            cartridge_paged_kv_cache[0],
+                            cartridge_paged_kv_cache[1],
+                            attn_metadata.cartridge_num_tokens,
+                            cartridge_paged_kv_cache[0].stride(0),
+                            cartridge_paged_kv_cache[1].stride(0),
+                            self.logits_soft_cap or 0.0,
+                            self.scale,
+                            1,
+                        )
+                    else:
+                        decode_cartridge_args = ()
                     decode_wrapper.run(
                         decode_query,
                         paged_kv_cache,
+                        *decode_cartridge_args,
                         q_scale=layer._q_scale_float,
                         k_scale=layer._k_scale_float,
                         v_scale=layer._v_scale_float,
@@ -2548,4 +2859,38 @@ def _copy_page_indices_kernel(
             page_indices + start_idx + i + offset,
             block_ids,
             mask=i + offset < num_blocks,
+        )
+
+
+@triton.jit
+def _copy_cartridge_page_indices_kernel(
+    page_indices,
+    live_block_table,
+    block_table_stride,
+    cu_num_blocks,
+    cartridge_num_pages,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Build one logical page table: shared cartridge, then live suffix."""
+    req_idx = tl.program_id(0)
+    live_row_ptr = live_block_table + req_idx * block_table_stride
+    start_idx = tl.load(cu_num_blocks + req_idx)
+    end_idx = tl.load(cu_num_blocks + req_idx + 1)
+    num_blocks = end_idx - start_idx
+
+    offset = tl.arange(0, BLOCK_SIZE)
+    for i in tl.range(0, num_blocks, BLOCK_SIZE):
+        logical_page = i + offset
+        is_cartridge = logical_page < cartridge_num_pages
+        live_page = logical_page - cartridge_num_pages
+        block_ids = tl.load(
+            live_row_ptr + live_page,
+            mask=(logical_page < num_blocks) & ~is_cartridge,
+            other=0,
+        )
+        selected = tl.where(is_cartridge, logical_page, block_ids)
+        tl.store(
+            page_indices + start_idx + logical_page,
+            selected,
+            mask=logical_page < num_blocks,
         )
