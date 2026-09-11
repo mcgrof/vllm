@@ -488,6 +488,17 @@ class KVCacheManager:
             request_id, total_computed_tokens, num_prompt_tokens
         )
 
+    def remove_external_prefix_blocks(
+        self,
+        request_id: str,
+        num_external_prefix_tokens: int,
+    ) -> None:
+        """Release blocks for a prefix served from connector-owned storage."""
+        self.coordinator.remove_external_prefix_blocks(
+            request_id,
+            num_external_prefix_tokens,
+        )
+
     def pop_blocks_for_free(self, request: Request) -> list[KVCacheBlock]:
         """Pop the request's bookkeeping and return its blocks without
         returning them to the block pool. The caller must eventually free

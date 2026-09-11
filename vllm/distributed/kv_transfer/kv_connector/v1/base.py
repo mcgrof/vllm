@@ -204,6 +204,17 @@ class KVConnectorBase_V1(ABC):
         """
         return False
 
+    @property
+    def owns_external_kv_prefix(self) -> bool:
+        """Whether externally computed prefix blocks live outside vLLM's cache.
+
+        Connectors normally load into blocks allocated by vLLM. A connector
+        returning True owns a separate attention-visible prefix pool, so the
+        scheduler may replace the corresponding vLLM blocks with null blocks
+        after allocation.
+        """
+        return False
+
     def __init__(
         self,
         vllm_config: "VllmConfig",

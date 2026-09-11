@@ -14,16 +14,66 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     ChunkedLocalAttentionManager,
+    FullAttentionManager,
     RSWAManager,
     SlidingWindowManager,
 )
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
+    FullAttentionSpec,
     RSWASpec,
     SlidingWindowSpec,
 )
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.mark.skip_global_cleanup
+def test_remove_external_prefix_blocks_releases_pages_but_keeps_positions():
+    block_size = 8
+    spec = FullAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.bfloat16,
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=32,
+        enable_caching=False,
+        hash_block_size=block_size,
+    )
+    manager = FullAttentionManager(
+        spec,
+        block_pool=block_pool,
+        enable_caching=False,
+        kv_cache_group_id=0,
+        scheduler_block_size=block_size,
+    )
+
+    request_id = "external-cartridge"
+    manager.allocate_external_computed_blocks(
+        request_id,
+        num_local_computed_tokens=0,
+        num_external_computed_tokens=16,
+    )
+    manager.allocate_new_blocks(
+        request_id,
+        num_tokens=24,
+        num_tokens_main_model=24,
+    )
+    blocks = manager.req_to_blocks[request_id]
+    assert len(blocks) == 3
+    assert all(not block.is_null for block in blocks)
+    free_before = block_pool.get_num_free_blocks()
+
+    manager.remove_external_prefix_blocks(request_id, 16)
+
+    assert blocks[:2] == [block_pool.null_block, block_pool.null_block]
+    assert not blocks[2].is_null
+    assert block_pool.get_num_free_blocks() == free_before + 2
+
+    with pytest.raises(ValueError, match="page aligned"):
+        manager.remove_external_prefix_blocks(request_id, 15)
 
 
 def get_sliding_window_manager(sliding_window_spec, block_pool, enable_caching=True):

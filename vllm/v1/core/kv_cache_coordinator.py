@@ -351,6 +351,17 @@ class KVCacheCoordinator(ABC):
                 request_id, total_computed_tokens, num_prompt_tokens
             )
 
+    def remove_external_prefix_blocks(
+        self,
+        request_id: str,
+        num_external_prefix_tokens: int,
+    ) -> None:
+        for manager in self.single_type_managers:
+            manager.remove_external_prefix_blocks(
+                request_id,
+                num_external_prefix_tokens,
+            )
+
     def get_blocks(self, request_id: str) -> tuple[list[KVCacheBlock], ...]:
         """
         Get the blocks for the request.

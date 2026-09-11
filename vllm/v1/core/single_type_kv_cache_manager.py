@@ -543,6 +543,28 @@ class SingleTypeKVCacheManager(ABC):
         num_skipped_blocks = min(num_skipped_blocks, len(blocks))
         self._remove_blocks_in_range(request_id, 0, num_skipped_blocks)
 
+    def remove_external_prefix_blocks(
+        self,
+        request_id: str,
+        num_external_prefix_tokens: int,
+    ) -> None:
+        """Free a page-aligned external prefix owned by a connector.
+
+        The logical block-table positions remain as null blocks, preserving
+        token positions while avoiding duplicate allocation for KV that lives
+        in a connector-owned attention pool.
+        """
+        if num_external_prefix_tokens % self.block_size != 0:
+            raise ValueError(
+                "connector-owned external prefixes must be page aligned: "
+                f"tokens={num_external_prefix_tokens}, block_size={self.block_size}"
+            )
+        self._remove_blocks_in_range(
+            request_id,
+            0,
+            num_external_prefix_tokens // self.block_size,
+        )
+
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """
         Get the number of tokens that will be skipped for attention computation.

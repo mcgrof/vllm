@@ -936,6 +936,19 @@ class Scheduler(SchedulerInterface):
                         num_external_computed_tokens,
                     )
                     if (
+                        self.connector.owns_external_kv_prefix
+                        and num_external_computed_tokens > 0
+                    ):
+                        if num_new_local_computed_tokens != 0:
+                            raise RuntimeError(
+                                "connector-owned external prefixes cannot be "
+                                "combined with a local prefix-cache hit"
+                            )
+                        self.kv_cache_manager.remove_external_prefix_blocks(
+                            request_id,
+                            num_external_computed_tokens,
+                        )
+                    if (
                         self.connector_prefix_cache_stats is not None
                         and connector_prefix_cache_queries != 0
                     ):
