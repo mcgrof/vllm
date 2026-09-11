@@ -52,7 +52,7 @@ from __future__ import annotations
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeAlias
 
 import torch
 
@@ -64,6 +64,9 @@ if TYPE_CHECKING:
     )
 
 logger = init_logger(__name__)
+
+KVChunk: TypeAlias = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+DTypeSpec: TypeAlias = torch.dtype | tuple[torch.dtype, torch.dtype] | None
 
 
 @dataclass
@@ -112,7 +115,7 @@ class _CartridgeGPUEntry:
     """
 
     cartridge_id: str
-    chunks: dict[int, torch.Tensor] = field(default_factory=dict)
+    chunks: dict[int, KVChunk] = field(default_factory=dict)
     bytes: int = 0
     ref_count: int = 0
     last_used: int = 0
@@ -181,7 +184,7 @@ class GPUResidencyManager:
     def acquire(
         self,
         cartridge_id: str,
-        dtype: torch.dtype | None = None,
+        dtype: DTypeSpec = None,
     ) -> None:
         """Ensure all chunks of ``cartridge_id`` are resident on the
         GPU tier and pin the cartridge against eviction.
@@ -198,7 +201,10 @@ class GPUResidencyManager:
 
         ``dtype`` optionally requests promotion into a specific GPU
         dtype (typically the paged-cache dtype, e.g. ``bfloat16``).
-        If omitted, the store's native dtype is used.
+        A ``(k_dtype, v_dtype)`` pair preserves the two cartridge
+        planes independently, which is required for asymmetric caches
+        such as BF16-K / FP8-V. If omitted, the store's native dtype is
+        used.
         """
         with self._lock:
             entry = self._entries.get(cartridge_id)
@@ -221,7 +227,7 @@ class GPUResidencyManager:
             # to GPU.
             chunks_cpu = self._fetch_cpu_chunks(cartridge_id)
             required_bytes = sum(
-                t.nelement() * self._element_size(t, dtype) for t in chunks_cpu.values()
+                self._chunk_nbytes_for_dtype(t, dtype) for t in chunks_cpu.values()
             )
             if required_bytes > self._capacity_bytes:
                 raise GPUResidencyError(
@@ -235,16 +241,12 @@ class GPUResidencyManager:
             # Promote to GPU.
             new_entry = _CartridgeGPUEntry(cartridge_id=cartridge_id)
             promoted_bytes = 0
-            for layer_idx, cpu_tensor in sorted(chunks_cpu.items()):
-                gpu_tensor = cpu_tensor.to(
-                    device=self._device,
-                    dtype=dtype or cpu_tensor.dtype,
-                    non_blocking=False,
-                )
-                new_entry.chunks[layer_idx] = gpu_tensor
-                tensor_bytes = gpu_tensor.nelement() * gpu_tensor.element_size()
-                new_entry.bytes += tensor_bytes
-                promoted_bytes += tensor_bytes
+            for layer_idx, cpu_chunk in sorted(chunks_cpu.items()):
+                gpu_chunk = self._promote_chunk(cpu_chunk, dtype)
+                new_entry.chunks[layer_idx] = gpu_chunk
+                chunk_bytes = self._chunk_nbytes(gpu_chunk)
+                new_entry.bytes += chunk_bytes
+                promoted_bytes += chunk_bytes
 
             new_entry.ref_count = 1
             self._tick += 1
@@ -294,8 +296,12 @@ class GPUResidencyManager:
         self,
         cartridge_id: str,
         layer_idx: int,
-    ) -> torch.Tensor:
-        """Return the GPU-resident chunk tensor for a layer.
+    ) -> KVChunk:
+        """Return the GPU-resident chunk for a layer.
+
+        Symmetric residency returns a stacked ``(2, T, H, D)``
+        tensor. Asymmetric residency returns ``(K, V)`` with each
+        plane in its requested dtype.
 
         Caller MUST have called ``acquire(cartridge_id)`` earlier in
         the same logical request. Raises ``GPUResidencyError`` if
@@ -321,7 +327,7 @@ class GPUResidencyManager:
     def prefetch(
         self,
         cartridge_id: str,
-        dtype: torch.dtype | None = None,
+        dtype: DTypeSpec = None,
     ) -> bool:
         """Best-effort promote ``cartridge_id`` to GPU without
         pinning.
@@ -350,7 +356,7 @@ class GPUResidencyManager:
                 )
                 return False
             required_bytes = sum(
-                t.nelement() * self._element_size(t, dtype) for t in chunks_cpu.values()
+                self._chunk_nbytes_for_dtype(t, dtype) for t in chunks_cpu.values()
             )
             if required_bytes > self._capacity_bytes:
                 return False
@@ -359,14 +365,10 @@ class GPUResidencyManager:
                 return False
 
             new_entry = _CartridgeGPUEntry(cartridge_id=cartridge_id)
-            for layer_idx, cpu_tensor in sorted(chunks_cpu.items()):
-                gpu_tensor = cpu_tensor.to(
-                    device=self._device,
-                    dtype=dtype or cpu_tensor.dtype,
-                    non_blocking=False,
-                )
-                new_entry.chunks[layer_idx] = gpu_tensor
-                new_entry.bytes += gpu_tensor.nelement() * gpu_tensor.element_size()
+            for layer_idx, cpu_chunk in sorted(chunks_cpu.items()):
+                gpu_chunk = self._promote_chunk(cpu_chunk, dtype)
+                new_entry.chunks[layer_idx] = gpu_chunk
+                new_entry.bytes += self._chunk_nbytes(gpu_chunk)
             new_entry.ref_count = 0  # prefetch does NOT pin
             self._tick += 1
             new_entry.last_used = self._tick
@@ -482,17 +484,65 @@ class GPUResidencyManager:
         finally:
             self._store.release(cartridge_id)
 
-    def _element_size(
-        self,
-        tensor: torch.Tensor,
-        dtype: torch.dtype | None,
-    ) -> int:
-        """Return element size after optional dtype coercion."""
-        if dtype is None or dtype == tensor.dtype:
-            return tensor.element_size()
-        # torch has no element_size() on dtype objects; construct a
-        # zero-element tensor of the target dtype and read from it.
-        return torch.empty(0, dtype=dtype).element_size()
+    @staticmethod
+    def _split_chunk(chunk: KVChunk) -> tuple[torch.Tensor, torch.Tensor]:
+        if isinstance(chunk, tuple):
+            return chunk
+        if chunk.ndim < 1 or chunk.shape[0] != 2:
+            raise GPUResidencyError(
+                "stacked cartridge chunk must have leading K/V dimension of 2; "
+                f"got shape={tuple(chunk.shape)}"
+            )
+        return chunk[0], chunk[1]
+
+    @classmethod
+    def _chunk_nbytes(cls, chunk: KVChunk) -> int:
+        if isinstance(chunk, tuple):
+            return sum(t.nelement() * t.element_size() for t in chunk)
+        return chunk.nelement() * chunk.element_size()
+
+    @classmethod
+    def _chunk_nbytes_for_dtype(cls, chunk: KVChunk, dtype: DTypeSpec) -> int:
+        if isinstance(dtype, tuple):
+            key, value = cls._split_chunk(chunk)
+            k_size = torch.empty(0, dtype=dtype[0]).element_size()
+            v_size = torch.empty(0, dtype=dtype[1]).element_size()
+            return key.nelement() * k_size + value.nelement() * v_size
+        if isinstance(chunk, tuple):
+            target_size = (
+                torch.empty(0, dtype=dtype).element_size()
+                if dtype is not None
+                else None
+            )
+            return sum(t.nelement() * (target_size or t.element_size()) for t in chunk)
+        target_size = (
+            torch.empty(0, dtype=dtype).element_size()
+            if dtype is not None
+            else chunk.element_size()
+        )
+        return chunk.nelement() * target_size
+
+    def _promote_chunk(self, chunk: KVChunk, dtype: DTypeSpec) -> KVChunk:
+        if isinstance(dtype, tuple):
+            key, value = self._split_chunk(chunk)
+            return (
+                key.to(device=self._device, dtype=dtype[0], non_blocking=False),
+                value.to(device=self._device, dtype=dtype[1], non_blocking=False),
+            )
+        if isinstance(chunk, tuple):
+            return tuple(
+                t.to(
+                    device=self._device,
+                    dtype=dtype or t.dtype,
+                    non_blocking=False,
+                )
+                for t in chunk
+            )
+        return chunk.to(
+            device=self._device,
+            dtype=dtype or chunk.dtype,
+            non_blocking=False,
+        )
 
     def _evict_until_fits(
         self,

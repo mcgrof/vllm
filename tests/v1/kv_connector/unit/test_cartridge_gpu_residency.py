@@ -455,6 +455,34 @@ class TestMultiCartridgeRouting:
         assert chunk2.data_ptr() == chunk.data_ptr()
         mgr.release("A")
 
+    def test_asymmetric_dtype_conversion_preserves_split_planes(self):
+        store = _make_store_with_cartridges(["A"])
+        asym_bytes = _chunk_bytes(dtype=torch.bfloat16) * 3 // 4
+        mgr = GPUResidencyManager(
+            store,
+            capacity_bytes=10 * _chunk_bytes(),
+            device="cpu",
+        )
+
+        mgr.acquire("A", dtype=(torch.bfloat16, torch.float8_e4m3fn))
+        chunk = mgr.get_chunk("A", 0)
+        assert isinstance(chunk, tuple)
+        key, value = chunk
+        assert key.dtype == torch.bfloat16
+        assert value.dtype == torch.float8_e4m3fn
+        assert (
+            key.shape
+            == value.shape
+            == (
+                TOKENS_PER_CART,
+                NUM_KV_HEADS,
+                HEAD_DIM,
+            )
+        )
+        assert mgr.resident_bytes() == asym_bytes
+        assert mgr.metrics.bytes_promoted == asym_bytes
+        mgr.release("A")
+
 
 # ---------------------------------------------------------------------------
 # 6. No eager immortal residency
