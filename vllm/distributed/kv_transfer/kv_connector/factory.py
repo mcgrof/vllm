@@ -192,6 +192,12 @@ KVConnectorFactory.register_connector(
 )
 
 KVConnectorFactory.register_connector(
+    "NixlStorageHandoffConnector",
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl_storage.connector",
+    "NixlStorageHandoffConnector",
+)
+
+KVConnectorFactory.register_connector(
     "MultiConnector",
     "vllm.distributed.kv_transfer.kv_connector.v1.multi_connector",
     "MultiConnector",
