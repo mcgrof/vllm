@@ -1209,6 +1209,11 @@ def _expand_flashinfer_variants(
         xqa["compute_capability"] = fi_features["xqa"]["compute_capability"]
         xqa["supports_sink"] = fi_features["xqa"]["supports_sink"]
         xqa["supports_non_causal"] = False
+        xqa["block_sizes"] = ", ".join(
+            size
+            for size in (s.strip() for s in xqa["block_sizes"].split(","))
+            if size != "1"
+        )
         if exclude:
             xqa["kv_cache_dtypes"] = ", ".join(
                 d
@@ -1225,6 +1230,11 @@ def _expand_flashinfer_variants(
             "compute_capability"
         ]
         trtllm_gen["supports_sink"] = fi_features["trtllm_gen"]["supports_sink"]
+        trtllm_gen["block_sizes"] = ", ".join(
+            size
+            for size in (s.strip() for s in trtllm_gen["block_sizes"].split(","))
+            if size != "1"
+        )
 
         expanded.append(native)
         if fi_features["xqa"]["compute_capability"]:
@@ -1836,7 +1846,8 @@ def generate_docs() -> str:
             "> **†** FlashInfer Native is the regular FlashInfer path. XQA is the "
             "SM90 decode path exposed through FlashInfer's TRTLLM decode API. "
             "trtllm-gen is used on SM100 and supports sinks. Disable XQA/trtllm-gen "
-            "via `--attention-config.use_trtllm_attention=0`."
+            "via `--attention-config.use_trtllm_attention=0`. A one-token page always "
+            "uses Native."
         )
     if fa_features:
         footnotes.append(

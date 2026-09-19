@@ -370,8 +370,8 @@ class FlashInferBackend(AttentionBackend):
                 and can_use_trtllm_attention(num_qo_heads, num_kv_heads)
             )
         if not use_large_pages:
-            return [8, 16, 32, 64]
-        return [8, 16, 32, 64, 128, 256, 512, 1024]
+            return [1, 8, 16, 32, 64]
+        return [1, 8, 16, 32, 64, 128, 256, 512, 1024]
 
     @staticmethod
     def get_name() -> str:
@@ -831,6 +831,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         if self._is_asymmetric:
             can_use_xqa_or_trtllm_gen_decode = False
         if self._separate_asymmetric_cartridge:
+            can_use_xqa_or_trtllm_gen_decode = False
+        if self.page_size == 1:
             can_use_xqa_or_trtllm_gen_decode = False
         # Page sizes >= 128 require the trtllm-gen GQA/MQA path (guaranteed by
         # get_supported_kernel_block_sizes).
@@ -1391,6 +1393,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             has_spec=uses_spec_reorder,
         )
         if use_external_cartridge:
+            prefill_use_trtllm = False
+        if page_size == 1:
             prefill_use_trtllm = False
         decode_with_flashinfer_trtllm_api = (
             causal and self.use_trtllm_decode_attention and self.dcp_world_size <= 1
