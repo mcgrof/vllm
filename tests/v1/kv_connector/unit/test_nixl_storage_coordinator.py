@@ -30,7 +30,12 @@ MiB = 1 << 20
 
 def make_manifest(coord, transfer_id, generation, extents, request_id="r1"):
     layers = [
-        LayerSlice(layer_name=f"layers.{i}", extent=e, bytes_per_block=4096, regions_per_block=2)
+        LayerSlice(
+            layer_name=f"layers.{i}",
+            extent=e,
+            bytes_per_block=4096,
+            regions_per_block=2,
+        )
         for i, e in enumerate(extents)
     ]
     return HandoffManifest(
@@ -207,13 +212,17 @@ def test_server_and_client_round_trip():
             assert epoch == coord.session_epoch
             assert consumer.lookup("r7") is None
             producer.call("mark_writing", transfer_id=tid)
-            producer.publish(tid, gen, make_manifest(coord, tid, gen, extents, request_id="r7"))
+            producer.publish(
+                tid, gen, make_manifest(coord, tid, gen, extents, request_id="r7")
+            )
             got = consumer.lookup("r7")
             assert got is not None and got.transfer_id == tid
             lease_id, m = consumer.lease(tid, gen, "decode-0")
             assert m.extents == extents
             with pytest.raises(StaleGeneration):
-                consumer.call("ack", transfer_id=tid, generation=gen + 1, consumer="decode-0")
+                consumer.call(
+                    "ack", transfer_id=tid, generation=gen + 1, consumer="decode-0"
+                )
             consumer.call("ack", transfer_id=tid, generation=gen, consumer="decode-0")
             assert producer.call("reclaim") == 1
             snap = consumer.call("snapshot")
@@ -226,7 +235,9 @@ def test_server_and_client_round_trip():
                 try:
                     cl = CoordinatorClient(path)
                     t, g, e, _ = cl.reserve(f"req-{i}", [256 * 1024])
-                    cl.publish(t, g, make_manifest(coord, t, g, e, request_id=f"req-{i}"))
+                    cl.publish(
+                        t, g, make_manifest(coord, t, g, e, request_id=f"req-{i}")
+                    )
                     cl.lease(t, g, "c")
                     cl.call("ack", transfer_id=t, generation=g, consumer="c")
                     cl.close()

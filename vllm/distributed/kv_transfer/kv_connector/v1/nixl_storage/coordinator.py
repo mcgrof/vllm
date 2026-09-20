@@ -144,7 +144,9 @@ class StorageHandoffCoordinator:
 
     # ---- producer side -----------------------------------------------------
 
-    def reserve(self, request_id: str, lengths: list[int]) -> tuple[str, int, list[Extent]]:
+    def reserve(
+        self, request_id: str, lengths: list[int]
+    ) -> tuple[str, int, list[Extent]]:
         """Allocate one extent per length for a new object of request_id.
         A repeated reservation for the same request id is a new generation
         of the object; the older generation stays until reclaimed."""
@@ -180,7 +182,9 @@ class StorageHandoffCoordinator:
             self._require(obj, ObjectState.RESERVED)
             obj.state = ObjectState.WRITING
 
-    def publish(self, transfer_id: str, generation: int, manifest: HandoffManifest) -> None:
+    def publish(
+        self, transfer_id: str, generation: int, manifest: HandoffManifest
+    ) -> None:
         """READY: only after the producer reports every write succeeded.
         Publication is idempotent for the same generation."""
         with self._lock:
@@ -229,7 +233,9 @@ class StorageHandoffCoordinator:
         with self._lock:
             return self._get(transfer_id).state
 
-    def lease(self, transfer_id: str, generation: int, consumer: str) -> tuple[str, HandoffManifest]:
+    def lease(
+        self, transfer_id: str, generation: int, consumer: str
+    ) -> tuple[str, HandoffManifest]:
         """Grant a consumer the right to read; READY -> READING."""
         with self._lock:
             obj = self._get(transfer_id)
@@ -261,7 +267,7 @@ class StorageHandoffCoordinator:
             lease.acked = True
             lease.drained = True
             self.counters["acks"] += 1
-            if all(l.acked for l in obj.leases.values()):
+            if all(lease.acked for lease in obj.leases.values()):
                 obj.state = ObjectState.ACKED
 
     def consumer_drained(self, transfer_id: str, consumer: str) -> None:
@@ -298,7 +304,7 @@ class StorageHandoffCoordinator:
             lease.acked = True
             lease.drained = True
             obj.error = obj.error or f"force_release({consumer}): {reason}"
-            if all(l.acked for l in obj.leases.values()):
+            if all(lease.acked for lease in obj.leases.values()):
                 obj.state = ObjectState.ACKED
 
     def reclaim(self) -> int:
@@ -307,10 +313,10 @@ class StorageHandoffCoordinator:
         freed = 0
         with self._lock:
             for tid, obj in list(self._objects.items()):
-                if obj.state == ObjectState.ACKED:
-                    ready = obj.producer_drained and all(l.drained for l in obj.leases.values())
-                elif obj.state == ObjectState.DRAINING:
-                    ready = obj.producer_drained and all(l.drained for l in obj.leases.values())
+                if obj.state == ObjectState.ACKED or obj.state == ObjectState.DRAINING:
+                    ready = obj.producer_drained and all(
+                        lease.drained for lease in obj.leases.values()
+                    )
                 else:
                     continue
                 if not ready:
@@ -336,7 +342,10 @@ class StorageHandoffCoordinator:
                         "generation": o.generation,
                         "state": o.state.value,
                         "bytes": sum(e.length for e in o.extents),
-                        "leases": {c: l.acked for c, l in o.leases.items()},
+                        "leases": {
+                            consumer: lease.acked
+                            for consumer, lease in o.leases.items()
+                        },
                         "error": o.error,
                     }
                     for tid, o in self._objects.items()
@@ -357,13 +366,17 @@ class StorageHandoffCoordinator:
     @staticmethod
     def _require(obj: HandoffObject, *states: ObjectState) -> None:
         if obj.state not in states:
-            raise HandoffError(f"{obj.transfer_id} is {obj.state.value}, expected {[s.value for s in states]}")
+            raise HandoffError(
+                f"{obj.transfer_id} is {obj.state.value}, expected "
+                f"{[state.value for state in states]}"
+            )
 
     def _check_generation(self, obj: HandoffObject, generation: int) -> None:
         if generation != obj.generation:
             self.counters["stale_rejected"] += 1
             raise StaleGeneration(
-                f"{obj.transfer_id}: generation {generation} != current {obj.generation}"
+                f"{obj.transfer_id}: generation {generation} != current "
+                f"{obj.generation}"
             )
 
 
@@ -388,7 +401,11 @@ class _Handler(socketserver.StreamRequestHandler):
             except HandoffError as e:
                 reply = {"ok": False, "error": str(e), "kind": type(e).__name__}
             except Exception as e:  # noqa: BLE001
-                reply = {"ok": False, "error": f"{type(e).__name__}: {e}", "kind": "HandoffError"}
+                reply = {
+                    "ok": False,
+                    "error": f"{type(e).__name__}: {e}",
+                    "kind": "HandoffError",
+                }
             self.wfile.write((json.dumps(reply) + "\n").encode())
             self.wfile.flush()
 
@@ -396,14 +413,21 @@ class _Handler(socketserver.StreamRequestHandler):
 def _dispatch(coord: StorageHandoffCoordinator, op: str, args: dict):
     if op == "reserve":
         tid, gen, extents = coord.reserve(args["request_id"], args["lengths"])
-        return {"transfer_id": tid, "generation": gen, "extents": _encode_extents(extents),
-                "session_epoch": coord.session_epoch}
+        return {
+            "transfer_id": tid,
+            "generation": gen,
+            "extents": _encode_extents(extents),
+            "session_epoch": coord.session_epoch,
+        }
     if op == "mark_writing":
         coord.mark_writing(args["transfer_id"])
         return None
     if op == "publish":
-        coord.publish(args["transfer_id"], args["generation"],
-                      HandoffManifest.from_json(args["manifest"]))
+        coord.publish(
+            args["transfer_id"],
+            args["generation"],
+            HandoffManifest.from_json(args["manifest"]),
+        )
         return None
     if op == "fail":
         coord.fail(args["transfer_id"], args["generation"], args["reason"])
@@ -417,7 +441,9 @@ def _dispatch(coord: StorageHandoffCoordinator, op: str, args: dict):
     if op == "state_of":
         return coord.state_of(args["transfer_id"]).value
     if op == "lease":
-        lease_id, m = coord.lease(args["transfer_id"], args["generation"], args["consumer"])
+        lease_id, m = coord.lease(
+            args["transfer_id"], args["generation"], args["consumer"]
+        )
         return {"lease_id": lease_id, "manifest": m.to_json()}
     if op == "ack":
         coord.ack(args["transfer_id"], args["generation"], args["consumer"])
@@ -452,7 +478,9 @@ class CoordinatorServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServ
         self.path = path
 
     def serve_in_thread(self) -> threading.Thread:
-        t = threading.Thread(target=self.serve_forever, name="handoff-coordinator", daemon=True)
+        t = threading.Thread(
+            target=self.serve_forever, name="handoff-coordinator", daemon=True
+        )
         t.start()
         return t
 
@@ -483,26 +511,45 @@ class CoordinatorClient:
         if reply["ok"]:
             return reply["result"]
         kind = reply.get("kind", "HandoffError")
-        exc = {"StaleGeneration": StaleGeneration, "NotReady": NotReady,
-               "OutOfSpace": OutOfSpace}.get(kind, HandoffError)
+        exc = {
+            "StaleGeneration": StaleGeneration,
+            "NotReady": NotReady,
+            "OutOfSpace": OutOfSpace,
+        }.get(kind, HandoffError)
         raise exc(reply["error"])
 
     # typed conveniences
-    def reserve(self, request_id: str, lengths: list[int]) -> tuple[str, int, list[Extent], str]:
+    def reserve(
+        self, request_id: str, lengths: list[int]
+    ) -> tuple[str, int, list[Extent], str]:
         r = self.call("reserve", request_id=request_id, lengths=lengths)
-        return (r["transfer_id"], r["generation"], [Extent(**e) for e in r["extents"]],
-                r["session_epoch"])
+        return (
+            r["transfer_id"],
+            r["generation"],
+            [Extent(**e) for e in r["extents"]],
+            r["session_epoch"],
+        )
 
-    def publish(self, transfer_id: str, generation: int, manifest: HandoffManifest) -> None:
-        self.call("publish", transfer_id=transfer_id, generation=generation,
-                  manifest=manifest.to_json())
+    def publish(
+        self, transfer_id: str, generation: int, manifest: HandoffManifest
+    ) -> None:
+        self.call(
+            "publish",
+            transfer_id=transfer_id,
+            generation=generation,
+            manifest=manifest.to_json(),
+        )
 
     def lookup(self, request_id: str) -> HandoffManifest | None:
         r = self.call("lookup", request_id=request_id)
         return None if r is None else HandoffManifest.from_json(r)
 
-    def lease(self, transfer_id: str, generation: int, consumer: str) -> tuple[str, HandoffManifest]:
-        r = self.call("lease", transfer_id=transfer_id, generation=generation, consumer=consumer)
+    def lease(
+        self, transfer_id: str, generation: int, consumer: str
+    ) -> tuple[str, HandoffManifest]:
+        r = self.call(
+            "lease", transfer_id=transfer_id, generation=generation, consumer=consumer
+        )
         return r["lease_id"], HandoffManifest.from_json(r["manifest"])
 
 
@@ -513,20 +560,29 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(description="storage handoff coordinator")
     parser.add_argument("--socket", required=True)
-    parser.add_argument("--base", type=int, required=True, help="first byte of the range")
+    parser.add_argument(
+        "--base", type=int, required=True, help="first byte of the range"
+    )
     parser.add_argument("--size", type=int, required=True, help="bytes in the range")
     parser.add_argument("--align", type=int, default=4096)
     parser.add_argument("--lease-timeout", type=float, default=60.0)
-    parser.add_argument("--snapshot", default="", help="write a JSON snapshot here on exit")
+    parser.add_argument(
+        "--snapshot", default="", help="write a JSON snapshot here on exit"
+    )
     args = parser.parse_args(argv)
-    coord = StorageHandoffCoordinator(args.base, args.size, args.align, args.lease_timeout)
+    coord = StorageHandoffCoordinator(
+        args.base, args.size, args.align, args.lease_timeout
+    )
     server = CoordinatorServer(args.socket, coord)
     stop = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: stop.set())
     server.serve_in_thread()
-    print(f"coordinator on {args.socket} epoch={coord.session_epoch} "
-          f"range=[{args.base}, +{args.size})", flush=True)
+    print(
+        f"coordinator on {args.socket} epoch={coord.session_epoch} "
+        f"range=[{args.base}, +{args.size})",
+        flush=True,
+    )
     while not stop.wait(1.0):
         coord.expire_leases()
         coord.reclaim()

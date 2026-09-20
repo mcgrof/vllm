@@ -26,7 +26,7 @@ from dataclasses import dataclass
 
 import torch
 
-from .coordinator import ExtentAllocator, OutOfSpace
+from .coordinator import ExtentAllocator
 from .manifest import Extent, LayerSlice
 
 EXPORTERS = ("host", "system_heap", "udmabuf", "udmabuf_hugetlb", "cuda")
@@ -46,8 +46,14 @@ _UDMABUF_FLAGS_CLOEXEC = 1
 
 _libc = ctypes.CDLL(None, use_errno=True)
 _libc.mmap.restype = ctypes.c_void_p
-_libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-                       ctypes.c_long]
+_libc.mmap.argtypes = [
+    ctypes.c_void_p,
+    ctypes.c_size_t,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_long,
+]
 _libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
 _libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
 _MAP_FAILED = ctypes.c_void_p(-1).value
@@ -69,15 +75,35 @@ class _Cuda:
         try:
             self.lib = ctypes.CDLL("libcuda.so.1")
         except OSError as e:
-            raise OSError(0, f"libcuda.so.1: {e}; the cuda exporter needs the NVIDIA driver") from e
-        self.lib.cuGetErrorString.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_char_p)]
-        self.lib.cuMemAlloc_v2.argtypes = [ctypes.POINTER(ctypes.c_ulonglong), ctypes.c_size_t]
+            raise OSError(
+                0, f"libcuda.so.1: {e}; the cuda exporter needs the NVIDIA driver"
+            ) from e
+        self.lib.cuGetErrorString.argtypes = [
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_char_p),
+        ]
+        self.lib.cuMemAlloc_v2.argtypes = [
+            ctypes.POINTER(ctypes.c_ulonglong),
+            ctypes.c_size_t,
+        ]
         self.lib.cuMemFree_v2.argtypes = [ctypes.c_ulonglong]
-        self.lib.cuDeviceGetAttribute.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int]
+        self.lib.cuDeviceGetAttribute.argtypes = [
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
         self.lib.cuMemGetHandleForAddressRange.argtypes = [
-            ctypes.c_void_p, ctypes.c_ulonglong, ctypes.c_size_t, ctypes.c_int, ctypes.c_ulonglong]
+            ctypes.c_void_p,
+            ctypes.c_ulonglong,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_ulonglong,
+        ]
         self.lib.cuCtxGetCurrent.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
-        self.lib.cuDevicePrimaryCtxRetain.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int]
+        self.lib.cuDevicePrimaryCtxRetain.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_int,
+        ]
         self.lib.cuCtxSetCurrent.argtypes = [ctypes.c_void_p]
         self.lib.cuInit.argtypes = [ctypes.c_uint]
 
@@ -85,7 +111,9 @@ class _Cuda:
         if rc != 0:
             msg = ctypes.c_char_p()
             self.lib.cuGetErrorString(rc, ctypes.byref(msg))
-            raise RuntimeError(f"{what}: CUDA error {rc} ({(msg.value or b'?').decode()})")
+            raise RuntimeError(
+                f"{what}: CUDA error {rc} ({(msg.value or b'?').decode()})"
+            )
 
     def ensure_context(self, device: int) -> None:
         ctx = ctypes.c_void_p()
@@ -93,18 +121,27 @@ class _Cuda:
         if ctx.value:
             return
         self.check(self.lib.cuInit(0), "cuInit")
-        self.check(self.lib.cuDevicePrimaryCtxRetain(ctypes.byref(ctx), device), "cuDevicePrimaryCtxRetain")
+        self.check(
+            self.lib.cuDevicePrimaryCtxRetain(ctypes.byref(ctx), device),
+            "cuDevicePrimaryCtxRetain",
+        )
         self.check(self.lib.cuCtxSetCurrent(ctx), "cuCtxSetCurrent")
 
     def dmabuf_supported(self, device: int) -> bool:
         v = ctypes.c_int(0)
-        self.check(self.lib.cuDeviceGetAttribute(ctypes.byref(v), _CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED, device),
-                   "cuDeviceGetAttribute(DMA_BUF_SUPPORTED)")
+        self.check(
+            self.lib.cuDeviceGetAttribute(
+                ctypes.byref(v), _CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED, device
+            ),
+            "cuDeviceGetAttribute(DMA_BUF_SUPPORTED)",
+        )
         return bool(v.value)
 
     def alloc(self, nbytes: int) -> int:
         p = ctypes.c_ulonglong(0)
-        self.check(self.lib.cuMemAlloc_v2(ctypes.byref(p), nbytes), f"cuMemAlloc({nbytes})")
+        self.check(
+            self.lib.cuMemAlloc_v2(ctypes.byref(p), nbytes), f"cuMemAlloc({nbytes})"
+        )
         return p.value
 
     def free(self, ptr: int) -> None:
@@ -115,12 +152,17 @@ class _Cuda:
         was requested with (PCIe when the driver knows the flag)."""
         fd = ctypes.c_int(-1)
         rc = self.lib.cuMemGetHandleForAddressRange(
-            ctypes.byref(fd), ptr, nbytes, _CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD,
-            _CU_MEM_RANGE_FLAG_DMA_BUF_MAPPING_TYPE_PCIE)
+            ctypes.byref(fd),
+            ptr,
+            nbytes,
+            _CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD,
+            _CU_MEM_RANGE_FLAG_DMA_BUF_MAPPING_TYPE_PCIE,
+        )
         if rc == 0:
             return fd.value, "pcie"
         rc = self.lib.cuMemGetHandleForAddressRange(
-            ctypes.byref(fd), ptr, nbytes, _CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0)
+            ctypes.byref(fd), ptr, nbytes, _CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0
+        )
         self.check(rc, f"cuMemGetHandleForAddressRange({nbytes} bytes)")
         return fd.value, "default"
 
@@ -129,9 +171,14 @@ def _clear_cuda_last_error() -> None:
     """cudaGetLastError through the runtime library torch loaded (torch's own
     cudart binding does not expose it)."""
     import glob
+
     here = os.path.dirname(torch.__file__)
-    for pattern in (os.path.join(here, "lib", "libcudart*.so*"),
-                    os.path.join(os.path.dirname(here), "nvidia", "cuda_runtime", "lib", "libcudart*.so*")):
+    for pattern in (
+        os.path.join(here, "lib", "libcudart*.so*"),
+        os.path.join(
+            os.path.dirname(here), "nvidia", "cuda_runtime", "lib", "libcudart*.so*"
+        ),
+    ):
         for lib in glob.glob(pattern):
             try:
                 ctypes.CDLL(lib).cudaGetLastError()
@@ -144,11 +191,17 @@ class _DevicePointer:
     """A CUDA device range torch can wrap without copying."""
 
     def __init__(self, ptr: int, nbytes: int):
-        self.__cuda_array_interface__ = {"shape": (nbytes,), "typestr": "|u1",
-                                         "data": (ptr, False), "version": 3}
+        self.__cuda_array_interface__ = {
+            "shape": (nbytes,),
+            "typestr": "|u1",
+            "data": (ptr, False),
+            "version": 3,
+        }
 
 
-def aligned_empty(shape, dtype: torch.dtype, stride=None, align: int = 4096) -> torch.Tensor:
+def aligned_empty(
+    shape, dtype: torch.dtype, stride=None, align: int = 4096
+) -> torch.Tensor:
     """A host tensor whose data pointer is aligned to `align` bytes: direct
     I/O and passthrough need at least logical-block alignment, and torch's
     CPU allocator only promises 64 bytes. `stride` lets the tensor keep a
@@ -161,7 +214,7 @@ def aligned_empty(shape, dtype: torch.dtype, stride=None, align: int = 4096) -> 
     nbytes = nelem * elem
     raw = torch.empty(nbytes + align, dtype=torch.uint8)
     off = (-raw.data_ptr()) % align
-    view = raw[off:off + nbytes].view(dtype)
+    view = raw[off : off + nbytes].view(dtype)
     return torch.as_strided(view, tuple(shape), tuple(stride))
 
 
@@ -199,10 +252,19 @@ class StagingArena:
     registration takes at most 1 GiB per dma-buf. The exporter is
     invisible past registration."""
 
-    def __init__(self, nbytes: int, exporter: str = "host", chunk_bytes: int = 1 << 30,
-                 align: int = 4096, name: str = "kv-staging", device: int = 0):
+    def __init__(
+        self,
+        nbytes: int,
+        exporter: str = "host",
+        chunk_bytes: int = 1 << 30,
+        align: int = 4096,
+        name: str = "kv-staging",
+        device: int = 0,
+    ):
         if exporter not in EXPORTERS:
-            raise ValueError(f"staging exporter must be one of {EXPORTERS}, got {exporter!r}")
+            raise ValueError(
+                f"staging exporter must be one of {EXPORTERS}, got {exporter!r}"
+            )
         if nbytes <= 0:
             raise ValueError("arena size must be positive")
         if chunk_bytes <= 0 or chunk_bytes % HUGE_2M:
@@ -215,6 +277,7 @@ class StagingArena:
         self.chunk_bytes = chunk_bytes
         self.chunks: list[ArenaChunk] = []
         self.cuda_registered = False
+        self._cuda_registered_chunks: list[ArenaChunk] = []
         self.mapping_type = ""
         self.waits = 0
         self.wait_ns = 0
@@ -224,8 +287,9 @@ class StagingArena:
             self._init_cuda()
             return
         # Reserve the whole range first so the chunks land back to back.
-        self.base = _mmap(0, self.nbytes, _PROT_NONE,
-                          mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS, -1)
+        self.base = _mmap(
+            0, self.nbytes, _PROT_NONE, mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS, -1
+        )
         try:
             off = 0
             while off < self.nbytes:
@@ -252,9 +316,12 @@ class StagingArena:
         self._cuda = _Cuda()
         self._cuda.ensure_context(self.device)
         if not self._cuda.dmabuf_supported(self.device):
-            raise OSError(0, f"CUDA device {self.device} does not export dma-bufs "
-                          "(CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED is 0; the open kernel modules "
-                          "and a PCIe peer-mappable GPU are required)")
+            raise OSError(
+                0,
+                f"CUDA device {self.device} does not export dma-bufs "
+                "(CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED is 0; the open kernel modules "
+                "and a PCIe peer-mappable GPU are required)",
+            )
         self.base = self._cuda.alloc(self.nbytes)
         if self.base % 4096:
             self._cuda.free(self.base)
@@ -266,14 +333,17 @@ class StagingArena:
                 length = min(self.chunk_bytes, self.nbytes - off)
                 fd, mapping = self._cuda.export(self.base + off, length)
                 self.mapping_type = mapping
-                self.chunks.append(ArenaChunk(off, length, self.base + off, dmabuf_fd=fd))
+                self.chunks.append(
+                    ArenaChunk(off, length, self.base + off, dmabuf_fd=fd)
+                )
                 off += length
         except Exception:
             self.close()
             raise
         self._alloc = ExtentAllocator(0, self.nbytes, self.align)
-        self.tensor = torch.as_tensor(_DevicePointer(self.base, self.nbytes),
-                                      device=f"cuda:{self.device}")
+        self.tensor = torch.as_tensor(
+            _DevicePointer(self.base, self.nbytes), device=f"cuda:{self.device}"
+        )
         assert self.tensor.data_ptr() == self.base
 
     # -- mapping -------------------------------------------------------------
@@ -282,7 +352,9 @@ class StagingArena:
         addr = self.base + off
         rw = mmap.PROT_READ | mmap.PROT_WRITE
         if self.exporter == "host":
-            _mmap(addr, length, rw, mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | _MAP_FIXED, -1)
+            _mmap(
+                addr, length, rw, mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | _MAP_FIXED, -1
+            )
             _libc.madvise(addr, length, _MADV_HUGEPAGE)
             return ArenaChunk(off, length, addr)
         if self.exporter == "system_heap":
@@ -307,10 +379,14 @@ class StagingArena:
         try:
             heap = os.open("/dev/dma_heap/system", os.O_RDONLY | os.O_CLOEXEC)
         except OSError as e:
-            raise OSError(e.errno, f"/dev/dma_heap/system: {e.strerror}; the system heap needs "
-                          "CONFIG_DMABUF_HEAPS_SYSTEM and access to the node") from e
+            raise OSError(
+                e.errno,
+                f"/dev/dma_heap/system: {e.strerror}; the system heap needs "
+                "CONFIG_DMABUF_HEAPS_SYSTEM and access to the node",
+            ) from e
         try:
-            # struct dma_heap_allocation_data { u64 len; u32 fd; u32 fd_flags; u64 heap_flags; }
+            # struct dma_heap_allocation_data contains len, fd, fd_flags,
+            # and heap_flags.
             req = bytearray(struct.pack("QIIQ", length, 0, os.O_RDWR | os.O_CLOEXEC, 0))
             fcntl.ioctl(heap, _DMA_HEAP_IOCTL_ALLOC, req)
             return struct.unpack("QIIQ", bytes(req))[1]
@@ -328,11 +404,16 @@ class StagingArena:
             try:
                 dev = os.open("/dev/udmabuf", os.O_RDWR | os.O_CLOEXEC)
             except OSError as e:
-                raise OSError(e.errno, f"/dev/udmabuf: {e.strerror}; udmabuf needs CONFIG_UDMABUF "
-                              "and access to the node") from e
+                raise OSError(
+                    e.errno,
+                    f"/dev/udmabuf: {e.strerror}; udmabuf needs CONFIG_UDMABUF "
+                    "and access to the node",
+                ) from e
             try:
                 # struct udmabuf_create { u32 memfd; u32 flags; u64 offset; u64 size; }
-                req = bytearray(struct.pack("IIQQ", memfd, _UDMABUF_FLAGS_CLOEXEC, 0, length))
+                req = bytearray(
+                    struct.pack("IIQQ", memfd, _UDMABUF_FLAGS_CLOEXEC, 0, length)
+                )
                 fd = fcntl.ioctl(dev, _UDMABUF_CREATE, req)
             finally:
                 os.close(dev)
@@ -352,10 +433,14 @@ class StagingArena:
         rt = torch.cuda.cudart()
         for c in self.chunks:
             if rt.cudaHostRegister(c.addr, c.length, 0) != 0:
+                for registered in reversed(self._cuda_registered_chunks):
+                    rt.cudaHostUnregister(registered.addr)
+                self._cuda_registered_chunks = []
                 # The failure sits in the runtime's last-error slot and torch
                 # would report it from an unrelated later kernel launch.
                 _clear_cuda_last_error()
                 return False
+            self._cuda_registered_chunks.append(c)
         self.cuda_registered = True
         return True
 
@@ -403,9 +488,15 @@ class StagingArena:
             torch.cuda.synchronize(self.device)
 
     def view(self, offset: int, nbytes: int, dtype: torch.dtype, shape) -> torch.Tensor:
-        return self.tensor[offset:offset + nbytes].view(dtype).view(*shape)
+        return self.tensor[offset : offset + nbytes].view(dtype).view(*shape)
 
     def close(self) -> None:
+        if self._cuda_registered_chunks:
+            rt = torch.cuda.cudart()
+            for c in reversed(self._cuda_registered_chunks):
+                rt.cudaHostUnregister(c.addr)
+            self._cuda_registered_chunks = []
+            self.cuda_registered = False
         for c in self.chunks:
             if c.dmabuf_fd >= 0:
                 os.close(c.dmabuf_fd)
@@ -435,7 +526,7 @@ class LayerGeometry:
     inner_shape: tuple  # shape of one block's region
 
     @classmethod
-    def from_tensor(cls, layer_name: str, t: torch.Tensor) -> "LayerGeometry":
+    def from_tensor(cls, layer_name: str, t: torch.Tensor) -> LayerGeometry:
         shape = t.shape
         if t.ndim >= 2 and shape[0] == 2:
             regions, split, blkdim = 2, 0, 1
@@ -512,16 +603,27 @@ def plan_transfer(
     if len(geometries) != len(layers):
         raise ValueError("geometry/extent count mismatch")
     bases = object_layout(geometries, num_blocks)
-    if region.length < bases[-1] + geometries[-1].object_bytes(num_blocks) if geometries else 0:
+    if (
+        region.length < bases[-1] + geometries[-1].object_bytes(num_blocks)
+        if geometries
+        else 0
+    ):
         raise ValueError("arena region smaller than the object")
     local: list[tuple[int, int, int]] = []
     remote: list[tuple[int, int, int]] = []
     total = 0
     for g, layer, base in zip(geometries, layers, bases):
-        if layer.bytes_per_block != g.block_bytes or layer.regions_per_block != g.regions:
-            raise ValueError(f"{g.layer_name}: object geometry differs from the local cache")
+        if (
+            layer.bytes_per_block != g.block_bytes
+            or layer.regions_per_block != g.regions
+        ):
+            raise ValueError(
+                f"{g.layer_name}: object geometry differs from the local cache"
+            )
         if g.object_bytes(num_blocks) > layer.extent.length:
-            raise ValueError(f"{g.layer_name}: {num_blocks} blocks do not fit the extent")
+            raise ValueError(
+                f"{g.layer_name}: {num_blocks} blocks do not fit the extent"
+            )
         region_bytes = num_blocks * g.block_bytes
         for k in range(g.regions):
             here = region.offset + base + k * region_bytes
@@ -533,32 +635,54 @@ def plan_transfer(
     return TransferPlan(local=local, remote=remote, bytes=total, descriptors=len(local))
 
 
-def pack_blocks(geometries: list[LayerGeometry], caches: dict[str, torch.Tensor],
-                block_ids: list[int], arena: StagingArena, region: Extent,
-                non_blocking: bool = False) -> None:
+def pack_blocks(
+    geometries: list[LayerGeometry],
+    caches: dict[str, torch.Tensor],
+    block_ids: list[int],
+    arena: StagingArena,
+    region: Extent,
+    non_blocking: bool = False,
+) -> None:
     """Gather the blocks of every layer into the arena region, in object order."""
     n = len(block_ids)
     for g, base in zip(geometries, object_layout(geometries, n)):
         views = g.region_views(caches[g.layer_name])
         for k, src in enumerate(views):
-            dst = arena.view(region.offset + base + k * n * g.block_bytes, n * g.block_bytes,
-                             g.dtype, (n, *g.inner_shape))
+            dst = arena.view(
+                region.offset + base + k * n * g.block_bytes,
+                n * g.block_bytes,
+                g.dtype,
+                (n, *g.inner_shape),
+            )
             for idx, first, count in g.runs(block_ids):
-                dst[idx:idx + count].copy_(src[first:first + count], non_blocking=non_blocking)
+                dst[idx : idx + count].copy_(
+                    src[first : first + count], non_blocking=non_blocking
+                )
 
 
-def unpack_blocks(geometries: list[LayerGeometry], caches: dict[str, torch.Tensor],
-                  block_ids: list[int], arena: StagingArena, region: Extent,
-                  non_blocking: bool = False) -> None:
+def unpack_blocks(
+    geometries: list[LayerGeometry],
+    caches: dict[str, torch.Tensor],
+    block_ids: list[int],
+    arena: StagingArena,
+    region: Extent,
+    non_blocking: bool = False,
+) -> None:
     """Scatter an object staged at `region` back into the given blocks."""
     n = len(block_ids)
     for g, base in zip(geometries, object_layout(geometries, n)):
         views = g.region_views(caches[g.layer_name])
         for k, dst in enumerate(views):
-            src = arena.view(region.offset + base + k * n * g.block_bytes, n * g.block_bytes,
-                             g.dtype, (n, *g.inner_shape))
+            src = arena.view(
+                region.offset + base + k * n * g.block_bytes,
+                n * g.block_bytes,
+                g.dtype,
+                (n, *g.inner_shape),
+            )
             for idx, first, count in g.runs(block_ids):
-                dst[first:first + count].copy_(src[idx:idx + count], non_blocking=non_blocking)
+                dst[first : first + count].copy_(
+                    src[idx : idx + count], non_blocking=non_blocking
+                )
 
 
 @dataclass
@@ -594,25 +718,37 @@ class NixlStorageAdapter:
                 except TypeError:
                     cfg = nixl_agent_config(backends=[])
                 return nixl_agent(name, cfg)
+
         self.agent_name = agent_name
         self.agent = nixl_agent_cls(agent_name)
         self.agent.create_backend("XNVME_NVM", backend_params)
         self.range_offset = range_offset
         self.range_len = range_len
         self._blk_reg = self.agent.register_memory(
-            [(range_offset, range_len, 0, "")], "BLOCK", backends=["XNVME_NVM"])
+            [(range_offset, range_len, 0, "")], "BLOCK", backends=["XNVME_NVM"]
+        )
         self._arena_regs: list = []
         self.arena: StagingArena | None = None
         self.geometries: dict[str, LayerGeometry] = {}
         self.device_info = self._query_device()
-        self.counters = {"writes": 0, "reads": 0, "bytes_written": 0, "bytes_read": 0,
-                         "errors": 0, "descriptors": 0, "warm_ms": 0.0}
+        self.counters = {
+            "writes": 0,
+            "reads": 0,
+            "bytes_written": 0,
+            "bytes_read": 0,
+            "errors": 0,
+            "descriptors": 0,
+            "warm_ms": 0.0,
+        }
 
     def _query_device(self) -> dict[str, str]:
         resp = self.agent.query_memory(
-            [(self.range_offset, self.range_len, 0, "")], "XNVME_NVM", "BLOCK")
+            [(self.range_offset, self.range_len, 0, "")], "XNVME_NVM", "BLOCK"
+        )
         if not resp or resp[0] is None:
-            raise RuntimeError("XNVME_NVM does not report the registered range as accessible")
+            raise RuntimeError(
+                "XNVME_NVM does not report the registered range as accessible"
+            )
         return dict(resp[0])
 
     def register_cache(self, caches: dict[str, torch.Tensor]) -> None:
@@ -625,8 +761,10 @@ class NixlStorageAdapter:
         self.arena = arena
         for addr, length, dev, meta in arena.registrations():
             self._arena_regs.append(
-                self.agent.register_memory([(addr, length, dev, meta)], arena.mem_type,
-                                           backends=["XNVME_NVM"]))
+                self.agent.register_memory(
+                    [(addr, length, dev, meta)], arena.mem_type, backends=["XNVME_NVM"]
+                )
+            )
 
     def warm(self) -> float:
         """Read one logical block into the start of every dma-buf chunk so
@@ -638,10 +776,13 @@ class NixlStorageAdapter:
             if c.dmabuf_fd < 0:
                 continue
             dev = self.arena.device if self.arena.exporter == "cuda" else 0
-            local = self.agent.get_xfer_descs([(c.addr, 4096, dev)], self.arena.mem_type)
+            local = self.agent.get_xfer_descs(
+                [(c.addr, 4096, dev)], self.arena.mem_type
+            )
             remote = self.agent.get_xfer_descs([(self.range_offset, 4096, 0)], "BLOCK")
-            handle = self.agent.initialize_xfer("READ", local, remote, self.agent_name, b"",
-                                                ["XNVME_NVM"])
+            handle = self.agent.initialize_xfer(
+                "READ", local, remote, self.agent_name, b"", ["XNVME_NVM"]
+            )
             status = self.agent.transfer(handle)
             while status == "PROC":
                 status = self.agent.check_xfer_state(handle)
@@ -657,8 +798,12 @@ class NixlStorageAdapter:
         if len(extents) != len(names):
             raise ValueError("one extent per layer is required")
         return [
-            LayerSlice(layer_name=n, extent=e, bytes_per_block=self.geometries[n].block_bytes,
-                       regions_per_block=self.geometries[n].regions)
+            LayerSlice(
+                layer_name=n,
+                extent=e,
+                bytes_per_block=self.geometries[n].block_bytes,
+                regions_per_block=self.geometries[n].regions,
+            )
             for n, e in zip(names, extents)
         ]
 
@@ -668,41 +813,66 @@ class NixlStorageAdapter:
     def object_bytes(self, num_blocks: int) -> int:
         return sum(self.object_lengths(num_blocks))
 
-    def pack(self, caches: dict[str, torch.Tensor], block_ids: list[int], region: Extent) -> None:
+    def pack(
+        self, caches: dict[str, torch.Tensor], block_ids: list[int], region: Extent
+    ) -> None:
         assert self.arena is not None
         geoms = list(self.geometries.values())
         cuda = any(t.is_cuda for t in caches.values())
-        pack_blocks(geoms, caches, block_ids, self.arena, region,
-                    non_blocking=cuda and (self.arena.cuda_registered or self.arena.exporter == "cuda"))
+        pack_blocks(
+            geoms,
+            caches,
+            block_ids,
+            self.arena,
+            region,
+            non_blocking=cuda
+            and (self.arena.cuda_registered or self.arena.exporter == "cuda"),
+        )
         if cuda:
             # Device writes into the arena (host or GPU) are complete before
             # the command that reads them is submitted.
             torch.cuda.synchronize()
 
-    def unpack(self, caches: dict[str, torch.Tensor], block_ids: list[int], region: Extent) -> None:
+    def unpack(
+        self, caches: dict[str, torch.Tensor], block_ids: list[int], region: Extent
+    ) -> None:
         assert self.arena is not None
         geoms = list(self.geometries.values())
         cuda = any(t.is_cuda for t in caches.values())
         # The command's completion was observed before this call, so the
         # bytes are in the arena; the copies are ordered behind it by the
         # stream and waited for before the blocks are handed back.
-        unpack_blocks(geoms, caches, block_ids, self.arena, region,
-                      non_blocking=cuda and (self.arena.cuda_registered or self.arena.exporter == "cuda"))
+        unpack_blocks(
+            geoms,
+            caches,
+            block_ids,
+            self.arena,
+            region,
+            non_blocking=cuda
+            and (self.arena.cuda_registered or self.arena.exporter == "cuda"),
+        )
         if cuda:
             torch.cuda.synchronize()
 
-    def start(self, op: str, layers: list[LayerSlice], num_blocks: int,
-              region: Extent) -> PendingTransfer:
+    def start(
+        self, op: str, layers: list[LayerSlice], num_blocks: int, region: Extent
+    ) -> PendingTransfer:
         assert self.arena is not None
-        geoms = [self.geometries[l.layer_name] for l in layers]
+        geoms = [self.geometries[layer.layer_name] for layer in layers]
         plan = plan_transfer(geoms, layers, num_blocks, self.arena, region)
         dev = self.arena.device if self.arena.exporter == "cuda" else 0
-        local = self.agent.get_xfer_descs([(a, n, dev) for a, n, _ in plan.local], self.arena.mem_type)
+        local = self.agent.get_xfer_descs(
+            [(a, n, dev) for a, n, _ in plan.local], self.arena.mem_type
+        )
         remote = self.agent.get_xfer_descs(plan.remote, "BLOCK")
-        handle = self.agent.initialize_xfer(op, local, remote, self.agent_name, b"", ["XNVME_NVM"])
+        handle = self.agent.initialize_xfer(
+            op, local, remote, self.agent_name, b"", ["XNVME_NVM"]
+        )
         started = time.monotonic_ns()
         status = self.agent.transfer(handle)
-        pending = PendingTransfer(handle=handle, plan=plan, started_ns=started, op=op, status=status)
+        pending = PendingTransfer(
+            handle=handle, plan=plan, started_ns=started, op=op, status=status
+        )
         self.counters["descriptors"] += plan.descriptors
         if status == "DONE":
             pending.done_ns = time.monotonic_ns()

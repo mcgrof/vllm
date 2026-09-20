@@ -81,7 +81,7 @@ class HandoffManifest:
         return json.dumps(asdict(self), sort_keys=True)
 
     @classmethod
-    def from_json(cls, text: str) -> "HandoffManifest":
+    def from_json(cls, text: str) -> HandoffManifest:
         raw = json.loads(text)
         layers = [
             LayerSlice(
@@ -94,7 +94,7 @@ class HandoffManifest:
         ]
         return cls(layers=layers, **raw)
 
-    def same_identity(self, other: "HandoffManifest") -> bool:
+    def same_identity(self, other: HandoffManifest) -> bool:
         """The fields a consumer must match before restoring bytes into
         its own KV cache."""
         return (

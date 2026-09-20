@@ -6,9 +6,12 @@ configuration parsing and the bounded wait for namespace space."""
 import pytest
 
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl_storage.connector import (
-    HandoffConfig, _Worker)
+    HandoffConfig,
+    _Worker,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl_storage.coordinator import (
-    OutOfSpace)
+    OutOfSpace,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl_storage.manifest import Extent
 
 
@@ -16,8 +19,14 @@ def test_config_defaults_and_hooks():
     cfg = HandoffConfig.from_extra({"device_name": "/dev/ng0n1", "range_len": 4096})
     assert cfg.reserve_timeout_s == 30.0
     assert cfg.inject_store_error_nth == 0 and cfg.inject_load_error_nth == 0
-    cfg = HandoffConfig.from_extra({"device_name": "/dev/ng0n1", "range_len": 4096,
-                                    "reserve_timeout_s": "0.5", "inject_store_error_nth": 2})
+    cfg = HandoffConfig.from_extra(
+        {
+            "device_name": "/dev/ng0n1",
+            "range_len": 4096,
+            "reserve_timeout_s": "0.5",
+            "inject_store_error_nth": 2,
+        }
+    )
     assert cfg.reserve_timeout_s == 0.5 and cfg.inject_store_error_nth == 2
     with pytest.raises(ValueError):
         HandoffConfig.from_extra({"device_name": "/dev/ng0n1"})
@@ -25,15 +34,23 @@ def test_config_defaults_and_hooks():
 
 def test_config_ties_staging_exporter_to_buffer_mode():
     base = {"device_name": "/dev/nvme0n1", "range_len": 4096, "async": "io_uring"}
-    cfg = HandoffConfig.from_extra({**base, "staging": "system_heap", "buffer_mode": "dmabuf"})
+    cfg = HandoffConfig.from_extra(
+        {**base, "staging": "system_heap", "buffer_mode": "dmabuf"}
+    )
     assert cfg.staging == "system_heap" and cfg.dmabuf_chunk_bytes == 1 << 30
     with pytest.raises(ValueError):  # dma-buf staging without the dma-buf transport
         HandoffConfig.from_extra({**base, "staging": "udmabuf"})
     with pytest.raises(ValueError):  # dma-buf transport with host staging
         HandoffConfig.from_extra({**base, "buffer_mode": "dmabuf"})
     with pytest.raises(ValueError):  # registered modes need io_uring on the block node
-        HandoffConfig.from_extra({"device_name": "/dev/ng0n1", "range_len": 4096,
-                                  "staging": "system_heap", "buffer_mode": "dmabuf"})
+        HandoffConfig.from_extra(
+            {
+                "device_name": "/dev/ng0n1",
+                "range_len": 4096,
+                "staging": "system_heap",
+                "buffer_mode": "dmabuf",
+            }
+        )
     with pytest.raises(ValueError):
         HandoffConfig.from_extra({**base, "staging": "bogus"})
 
@@ -57,16 +74,23 @@ class _Adapter:
 
 def _worker(refusals: int, timeout_s: float) -> _Worker:
     w = _Worker.__new__(_Worker)
-    w.cfg = HandoffConfig(device_name="/dev/ng0n1", range_len=1 << 20,
-                          reserve_timeout_s=timeout_s)
+    w.cfg = HandoffConfig(
+        device_name="/dev/ng0n1", range_len=1 << 20, reserve_timeout_s=timeout_s
+    )
     w.coord = _Coord(refusals)
     w.adapter = _Adapter()
-    w.counters = {"reserve_waits": 0, "reserve_wait_ns": 0, "arena_waits": 0, "arena_wait_ns": 0}
+    w.counters = {
+        "reserve_waits": 0,
+        "reserve_wait_ns": 0,
+        "arena_waits": 0,
+        "arena_wait_ns": 0,
+    }
     w.arena = None
     w.polls = 0
 
     def poll():
         w.polls += 1
+
     w._poll_transfers = poll
     return w
 
@@ -92,11 +116,18 @@ def test_reserve_without_pressure_does_not_wait():
     w = _worker(refusals=0, timeout_s=1.0)
     t = {}
     w._reserve("r1", 1, t)
-    assert w.polls == 0 and w.counters["reserve_waits"] == 0 and "reserve_wait_start_ns" not in t
+    assert (
+        w.polls == 0
+        and w.counters["reserve_waits"] == 0
+        and "reserve_wait_start_ns" not in t
+    )
 
 
 def test_stage_waits_for_arena_space_then_gives_up():
-    from vllm.distributed.kv_transfer.kv_connector.v1.nixl_storage.storage import HUGE_2M, StagingArena
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl_storage.storage import (
+        HUGE_2M,
+        StagingArena,
+    )
 
     w = _worker(refusals=0, timeout_s=0.05)
     w.arena = StagingArena(HUGE_2M, "host", chunk_bytes=HUGE_2M)
@@ -111,4 +142,3 @@ def test_stage_waits_for_arena_space_then_gives_up():
         assert w._stage("r3", 4096, {}).offset == 0
     finally:
         w.arena.close()
-
