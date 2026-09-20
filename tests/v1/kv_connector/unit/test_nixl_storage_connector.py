@@ -3,16 +3,24 @@
 """Worker-side pieces of the storage handoff connector that need no device:
 configuration parsing and the bounded wait for namespace space."""
 
+from types import SimpleNamespace
+
 import pytest
 
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl_storage.connector import (
+    PARAM_KEY,
     HandoffConfig,
+    _Scheduler,
     _Worker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl_storage.coordinator import (
     OutOfSpace,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl_storage.manifest import Extent
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl_storage.manifest import (
+    Extent,
+    HandoffManifest,
+    LayerSlice,
+)
 
 
 def test_config_defaults_and_hooks():
@@ -55,12 +63,104 @@ def test_config_ties_staging_exporter_to_buffer_mode():
         HandoffConfig.from_extra({**base, "staging": "bogus"})
 
 
+def _manifest(rank: int, epoch: str = "epoch") -> HandoffManifest:
+    return HandoffManifest(
+        session_epoch=epoch,
+        request_id="prefill-request",
+        transfer_id=f"transfer-{rank}",
+        generation=0,
+        model_id="model#dtype",
+        kv_dtype="torch.bfloat16",
+        kv_scales=None,
+        tp_rank=rank,
+        tp_size=2,
+        block_size=16,
+        num_tokens=32,
+        num_blocks=2,
+        layout="16x2x64",
+        namespace_serial="serial",
+        namespace_wwid="wwid",
+        layers=[LayerSlice("layer.0", Extent(rank * 8192, 8192), 2048, 2)],
+        producer="prefill-engine",
+    )
+
+
+class _LookupCoord:
+    def __init__(self, manifests):
+        self.manifests = manifests
+        self.calls = []
+
+    def lookup(self, request_id, producer, tp_rank):
+        self.calls.append((request_id, producer, tp_rank))
+        return self.manifests.get(tp_rank)
+
+
+def _scheduler(manifests) -> _Scheduler:
+    scheduler = _Scheduler.__new__(_Scheduler)
+    scheduler.conn = SimpleNamespace(
+        is_consumer=True,
+        tp_size=2,
+        block_size=16,
+        model_id="model#dtype",
+        config=HandoffConfig(device_name="file", range_len=1 << 20),
+    )
+    scheduler.coord = _LookupCoord(manifests)
+    scheduler.session_epoch = "epoch"
+    scheduler.pending_stores = {}
+    scheduler.pending_loads = {}
+    scheduler.matched = {}
+    scheduler.lookup_started = {}
+    scheduler.counters = {
+        "stores_ordered": 0,
+        "loads_ordered": 0,
+        "lookup_timeouts": 0,
+        "recompute_fallbacks": 0,
+        "lookup_waits": 0,
+    }
+    return scheduler
+
+
+def _decode_request(epoch="epoch"):
+    return SimpleNamespace(
+        request_id="decode-request",
+        prompt_token_ids=list(range(40)),
+        kv_transfer_params={
+            PARAM_KEY: {
+                "producer_request_id": "prefill-request",
+                "producer_engine_id": "prefill-engine",
+                "session_epoch": epoch,
+            }
+        },
+    )
+
+
+def test_scheduler_waits_for_every_tp_manifest():
+    scheduler = _scheduler({0: _manifest(0)})
+    assert scheduler.get_num_new_matched_tokens(_decode_request(), 0) == (
+        None,
+        False,
+    )
+    assert scheduler.coord.calls == [
+        ("prefill-request", "prefill-engine", 0),
+        ("prefill-request", "prefill-engine", 1),
+    ]
+
+
+def test_scheduler_routes_all_tp_manifests_by_engine_and_epoch():
+    scheduler = _scheduler({0: _manifest(0), 1: _manifest(1)})
+    assert scheduler.get_num_new_matched_tokens(_decode_request(), 0) == (32, True)
+    manifests, matched, computed = scheduler.matched["decode-request"]
+    assert set(manifests) == {0, 1} and matched == 32 and computed == 0
+    with pytest.raises(RuntimeError, match="coordinator epoch changed"):
+        scheduler.get_num_new_matched_tokens(_decode_request("stale"), 0)
+
+
 class _Coord:
     def __init__(self, refusals: int):
         self.refusals = refusals
         self.calls = 0
 
-    def reserve(self, request_id, lengths):
+    def reserve(self, request_id, producer, tp_rank, lengths):
         self.calls += 1
         if self.calls <= self.refusals:
             raise OutOfSpace("no hole")
@@ -78,6 +178,8 @@ def _worker(refusals: int, timeout_s: float) -> _Worker:
         device_name="/dev/ng0n1", range_len=1 << 20, reserve_timeout_s=timeout_s
     )
     w.coord = _Coord(refusals)
+    w.conn = SimpleNamespace(engine_id="prefill")
+    w.rank = 0
     w.adapter = _Adapter()
     w.counters = {
         "reserve_waits": 0,
@@ -97,7 +199,7 @@ def _worker(refusals: int, timeout_s: float) -> _Worker:
 
 def test_reserve_retries_while_full_and_keeps_polling():
     w = _worker(refusals=3, timeout_s=5.0)
-    t = {}
+    t: dict[str, int] = {}
     tid, gen, extents = w._reserve("r1", 2, t)
     assert tid == "tid" and gen == 1 and extents[0].length == 8192
     assert w.coord.calls == 4 and w.polls == 3
@@ -114,7 +216,7 @@ def test_reserve_gives_up_after_timeout():
 
 def test_reserve_without_pressure_does_not_wait():
     w = _worker(refusals=0, timeout_s=1.0)
-    t = {}
+    t: dict[str, int] = {}
     w._reserve("r1", 1, t)
     assert (
         w.polls == 0
@@ -132,7 +234,7 @@ def test_stage_waits_for_arena_space_then_gives_up():
     w = _worker(refusals=0, timeout_s=0.05)
     w.arena = StagingArena(HUGE_2M, "host", chunk_bytes=HUGE_2M)
     try:
-        t = {}
+        t: dict[str, int] = {}
         held = w._stage("r1", HUGE_2M, t)
         assert held.length == HUGE_2M and w.polls == 0
         with pytest.raises(OutOfSpace):

@@ -28,7 +28,15 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl_storage.manifest import (
 MiB = 1 << 20
 
 
-def make_manifest(coord, transfer_id, generation, extents, request_id="r1"):
+def make_manifest(
+    coord,
+    transfer_id,
+    generation,
+    extents,
+    request_id="r1",
+    producer="prefill",
+    tp_rank=0,
+):
     layers = [
         LayerSlice(
             layer_name=f"layers.{i}",
@@ -46,7 +54,7 @@ def make_manifest(coord, transfer_id, generation, extents, request_id="r1"):
         model_id="test-model#cfg",
         kv_dtype="bfloat16",
         kv_scales=None,
-        tp_rank=0,
+        tp_rank=tp_rank,
         tp_size=1,
         block_size=16,
         num_tokens=100,
@@ -55,6 +63,7 @@ def make_manifest(coord, transfer_id, generation, extents, request_id="r1"):
         namespace_serial="nixlpd0",
         namespace_wwid="nvme.wwid",
         layers=layers,
+        producer=producer,
     )
 
 
@@ -94,17 +103,21 @@ def test_allocator_rounds_up_and_rejects_double_free():
 
 def test_reserve_publish_lease_ack_reclaim():
     c = StorageHandoffCoordinator(base=0, size=64 * MiB, align=4096)
-    tid, gen, extents = c.reserve("r1", [1 * MiB, 2 * MiB])
+    tid, gen, extents = c.reserve("r1", "prefill", 0, [1 * MiB, 2 * MiB])
     assert gen == 0 and len(extents) == 2
     assert c.state_of(tid) == ObjectState.RESERVED
-    assert c.lookup("r1") is None  # not published
+    assert c.lookup("r1", "prefill", 0) is None  # not published
 
     c.mark_writing(tid)
     m = make_manifest(c, tid, gen, extents)
     c.publish(tid, gen, m)
     assert c.state_of(tid) == ObjectState.READY
-    assert c.lookup("r1").transfer_id == tid
+    assert c.lookup("r1", "prefill", 0).transfer_id == tid
     c.publish(tid, gen, m)  # idempotent
+    changed = make_manifest(c, tid, gen, extents)
+    changed.num_tokens += 1
+    with pytest.raises(HandoffError, match="different manifest"):
+        c.publish(tid, gen, changed)
 
     lease_id, got = c.lease(tid, gen, consumer="decode-0")
     assert got.total_bytes == 3 * MiB and c.state_of(tid) == ObjectState.READING
@@ -117,31 +130,63 @@ def test_reserve_publish_lease_ack_reclaim():
     assert c.counters["duplicate_acks"] == 1
     assert c.reclaim() == 1
     assert c.allocator.free_bytes == 64 * MiB
-    assert c.lookup("r1") is None
+    assert c.lookup("r1", "prefill", 0) is None
 
 
 def test_publish_requires_the_reserved_extents_and_identity():
     c = StorageHandoffCoordinator(base=0, size=8 * MiB)
-    tid, gen, extents = c.reserve("r1", [1 * MiB])
+    tid, gen, extents = c.reserve("r1", "prefill", 0, [1 * MiB])
     wrong = make_manifest(c, tid, gen, [Extent(2 * MiB, 1 * MiB)])
     with pytest.raises(HandoffError):
         c.publish(tid, gen, wrong)
     other = make_manifest(c, "not-the-tid", gen, extents)
     with pytest.raises(HandoffError):
         c.publish(tid, gen, other)
+    wrong_route = make_manifest(c, tid, gen, extents, producer="other-prefill")
+    with pytest.raises(HandoffError):
+        c.publish(tid, gen, wrong_route)
     assert c.state_of(tid) == ObjectState.RESERVED
+
+
+def test_request_index_isolated_by_producer_and_tp_rank():
+    c = StorageHandoffCoordinator(base=0, size=8 * MiB)
+    t0, g0, e0 = c.reserve("r1", "prefill-a", 0, [1 * MiB])
+    t1, g1, e1 = c.reserve("r1", "prefill-a", 1, [1 * MiB])
+    tb, gb, eb = c.reserve("r1", "prefill-b", 0, [1 * MiB])
+    assert g0 == g1 == gb == 0
+    c.publish(t0, g0, make_manifest(c, t0, g0, e0, producer="prefill-a"))
+    c.publish(
+        t1,
+        g1,
+        make_manifest(c, t1, g1, e1, producer="prefill-a", tp_rank=1),
+    )
+    c.publish(tb, gb, make_manifest(c, tb, gb, eb, producer="prefill-b"))
+    assert c.lookup("r1", "prefill-a", 0).transfer_id == t0
+    assert c.lookup("r1", "prefill-a", 1).transfer_id == t1
+    assert c.lookup("r1", "prefill-b", 0).transfer_id == tb
+
+
+def test_rank_shard_has_exactly_one_decode_consumer():
+    c = StorageHandoffCoordinator(base=0, size=8 * MiB)
+    tid, gen, extents = c.reserve("r1", "prefill", 0, [1 * MiB])
+    c.publish(tid, gen, make_manifest(c, tid, gen, extents))
+    c.lease(tid, gen, "decode-a:0")
+    with pytest.raises(HandoffError):
+        c.lease(tid, gen, "decode-b:0")
+    c.ack(tid, gen, "decode-a:0")
+    assert c.reclaim() == 1
 
 
 def test_stale_generation_cannot_release_newer_extents():
     c = StorageHandoffCoordinator(base=0, size=8 * MiB)
-    tid0, gen0, ext0 = c.reserve("r1", [1 * MiB])
+    tid0, gen0, ext0 = c.reserve("r1", "prefill", 0, [1 * MiB])
     c.publish(tid0, gen0, make_manifest(c, tid0, gen0, ext0))
     lease0, _ = c.lease(tid0, gen0, "d")
     # A rewrite of the same request is a new generation with new extents;
     # the old one stays leased and READY for its reader.
-    tid1, gen1, ext1 = c.reserve("r1", [1 * MiB])
+    tid1, gen1, ext1 = c.reserve("r1", "prefill", 0, [1 * MiB])
     assert gen1 == 1 and ext1[0].offset != ext0[0].offset
-    assert c.lookup("r1") is None  # newest generation not published yet
+    assert c.lookup("r1", "prefill", 0) is None  # newest one not published yet
     with pytest.raises(StaleGeneration):
         c.ack(tid1, gen0, "d")
     with pytest.raises(StaleGeneration):
@@ -154,7 +199,7 @@ def test_stale_generation_cannot_release_newer_extents():
 
 def test_lease_expiry_records_but_does_not_free():
     c = StorageHandoffCoordinator(base=0, size=8 * MiB, lease_timeout_s=0.0)
-    tid, gen, ext = c.reserve("r1", [1 * MiB])
+    tid, gen, ext = c.reserve("r1", "prefill", 0, [1 * MiB])
     c.publish(tid, gen, make_manifest(c, tid, gen, ext))
     c.lease(tid, gen, "d")
     assert c.expire_leases(now=1e12) == 1
@@ -167,11 +212,11 @@ def test_lease_expiry_records_but_does_not_free():
 
 def test_failure_drains_before_reclaim():
     c = StorageHandoffCoordinator(base=0, size=8 * MiB)
-    tid, gen, ext = c.reserve("r1", [1 * MiB])
+    tid, gen, ext = c.reserve("r1", "prefill", 0, [1 * MiB])
     c.mark_writing(tid)
     c.fail(tid, gen, "write refused")
     assert c.state_of(tid) == ObjectState.DRAINING
-    assert c.lookup("r1") is None
+    assert c.lookup("r1", "prefill", 0) is None
     assert c.reclaim() == 0  # producer has not reported drain
     c.producer_drained(tid)
     assert c.reclaim() == 1
@@ -180,19 +225,25 @@ def test_failure_drains_before_reclaim():
 def test_out_of_space_rolls_back_partial_reservation():
     c = StorageHandoffCoordinator(base=0, size=4 * MiB)
     with pytest.raises(OutOfSpace):
-        c.reserve("r1", [3 * MiB, 3 * MiB])
+        c.reserve("r1", "prefill", 0, [3 * MiB, 3 * MiB])
     assert c.allocator.allocated_bytes == 0
-    assert c.lookup("r1") is None
+    assert c.lookup("r1", "prefill", 0) is None
 
 
 def test_manifest_round_trip_and_identity():
     c = StorageHandoffCoordinator(base=0, size=8 * MiB)
-    tid, gen, ext = c.reserve("r1", [1 * MiB, 1 * MiB])
+    tid, gen, ext = c.reserve("r1", "prefill", 0, [1 * MiB, 1 * MiB])
     m = make_manifest(c, tid, gen, ext)
     back = HandoffManifest.from_json(m.to_json())
     assert back == m
     other = make_manifest(c, tid, gen, ext)
     other.kv_dtype = "float8_e4m3"
+    assert not m.same_identity(other)
+    other = make_manifest(c, tid, gen, ext)
+    other.tp_rank = 1
+    assert not m.same_identity(other)
+    other = make_manifest(c, tid, gen, ext)
+    other.layers[0].bytes_per_block *= 2
     assert not m.same_identity(other)
 
 
@@ -208,14 +259,14 @@ def test_server_and_client_round_trip():
         try:
             producer = CoordinatorClient(path)
             consumer = CoordinatorClient(path)
-            tid, gen, extents, epoch = producer.reserve("r7", [2 * MiB])
+            tid, gen, extents, epoch = producer.reserve("r7", "prefill", 0, [2 * MiB])
             assert epoch == coord.session_epoch
-            assert consumer.lookup("r7") is None
+            assert consumer.lookup("r7", "prefill", 0) is None
             producer.call("mark_writing", transfer_id=tid)
             producer.publish(
                 tid, gen, make_manifest(coord, tid, gen, extents, request_id="r7")
             )
-            got = consumer.lookup("r7")
+            got = consumer.lookup("r7", "prefill", 0)
             assert got is not None and got.transfer_id == tid
             lease_id, m = consumer.lease(tid, gen, "decode-0")
             assert m.extents == extents
@@ -234,7 +285,7 @@ def test_server_and_client_round_trip():
             def worker(i):
                 try:
                     cl = CoordinatorClient(path)
-                    t, g, e, _ = cl.reserve(f"req-{i}", [256 * 1024])
+                    t, g, e, _ = cl.reserve(f"req-{i}", "prefill", 0, [256 * 1024])
                     cl.publish(
                         t, g, make_manifest(coord, t, g, e, request_id=f"req-{i}")
                     )

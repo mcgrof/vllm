@@ -281,8 +281,8 @@ class StagingArena:
         self.mapping_type = ""
         self.waits = 0
         self.wait_ns = 0
-        self.base = None
-        self._cuda = None
+        self.base: int | None = None
+        self._cuda: _Cuda | None = None
         if exporter == "cuda":
             self._init_cuda()
             return
@@ -311,44 +311,45 @@ class StagingArena:
     def _init_cuda(self) -> None:
         if not torch.cuda.is_available():
             raise OSError(0, "the cuda exporter needs a CUDA device")
-        torch.cuda.set_device(self.device)
-        torch.cuda.synchronize(self.device)
-        self._cuda = _Cuda()
-        self._cuda.ensure_context(self.device)
-        if not self._cuda.dmabuf_supported(self.device):
+        torch.accelerator.set_device_index(self.device)
+        torch.accelerator.synchronize()
+        cuda = _Cuda()
+        self._cuda = cuda
+        cuda.ensure_context(self.device)
+        if not cuda.dmabuf_supported(self.device):
             raise OSError(
                 0,
                 f"CUDA device {self.device} does not export dma-bufs "
                 "(CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED is 0; the open kernel modules "
                 "and a PCIe peer-mappable GPU are required)",
             )
-        self.base = self._cuda.alloc(self.nbytes)
-        if self.base % 4096:
-            self._cuda.free(self.base)
+        base = cuda.alloc(self.nbytes)
+        self.base = base
+        if base % 4096:
+            cuda.free(base)
             self.base = None
             raise RuntimeError("cuMemAlloc returned a range that is not page aligned")
         try:
             off = 0
             while off < self.nbytes:
                 length = min(self.chunk_bytes, self.nbytes - off)
-                fd, mapping = self._cuda.export(self.base + off, length)
+                fd, mapping = cuda.export(base + off, length)
                 self.mapping_type = mapping
-                self.chunks.append(
-                    ArenaChunk(off, length, self.base + off, dmabuf_fd=fd)
-                )
+                self.chunks.append(ArenaChunk(off, length, base + off, dmabuf_fd=fd))
                 off += length
         except Exception:
             self.close()
             raise
         self._alloc = ExtentAllocator(0, self.nbytes, self.align)
         self.tensor = torch.as_tensor(
-            _DevicePointer(self.base, self.nbytes), device=f"cuda:{self.device}"
+            _DevicePointer(base, self.nbytes), device=f"cuda:{self.device}"
         )
-        assert self.tensor.data_ptr() == self.base
+        assert self.tensor.data_ptr() == base
 
     # -- mapping -------------------------------------------------------------
 
     def _map_chunk(self, off: int, length: int) -> ArenaChunk:
+        assert self.base is not None
         addr = self.base + off
         rw = mmap.PROT_READ | mmap.PROT_WRITE
         if self.exporter == "host":
@@ -417,6 +418,8 @@ class StagingArena:
                 fd = fcntl.ioctl(dev, _UDMABUF_CREATE, req)
             finally:
                 os.close(dev)
+            if not isinstance(fd, int):
+                raise RuntimeError("UDMABUF_CREATE returned no file descriptor")
             if fd < 0:
                 raise OSError(-fd, f"UDMABUF_CREATE: {os.strerror(-fd)}")
             return memfd, fd
@@ -465,6 +468,7 @@ class StagingArena:
         it crosses a chunk; delta is the piece's offset within the range."""
         if offset < 0 or offset + length > self.nbytes:
             raise ValueError("range outside the arena")
+        assert self.base is not None
         out = []
         pos, end = offset, offset + length
         for c in self.chunks:
@@ -485,7 +489,7 @@ class StagingArena:
         """Every device write into the arena is complete and visible before
         a command reads it (the cuda exporter; a no-op elsewhere)."""
         if self.exporter == "cuda":
-            torch.cuda.synchronize(self.device)
+            torch.accelerator.synchronize()
 
     def view(self, offset: int, nbytes: int, dtype: torch.dtype, shape) -> torch.Tensor:
         return self.tensor[offset : offset + nbytes].view(dtype).view(*shape)
@@ -504,11 +508,13 @@ class StagingArena:
                 os.close(c.memfd)
         self.chunks = []
         self.tensor = None
-        if getattr(self, "base", None) is not None:
+        base = self.base
+        if base is not None:
             if self.exporter == "cuda":
-                self._cuda.free(self.base)
+                assert self._cuda is not None
+                self._cuda.free(base)
             else:
-                _libc.munmap(self.base, self.nbytes)
+                _libc.munmap(base, self.nbytes)
             self.base = None
 
 
@@ -730,7 +736,11 @@ class NixlStorageAdapter:
         self._arena_regs: list = []
         self.arena: StagingArena | None = None
         self.geometries: dict[str, LayerGeometry] = {}
-        self.device_info = self._query_device()
+        try:
+            self.device_info = self._query_device()
+        except Exception:
+            self.agent.deregister_memory(self._blk_reg, ["XNVME_NVM"])
+            raise
         self.counters = {
             "writes": 0,
             "reads": 0,
@@ -758,13 +768,22 @@ class NixlStorageAdapter:
             self.geometries[name] = LayerGeometry.from_tensor(name, t)
 
     def register_arena(self, arena: StagingArena) -> None:
-        self.arena = arena
-        for addr, length, dev, meta in arena.registrations():
-            self._arena_regs.append(
-                self.agent.register_memory(
-                    [(addr, length, dev, meta)], arena.mem_type, backends=["XNVME_NVM"]
+        regs = []
+        try:
+            for addr, length, dev, meta in arena.registrations():
+                regs.append(
+                    self.agent.register_memory(
+                        [(addr, length, dev, meta)],
+                        arena.mem_type,
+                        backends=["XNVME_NVM"],
+                    )
                 )
-            )
+        except Exception:
+            for reg in reversed(regs):
+                self.agent.deregister_memory(reg, ["XNVME_NVM"])
+            raise
+        self._arena_regs.extend(regs)
+        self.arena = arena
 
     def warm(self) -> float:
         """Read one logical block into the start of every dma-buf chunk so
@@ -783,10 +802,12 @@ class NixlStorageAdapter:
             handle = self.agent.initialize_xfer(
                 "READ", local, remote, self.agent_name, b"", ["XNVME_NVM"]
             )
-            status = self.agent.transfer(handle)
-            while status == "PROC":
-                status = self.agent.check_xfer_state(handle)
-            self.agent.release_xfer_handle(handle)
+            try:
+                status = self.agent.transfer(handle)
+                while status == "PROC":
+                    status = self.agent.check_xfer_state(handle)
+            finally:
+                self.agent.release_xfer_handle(handle)
             if status != "DONE":
                 raise RuntimeError("warm-up read of a staging chunk failed")
         ms = (time.monotonic_ns() - t0) / 1e6
@@ -831,7 +852,7 @@ class NixlStorageAdapter:
         if cuda:
             # Device writes into the arena (host or GPU) are complete before
             # the command that reads them is submitted.
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
 
     def unpack(
         self, caches: dict[str, torch.Tensor], block_ids: list[int], region: Extent
@@ -852,7 +873,7 @@ class NixlStorageAdapter:
             and (self.arena.cuda_registered or self.arena.exporter == "cuda"),
         )
         if cuda:
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
 
     def start(
         self, op: str, layers: list[LayerSlice], num_blocks: int, region: Extent
@@ -869,7 +890,11 @@ class NixlStorageAdapter:
             op, local, remote, self.agent_name, b"", ["XNVME_NVM"]
         )
         started = time.monotonic_ns()
-        status = self.agent.transfer(handle)
+        try:
+            status = self.agent.transfer(handle)
+        except Exception:
+            self.agent.release_xfer_handle(handle)
+            raise
         pending = PendingTransfer(
             handle=handle, plan=plan, started_ns=started, op=op, status=status
         )

@@ -65,9 +65,8 @@ class HandoffManifest:
     layout: str
     namespace_serial: str
     namespace_wwid: str
+    producer: str
     layers: list[LayerSlice] = field(default_factory=list)
-    checksums: dict[str, str] = field(default_factory=dict)  # layer -> hex digest
-    producer: str = ""
 
     @property
     def total_bytes(self) -> int:
@@ -98,10 +97,22 @@ class HandoffManifest:
         """The fields a consumer must match before restoring bytes into
         its own KV cache."""
         return (
-            self.model_id == other.model_id
+            self.session_epoch == other.session_epoch
+            and self.model_id == other.model_id
             and self.kv_dtype == other.kv_dtype
             and self.kv_scales == other.kv_scales
+            and self.tp_rank == other.tp_rank
             and self.tp_size == other.tp_size
             and self.block_size == other.block_size
             and self.layout == other.layout
+            and self.namespace_serial == other.namespace_serial
+            and self.namespace_wwid == other.namespace_wwid
+            and [
+                (layer.layer_name, layer.bytes_per_block, layer.regions_per_block)
+                for layer in self.layers
+            ]
+            == [
+                (layer.layer_name, layer.bytes_per_block, layer.regions_per_block)
+                for layer in other.layers
+            ]
         )

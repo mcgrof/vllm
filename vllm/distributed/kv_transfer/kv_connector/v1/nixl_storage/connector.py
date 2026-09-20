@@ -67,7 +67,6 @@ class HandoffConfig:
     fail_on_load_error: bool = True
     lookup_timeout_s: float = 30.0
     trace_path: str = ""
-    verify_checksums: bool = False
     # Staging arena: which exporter backs it (host memory, dma-bufs from
     # the system heap or udmabuf, or a CUDA allocation exported as
     # dma-bufs so the payload never touches host memory), its size (0:
@@ -104,7 +103,6 @@ class HandoffConfig:
             fail_on_load_error=bool(extra.get("fail_on_load_error", True)),
             lookup_timeout_s=float(extra.get("lookup_timeout_s", 30.0)),
             trace_path=str(extra.get("trace_path", "")),
-            verify_checksums=bool(extra.get("verify_checksums", False)),
             staging=str(extra.get("staging", "host")),
             staging_bytes=int(extra.get("staging_bytes", 0)),
             dmabuf_chunk_bytes=int(extra.get("dmabuf_chunk_bytes", 1 << 30)),
@@ -153,7 +151,9 @@ class StoreOrder:
 class LoadOrder:
     request_id: str
     producer_request_id: str
-    manifest_json: str
+    producer_engine_id: str
+    session_epoch: str
+    manifests: dict[int, str]
     block_ids: list[int]
     num_tokens: int
 
@@ -170,12 +170,14 @@ class NixlStorageHandoffConnector(KVConnectorBase_V1):
     ):
         super().__init__(vllm_config, role, kv_cache_config)
         ktc = vllm_config.kv_transfer_config
+        assert ktc is not None
         self.config = HandoffConfig.from_extra(ktc.kv_connector_extra_config or {})
         kv_role = ktc.kv_role or "kv_both"
         self.is_producer = kv_role in ("kv_producer", "kv_both")
         self.is_consumer = kv_role in ("kv_consumer", "kv_both")
         self.engine_id = ktc.engine_id or uuid.uuid4().hex
         self.block_size = vllm_config.cache_config.block_size
+        self.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.model_id = (
             f"{vllm_config.model_config.model}#{vllm_config.model_config.dtype}"
         )
@@ -253,6 +255,7 @@ class NixlStorageHandoffConnector(KVConnectorBase_V1):
                 self.engine_id,
                 self._scheduler.counters,
             )
+            self._scheduler.close()
         if self._worker is not None:
             self._worker.close()
 
@@ -264,7 +267,7 @@ class _Scheduler:
         self.session_epoch = self.coord.call("snapshot")["session_epoch"]
         self.pending_stores: dict[str, StoreOrder] = {}
         self.pending_loads: dict[str, LoadOrder] = {}
-        self.matched: dict[str, tuple[HandoffManifest, int, int]] = {}
+        self.matched: dict[str, tuple[dict[int, HandoffManifest], int, int]] = {}
         self.lookup_started: dict[str, float] = {}
         self.counters = {
             "stores_ordered": 0,
@@ -274,6 +277,9 @@ class _Scheduler:
             "lookup_waits": 0,
         }
 
+    def close(self) -> None:
+        self.coord.close()
+
     def get_num_new_matched_tokens(self, request: Request, num_computed_tokens: int):
         params = request.kv_transfer_params or {}
         handoff = params.get(PARAM_KEY)
@@ -281,8 +287,18 @@ class _Scheduler:
             return 0, False
         rid = request.request_id
         producer_rid = handoff["producer_request_id"]
-        manifest = self.coord.lookup(producer_rid)
-        if manifest is None:
+        producer_engine = handoff["producer_engine_id"]
+        session_epoch = handoff["session_epoch"]
+        manifests = {
+            rank: self.coord.lookup(producer_rid, producer_engine, rank)
+            for rank in range(self.conn.tp_size)
+        }
+        if session_epoch != self.session_epoch:
+            raise RuntimeError(
+                f"storage handoff for {rid}: coordinator epoch changed from "
+                f"{session_epoch} to {self.session_epoch}"
+            )
+        if any(manifest is None for manifest in manifests.values()):
             started = self.lookup_started.setdefault(rid, time.monotonic())
             if time.monotonic() - started > self.conn.config.lookup_timeout_s:
                 self.counters["lookup_timeouts"] += 1
@@ -305,14 +321,43 @@ class _Scheduler:
                 return 0, False
             self.counters["lookup_waits"] += 1
             return None, False
+        rank_manifests = {
+            rank: manifest
+            for rank, manifest in manifests.items()
+            if manifest is not None
+        }
+        for rank, manifest in rank_manifests.items():
+            if (
+                manifest.session_epoch != session_epoch
+                or manifest.request_id != producer_rid
+                or manifest.producer != producer_engine
+                or manifest.tp_rank != rank
+                or manifest.tp_size != self.conn.tp_size
+                or manifest.model_id != self.conn.model_id
+                or manifest.block_size != self.conn.block_size
+            ):
+                raise RuntimeError(
+                    f"storage handoff for {rid}: invalid route for producer "
+                    f"{producer_engine} request {producer_rid} TP rank {rank}"
+                )
+        manifest = rank_manifests[0]
+        if any(
+            (other.num_tokens, other.num_blocks, other.block_size)
+            != (manifest.num_tokens, manifest.num_blocks, manifest.block_size)
+            for other in rank_manifests.values()
+        ):
+            raise RuntimeError(
+                f"storage handoff for {rid}: producer TP manifests disagree"
+            )
         self.lookup_started.pop(rid, None)
         # All but the last prompt token come from storage; the last one is
         # recomputed so the first decode step has its logits.
-        usable = min(manifest.num_tokens, len(request.prompt_token_ids) - 1)
+        prompt_token_ids = request.prompt_token_ids or []
+        usable = min(manifest.num_tokens, len(prompt_token_ids) - 1)
         n = usable - num_computed_tokens
         if n <= 0:
             return 0, False
-        self.matched[rid] = (manifest, n, num_computed_tokens)
+        self.matched[rid] = (rank_manifests, n, num_computed_tokens)
         return n, True
 
     def update_state_after_alloc(
@@ -321,7 +366,8 @@ class _Scheduler:
         if num_external_tokens == 0:
             self.matched.pop(request.request_id, None)
             return
-        manifest, n, num_computed = self.matched.pop(request.request_id)
+        manifests, n, num_computed = self.matched.pop(request.request_id)
+        manifest = manifests[0]
         block_ids = list(blocks.get_block_ids()[0])
         first = num_computed // self.conn.block_size
         needed = math.ceil((num_computed + num_external_tokens) / self.conn.block_size)
@@ -331,7 +377,9 @@ class _Scheduler:
         self.pending_loads[request.request_id] = LoadOrder(
             request_id=request.request_id,
             producer_request_id=manifest.request_id,
-            manifest_json=manifest.to_json(),
+            producer_engine_id=manifest.producer,
+            session_epoch=manifest.session_epoch,
+            manifests={rank: item.to_json() for rank, item in manifests.items()},
             block_ids=target,
             num_tokens=num_external_tokens,
         )
@@ -436,32 +484,44 @@ class _Worker:
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         self.device_kv = kv_caches
-        self.adapter = NixlStorageAdapter(
+        adapter = NixlStorageAdapter(
             f"handoff-{self.conn.engine_id}-{self.rank}",
             self.cfg.backend_params(),
             self.cfg.range_offset,
             self.cfg.range_len,
         )
-        self.adapter.register_cache(kv_caches)
-        # The arena holds objects in flight, not a mirror of the cache: by
-        # default room for two objects of the longest possible request.
-        max_blocks = math.ceil(self.max_model_len / self.conn.block_size)
-        nbytes = self.cfg.staging_bytes or 2 * self.adapter.object_bytes(max_blocks)
-        first = next(iter(kv_caches.values()))
-        if self.cfg.staging == "cuda" and not first.is_cuda:
-            raise RuntimeError(
-                "storage handoff: staging=cuda needs the KV cache on a CUDA device"
+        arena = None
+        try:
+            adapter.register_cache(kv_caches)
+            # The arena holds objects in flight, not a mirror of the cache: by
+            # default room for two objects of the longest possible request.
+            max_blocks = math.ceil(self.max_model_len / self.conn.block_size)
+            nbytes = self.cfg.staging_bytes or 2 * adapter.object_bytes(max_blocks)
+            first = next(iter(kv_caches.values()))
+            if self.cfg.staging == "cuda" and not first.is_cuda:
+                raise RuntimeError(
+                    "storage handoff: staging=cuda needs the KV cache on a CUDA device"
+                )
+            arena = StagingArena(
+                nbytes,
+                self.cfg.staging,
+                self.cfg.dmabuf_chunk_bytes,
+                name=f"kv-staging-{self.conn.engine_id}-{self.rank}",
+                device=first.device.index or 0 if first.is_cuda else 0,
             )
-        self.arena = StagingArena(
-            nbytes,
-            self.cfg.staging,
-            self.cfg.dmabuf_chunk_bytes,
-            name=f"kv-staging-{self.conn.engine_id}-{self.rank}",
-            device=first.device.index or 0 if first.is_cuda else 0,
-        )
-        pinned = self.arena.cuda_register() if first.is_cuda else False
-        self.adapter.register_arena(self.arena)
-        warm_ms = self.adapter.warm()
+            pinned = arena.cuda_register() if first.is_cuda else False
+            adapter.register_arena(arena)
+            warm_ms = adapter.warm()
+        except Exception:
+            try:
+                adapter.close()
+            finally:
+                if arena is not None:
+                    arena.close()
+            raise
+        assert arena is not None
+        self.adapter = adapter
+        self.arena = arena
         self.kv_dtype = str(first.dtype)
         self.layout = (
             "x".join(str(d) for d in first.shape[2:]) if first.ndim > 2 else "flat"
@@ -480,8 +540,8 @@ class _Worker:
             if self.arena.mapping_type
             else "",
             warm_ms,
-            self.adapter.device_info.get("serial"),
-            self.adapter.device_info.get("max_io_bytes"),
+            adapter.device_info.get("serial"),
+            adapter.device_info.get("max_io_bytes"),
         )
         if first.is_cuda and self.arena.exporter != "cuda" and not pinned:
             logger.warning(
@@ -540,16 +600,16 @@ class _Worker:
             namespace_serial=self.adapter.device_info.get("serial", ""),
             namespace_wwid=self.adapter.device_info.get("wwid", ""),
             layers=layers,
-            producer=self.consumer_id,
+            producer=self.conn.engine_id,
         )
 
     # -- per step -----------------------------------------------------------------
 
     def begin(self, meta: HandoffMetadata) -> None:
-        for order in meta.stores.values():
-            self._begin_store(order)
-        for order in meta.loads.values():
-            self._begin_load(order)
+        for store_order in meta.stores.values():
+            self._begin_store(store_order)
+        for load_order in meta.loads.values():
+            self._begin_load(load_order)
 
     def _begin_store(self, order: StoreOrder) -> None:
         assert self.adapter is not None and self.arena is not None
@@ -573,13 +633,43 @@ class _Worker:
                 ) from e
             self._done_send.add(order.request_id)
             return
+        except Exception:
+            if region is not None:
+                self.arena.free(region)
+            raise
         t["reserved_ns"] = time.monotonic_ns()
-        layers = self.adapter.layer_slices(extents, n)
-        manifest = self._identity(
-            order.request_id, transfer_id, generation, order.num_tokens, n, layers
-        )
-        self.coord.call("mark_writing", transfer_id=transfer_id)
-        pending = self.adapter.start("WRITE", layers, n, region)
+        try:
+            layers = self.adapter.layer_slices(extents, n)
+            manifest = self._identity(
+                order.request_id,
+                transfer_id,
+                generation,
+                order.num_tokens,
+                n,
+                layers,
+            )
+            self.coord.call("mark_writing", transfer_id=transfer_id)
+            pending = self.adapter.start("WRITE", layers, n, region)
+        except Exception as e:
+            self.coord.call(
+                "fail",
+                transfer_id=transfer_id,
+                generation=generation,
+                reason=f"write submission failed: {e}",
+            )
+            self.coord.call("producer_drained", transfer_id=transfer_id)
+            self.coord.call("reclaim")
+            self.arena.free(region)
+            self.counters["stores_failed"] += 1
+            self._trace_event(
+                "store", order.request_id, transfer_id, generation, None, t, "error"
+            )
+            if self.cfg.fail_on_load_error:
+                raise RuntimeError(
+                    f"storage handoff: store of {order.request_id} failed to submit"
+                ) from e
+            self._done_send.add(order.request_id)
+            return
         t["submitted_ns"] = time.monotonic_ns()
         self.stores[order.request_id] = _Store(
             order, transfer_id, generation, manifest, pending, region, t
@@ -596,7 +686,7 @@ class _Worker:
         while True:
             try:
                 transfer_id, generation, extents, _ = self.coord.reserve(
-                    request_id, lengths
+                    request_id, self.conn.engine_id, self.rank, lengths
                 )
                 break
             except OutOfSpace:
@@ -614,9 +704,35 @@ class _Worker:
         return transfer_id, generation, extents
 
     def _begin_load(self, order: LoadOrder) -> None:
-        assert self.adapter is not None
-        manifest = HandoffManifest.from_json(order.manifest_json)
-        local = self._identity("", "", 0, 0, 0, [])
+        assert self.adapter is not None and self.arena is not None
+        try:
+            manifest_json = order.manifests[self.rank]
+        except KeyError as e:
+            raise RuntimeError(
+                f"storage handoff for {order.request_id}: no manifest for "
+                f"TP rank {self.rank}"
+            ) from e
+        manifest = HandoffManifest.from_json(manifest_json)
+        if (
+            order.session_epoch != self.session_epoch
+            or manifest.session_epoch != order.session_epoch
+            or manifest.request_id != order.producer_request_id
+            or manifest.producer != order.producer_engine_id
+            or manifest.tp_rank != self.rank
+        ):
+            raise RuntimeError(
+                f"storage handoff for {order.request_id}: manifest route does not "
+                "match the scheduled producer"
+            )
+        local_layers = self.adapter.layer_slices(manifest.extents, manifest.num_blocks)
+        local = self._identity(
+            "",
+            "",
+            0,
+            manifest.num_tokens,
+            manifest.num_blocks,
+            local_layers,
+        )
         if not manifest.same_identity(local):
             raise RuntimeError(
                 f"storage handoff for {order.request_id}: object identity "
@@ -624,18 +740,38 @@ class _Worker:
                 f"from this engine's {local.model_id}/{local.kv_dtype}/{local.layout}"
             )
         n = len(order.block_ids)
+        expected_lengths = self.adapter.object_lengths(manifest.num_blocks)
+        bad_extents = any(
+            layer.extent.length < expected or layer.extent.length - expected >= 4096
+            for layer, expected in zip(manifest.layers, expected_lengths)
+        )
+        if n > manifest.num_blocks or bad_extents:
+            raise RuntimeError(
+                f"storage handoff for {order.request_id}: manifest object geometry "
+                "does not match the local cache"
+            )
         t: dict[str, int] = {}
         region = self._stage(order.request_id, self.adapter.object_bytes(n), t)
         t["lease_start_ns"] = time.monotonic_ns()
+        leased = False
         try:
             _, manifest = self.coord.lease(
                 manifest.transfer_id, manifest.generation, self.consumer_id
             )
-        except Exception:
+            leased = True
+            pending = self.adapter.start("READ", manifest.layers, n, region)
+        except Exception as e:
+            if leased:
+                self.coord.call(
+                    "force_release",
+                    transfer_id=manifest.transfer_id,
+                    consumer=self.consumer_id,
+                    reason=f"read submission failed: {e}",
+                )
+                self.coord.call("reclaim")
             self.arena.free(region)
             raise
         t["leased_ns"] = time.monotonic_ns()
-        pending = self.adapter.start("READ", manifest.layers, n, region)
         t["submitted_ns"] = time.monotonic_ns()
         self.loads[order.request_id] = _Load(order, manifest, pending, region, t)
         self.counters["loads_started"] += 1
@@ -647,7 +783,7 @@ class _Worker:
         return done_send, done_recv
 
     def _poll_transfers(self) -> None:
-        assert self.adapter is not None
+        assert self.adapter is not None and self.arena is not None
         done_send = self._done_send
         done_recv = self._done_recv
         for rid, st in list(self.stores.items()):
@@ -708,15 +844,20 @@ class _Worker:
             del self.loads[rid]
             m = ld.manifest
             if status == "DONE":
-                self.adapter.unpack(self.device_kv, ld.order.block_ids, ld.region)
-                ld.t["restored_ns"] = time.monotonic_ns()
-                self.coord.call(
-                    "ack",
-                    transfer_id=m.transfer_id,
-                    generation=m.generation,
-                    consumer=self.consumer_id,
-                )
-                ld.t["acked_ns"] = time.monotonic_ns()
+                try:
+                    self.adapter.unpack(self.device_kv, ld.order.block_ids, ld.region)
+                    ld.t["restored_ns"] = time.monotonic_ns()
+                    self.coord.call(
+                        "ack",
+                        transfer_id=m.transfer_id,
+                        generation=m.generation,
+                        consumer=self.consumer_id,
+                    )
+                    ld.t["acked_ns"] = time.monotonic_ns()
+                except Exception as e:
+                    logger.error("storage handoff: load of %s failed: %s", rid, e)
+                    status = "ERR"
+            if status == "DONE":
                 self.counters["loads_done"] += 1
                 self.counters["bytes_loaded"] += ld.pending.plan.bytes
                 self._trace_event(
@@ -724,10 +865,12 @@ class _Worker:
                 )
             else:
                 self.coord.call(
-                    "consumer_drained",
+                    "force_release",
                     transfer_id=m.transfer_id,
                     consumer=self.consumer_id,
+                    reason="read failed",
                 )
+                self.coord.call("reclaim")
                 self.counters["loads_failed"] += 1
                 self._trace_event(
                     "load", rid, m.transfer_id, m.generation, ld.pending, ld.t, "error"
@@ -771,7 +914,12 @@ class _Worker:
         )
         if self._trace:
             self._trace.close()
-        if self.adapter:
-            self.adapter.close()
-        if self.arena:
-            self.arena.close()
+        try:
+            if self.adapter:
+                self.adapter.close()
+        finally:
+            try:
+                if self.arena:
+                    self.arena.close()
+            finally:
+                self.coord.close()

@@ -7,7 +7,8 @@ JSON line protocol (``CoordinatorServer`` / ``CoordinatorClient``) so a
 prefill and a decode process on one host share it. Extents come from a
 first-fit free list over one byte range of one namespace. Reclamation
 happens only after every reader acknowledged and every party reported its
-I/O drained; a lease timeout alone never frees a range.
+I/O drained; a lease timeout alone never frees a range. Each object is one
+producer TP shard consumed by the corresponding TP rank of one decode engine.
 """
 
 from __future__ import annotations
@@ -54,6 +55,8 @@ class Lease:
 class HandoffObject:
     transfer_id: str
     request_id: str
+    producer: str
+    tp_rank: int
     session_epoch: str
     generation: int
     extents: list[Extent]
@@ -128,7 +131,7 @@ class StorageHandoffCoordinator:
         self.lease_timeout_s = lease_timeout_s
         self.session_epoch = session_epoch or uuid.uuid4().hex
         self._objects: dict[str, HandoffObject] = {}
-        self._by_request: dict[str, str] = {}
+        self._by_request: dict[tuple[str, str, int], str] = {}
         self._lock = threading.RLock()
         self.counters = {
             "reserved": 0,
@@ -145,14 +148,17 @@ class StorageHandoffCoordinator:
     # ---- producer side -----------------------------------------------------
 
     def reserve(
-        self, request_id: str, lengths: list[int]
+        self, request_id: str, producer: str, tp_rank: int, lengths: list[int]
     ) -> tuple[str, int, list[Extent]]:
-        """Allocate one extent per length for a new object of request_id.
-        A repeated reservation for the same request id is a new generation
-        of the object; the older generation stays until reclaimed."""
+        """Allocate extents for one producer request and TP rank.
+
+        Repeating the same producer/request/rank key creates a new generation;
+        the older generation stays allocated until it is reclaimed.
+        """
         with self._lock:
+            key = (producer, request_id, tp_rank)
             generation = 0
-            old = self._by_request.get(request_id)
+            old = self._by_request.get(key)
             if old is not None:
                 generation = self._objects[old].generation + 1
             extents: list[Extent] = []
@@ -167,12 +173,14 @@ class StorageHandoffCoordinator:
             obj = HandoffObject(
                 transfer_id=transfer_id,
                 request_id=request_id,
+                producer=producer,
+                tp_rank=tp_rank,
                 session_epoch=self.session_epoch,
                 generation=generation,
                 extents=extents,
             )
             self._objects[transfer_id] = obj
-            self._by_request[request_id] = transfer_id
+            self._by_request[key] = transfer_id
             self.counters["reserved"] += 1
             return transfer_id, generation, extents
 
@@ -191,12 +199,23 @@ class StorageHandoffCoordinator:
             obj = self._get(transfer_id)
             self._check_generation(obj, generation)
             if obj.state == ObjectState.READY and obj.manifest is not None:
+                if obj.manifest != manifest:
+                    raise HandoffError(
+                        "a different manifest is already published for this generation"
+                    )
                 return
             self._require(obj, ObjectState.WRITING, ObjectState.RESERVED)
             if manifest.extents != obj.extents:
                 raise HandoffError("manifest extents differ from the reservation")
             if manifest.transfer_id != transfer_id or manifest.generation != generation:
                 raise HandoffError("manifest identity differs from the reservation")
+            if (
+                manifest.session_epoch != self.session_epoch
+                or manifest.request_id != obj.request_id
+                or manifest.producer != obj.producer
+                or manifest.tp_rank != obj.tp_rank
+            ):
+                raise HandoffError("manifest route differs from the reservation")
             obj.manifest = manifest
             obj.state = ObjectState.READY
             obj.producer_drained = True  # writes completed by definition
@@ -218,10 +237,12 @@ class StorageHandoffCoordinator:
 
     # ---- consumer side -----------------------------------------------------
 
-    def lookup(self, request_id: str) -> HandoffManifest | None:
-        """The READY manifest for a request id, or None (not yet, or gone)."""
+    def lookup(
+        self, request_id: str, producer: str, tp_rank: int
+    ) -> HandoffManifest | None:
+        """Return the READY manifest for one producer request and TP rank."""
         with self._lock:
-            tid = self._by_request.get(request_id)
+            tid = self._by_request.get((producer, request_id, tp_rank))
             if tid is None:
                 return None
             obj = self._objects[tid]
@@ -245,6 +266,10 @@ class StorageHandoffCoordinator:
             existing = obj.leases.get(consumer)
             if existing is not None and not existing.acked:
                 return existing.lease_id, obj.manifest
+            if obj.leases:
+                raise HandoffError(
+                    f"{transfer_id} is already assigned to another decode rank"
+                )
             now = time.monotonic()
             lease = Lease(consumer, uuid.uuid4().hex, now, now + self.lease_timeout_s)
             obj.leases[consumer] = lease
@@ -267,7 +292,9 @@ class StorageHandoffCoordinator:
             lease.acked = True
             lease.drained = True
             self.counters["acks"] += 1
-            if all(lease.acked for lease in obj.leases.values()):
+            if len(obj.leases) == 1 and all(
+                lease.acked for lease in obj.leases.values()
+            ):
                 obj.state = ObjectState.ACKED
 
     def consumer_drained(self, transfer_id: str, consumer: str) -> None:
@@ -304,7 +331,9 @@ class StorageHandoffCoordinator:
             lease.acked = True
             lease.drained = True
             obj.error = obj.error or f"force_release({consumer}): {reason}"
-            if all(lease.acked for lease in obj.leases.values()):
+            if len(obj.leases) == 1 and all(
+                lease.acked for lease in obj.leases.values()
+            ):
                 obj.state = ObjectState.ACKED
 
     def reclaim(self) -> int:
@@ -325,8 +354,9 @@ class StorageHandoffCoordinator:
                     self.allocator.free(e)
                 obj.state = ObjectState.RECLAIMABLE
                 obj.extents = []
-                if self._by_request.get(obj.request_id) == tid:
-                    del self._by_request[obj.request_id]
+                key = (obj.producer, obj.request_id, obj.tp_rank)
+                if self._by_request.get(key) == tid:
+                    del self._by_request[key]
                 del self._objects[tid]
                 freed += 1
                 self.counters["reclaimed"] += 1
@@ -339,6 +369,8 @@ class StorageHandoffCoordinator:
                 "objects": {
                     tid: {
                         "request_id": o.request_id,
+                        "producer": o.producer,
+                        "tp_rank": o.tp_rank,
                         "generation": o.generation,
                         "state": o.state.value,
                         "bytes": sum(e.length for e in o.extents),
@@ -412,7 +444,12 @@ class _Handler(socketserver.StreamRequestHandler):
 
 def _dispatch(coord: StorageHandoffCoordinator, op: str, args: dict):
     if op == "reserve":
-        tid, gen, extents = coord.reserve(args["request_id"], args["lengths"])
+        tid, gen, extents = coord.reserve(
+            args["request_id"],
+            args["producer"],
+            args["tp_rank"],
+            args["lengths"],
+        )
         return {
             "transfer_id": tid,
             "generation": gen,
@@ -436,7 +473,7 @@ def _dispatch(coord: StorageHandoffCoordinator, op: str, args: dict):
         coord.producer_drained(args["transfer_id"])
         return None
     if op == "lookup":
-        m = coord.lookup(args["request_id"])
+        m = coord.lookup(args["request_id"], args["producer"], args["tp_rank"])
         return None if m is None else m.to_json()
     if op == "state_of":
         return coord.state_of(args["transfer_id"]).value
@@ -520,9 +557,15 @@ class CoordinatorClient:
 
     # typed conveniences
     def reserve(
-        self, request_id: str, lengths: list[int]
+        self, request_id: str, producer: str, tp_rank: int, lengths: list[int]
     ) -> tuple[str, int, list[Extent], str]:
-        r = self.call("reserve", request_id=request_id, lengths=lengths)
+        r = self.call(
+            "reserve",
+            request_id=request_id,
+            producer=producer,
+            tp_rank=tp_rank,
+            lengths=lengths,
+        )
         return (
             r["transfer_id"],
             r["generation"],
@@ -540,8 +583,12 @@ class CoordinatorClient:
             manifest=manifest.to_json(),
         )
 
-    def lookup(self, request_id: str) -> HandoffManifest | None:
-        r = self.call("lookup", request_id=request_id)
+    def lookup(
+        self, request_id: str, producer: str, tp_rank: int
+    ) -> HandoffManifest | None:
+        r = self.call(
+            "lookup", request_id=request_id, producer=producer, tp_rank=tp_rank
+        )
         return None if r is None else HandoffManifest.from_json(r)
 
     def lease(

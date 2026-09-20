@@ -213,6 +213,85 @@ def test_cuda_registered_chunks_are_unregistered_on_close(monkeypatch):
     assert arena._cuda_registered_chunks == []
 
 
+class _FakeAgent:
+    def __init__(self, fail_registration=0, fail_transfer=False):
+        self.fail_registration = fail_registration
+        self.fail_transfer = fail_transfer
+        self.registrations = []
+        self.deregistrations = []
+        self.released = []
+
+    def create_backend(self, name, params):
+        del name, params
+
+    def register_memory(self, descs, mem_type, backends):
+        del descs, mem_type, backends
+        call = len(self.registrations) + 1
+        if call == self.fail_registration:
+            raise RuntimeError("injected registration failure")
+        reg = f"reg-{call}"
+        self.registrations.append(reg)
+        return reg
+
+    def deregister_memory(self, reg, backends):
+        del backends
+        self.deregistrations.append(reg)
+
+    def query_memory(self, descs, backend, mem_type):
+        del descs, backend, mem_type
+        return [{"serial": "fake", "wwid": "fake.wwid"}]
+
+    def get_xfer_descs(self, descs, mem_type):
+        del mem_type
+        return descs
+
+    def initialize_xfer(self, op, local, remote, agent, metadata, backends):
+        del op, local, remote, agent, metadata, backends
+        return "handle"
+
+    def transfer(self, handle):
+        del handle
+        if self.fail_transfer:
+            raise RuntimeError("injected transfer failure")
+        return "DONE"
+
+    def release_xfer_handle(self, handle):
+        self.released.append(handle)
+
+
+def test_adapter_rolls_back_partial_arena_registration():
+    agent = _FakeAgent(fail_registration=3)
+    adapter = NixlStorageAdapter("test", {}, 0, 4 * MiB, nixl_agent_cls=lambda _: agent)
+    arena = StagingArena(2 * HUGE_2M, "host", chunk_bytes=HUGE_2M)
+    try:
+        with pytest.raises(RuntimeError, match="injected registration failure"):
+            adapter.register_arena(arena)
+        assert adapter.arena is None and adapter._arena_regs == []
+        assert agent.deregistrations == ["reg-2"]
+    finally:
+        adapter.close()
+        arena.close()
+
+
+def test_adapter_releases_handle_when_transfer_raises():
+    agent = _FakeAgent(fail_transfer=True)
+    adapter = NixlStorageAdapter("test", {}, 0, 4 * MiB, nixl_agent_cls=lambda _: agent)
+    caches = make_cache(1, 4)
+    adapter.register_cache(caches)
+    arena = StagingArena(HUGE_2M, "host", chunk_bytes=HUGE_2M)
+    adapter.register_arena(arena)
+    layers = adapter.layer_slices([Extent(0, adapter.object_lengths(1)[0])], 1)
+    region = arena.allocate(adapter.object_bytes(1))
+    try:
+        with pytest.raises(RuntimeError, match="injected transfer failure"):
+            adapter.start("WRITE", layers, 1, region)
+        assert agent.released == ["handle"]
+    finally:
+        arena.free(region)
+        adapter.close()
+        arena.close()
+
+
 @pytest.mark.parametrize("exporter", ["system_heap", "udmabuf", "udmabuf_hugetlb"])
 def test_dmabuf_exporters_hand_out_fds(exporter):
     arena = exporter_or_skip(exporter)
@@ -263,7 +342,7 @@ def test_cuda_exporter_is_device_memory_in_dmabuf_chunks():
         arena.fence_before_io()
         out = {n: torch.zeros_like(t) for n, t in caches.items()}
         unpack_blocks(geoms, out, [7, 0, 3], arena, region, non_blocking=True)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         for n in caches:
             assert torch.equal(
                 caches[n][:, block_ids].cpu(), out[n][:, [7, 0, 3]].cpu()
