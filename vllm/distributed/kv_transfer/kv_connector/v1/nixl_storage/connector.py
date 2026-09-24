@@ -89,7 +89,7 @@ class HandoffConfig:
             raise ValueError("storage handoff needs device_name and range_len")
         cfg = cls(
             device_name=str(extra["device_name"]),
-            async_iface=str(extra.get("async", "io_uring_cmd")),
+            async_iface=str(extra.get("async", "io_uring")),
             buffer_mode=str(extra.get("buffer_mode", "host")),
             range_offset=int(extra.get("range_offset", 0)),
             range_len=int(extra["range_len"]),
