@@ -169,8 +169,20 @@ class _Cuda:
 
 def _clear_cuda_last_error() -> None:
     """cudaGetLastError through the runtime library torch loaded (torch's own
-    cudart binding does not expose it)."""
+    cudart binding does not expose it).
+
+    The error sits in the last-error slot of the runtime that produced it, so
+    it has to be cleared through that same library.  Resolve the symbol in the
+    process first: a wheel directory can hold a cudart of a different major
+    version than the one torch actually loaded, and clearing that one leaves
+    the real error in place to surface from an unrelated later launch."""
     import glob
+
+    try:
+        ctypes.CDLL(None).cudaGetLastError()
+        return
+    except (OSError, AttributeError):
+        pass
 
     here = os.path.dirname(torch.__file__)
     for pattern in (
@@ -183,7 +195,7 @@ def _clear_cuda_last_error() -> None:
             try:
                 ctypes.CDLL(lib).cudaGetLastError()
                 return
-            except OSError:
+            except (OSError, AttributeError):
                 continue
 
 
