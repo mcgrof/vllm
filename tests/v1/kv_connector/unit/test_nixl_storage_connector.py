@@ -134,6 +134,25 @@ def _decode_request(epoch="epoch"):
     )
 
 
+def test_load_order_starts_where_the_local_prefix_cache_stops():
+    # Two of the object's blocks are already computed locally; the order
+    # must fetch the object's blocks from there, into the request's blocks
+    # from there, and not the object's first blocks.
+    manifests = {0: _manifest(0), 1: _manifest(1)}
+    for m in manifests.values():
+        m.num_tokens, m.num_blocks = 64, 4
+    scheduler = _scheduler(manifests)
+    request = _decode_request()
+    request.prompt_token_ids = list(range(64))
+    assert scheduler.get_num_new_matched_tokens(request, 32) == (31, True)
+    blocks = SimpleNamespace(get_block_ids=lambda: ([10, 11, 12, 13],))
+    scheduler.update_state_after_alloc(request, blocks, 31)
+    order = scheduler.pending_loads["decode-request"]
+    assert order.first_block == 2
+    assert order.block_ids == [12, 13]
+    assert order.num_tokens == 31
+
+
 def test_scheduler_waits_for_every_tp_manifest():
     scheduler = _scheduler({0: _manifest(0)})
     assert scheduler.get_num_new_matched_tokens(_decode_request(), 0) == (

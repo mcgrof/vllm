@@ -615,11 +615,24 @@ def plan_transfer(
     num_blocks: int,
     arena: StagingArena,
     region: Extent,
+    first_block: int = 0,
+    object_blocks: int | None = None,
 ) -> TransferPlan:
-    """Pair every layer region of the object staged at `region` with its
-    place on the namespace. Layer i of `layers` must describe geometries[i]."""
+    """Pair every layer region of the blocks staged at `region` with their
+    place on the namespace. Layer i of `layers` must describe geometries[i].
+
+    The staged region holds `num_blocks` blocks; on the namespace they are
+    blocks `first_block` onward of an object `object_blocks` long, whose
+    regions are laid out at the object's stride, not the transfer's."""
     if len(geometries) != len(layers):
         raise ValueError("geometry/extent count mismatch")
+    if object_blocks is None:
+        object_blocks = num_blocks
+    if first_block < 0 or first_block + num_blocks > object_blocks:
+        raise ValueError(
+            f"blocks {first_block}..{first_block + num_blocks} are outside an "
+            f"object of {object_blocks} blocks"
+        )
     bases = object_layout(geometries, num_blocks)
     if (
         region.length < bases[-1] + geometries[-1].object_bytes(num_blocks)
@@ -638,14 +651,19 @@ def plan_transfer(
             raise ValueError(
                 f"{g.layer_name}: object geometry differs from the local cache"
             )
-        if g.object_bytes(num_blocks) > layer.extent.length:
+        if g.object_bytes(object_blocks) > layer.extent.length:
             raise ValueError(
-                f"{g.layer_name}: {num_blocks} blocks do not fit the extent"
+                f"{g.layer_name}: {object_blocks} blocks do not fit the extent"
             )
         region_bytes = num_blocks * g.block_bytes
+        object_region_bytes = object_blocks * g.block_bytes
         for k in range(g.regions):
             here = region.offset + base + k * region_bytes
-            there = layer.extent.offset + k * region_bytes
+            there = (
+                layer.extent.offset
+                + k * object_region_bytes
+                + first_block * g.block_bytes
+            )
             for addr, length, delta in arena.pieces(here, region_bytes):
                 local.append((addr, length, 0))
                 remote.append((there + delta, length, 0))
@@ -888,11 +906,19 @@ class NixlStorageAdapter:
             torch.accelerator.synchronize()
 
     def start(
-        self, op: str, layers: list[LayerSlice], num_blocks: int, region: Extent
+        self,
+        op: str,
+        layers: list[LayerSlice],
+        num_blocks: int,
+        region: Extent,
+        first_block: int = 0,
+        object_blocks: int | None = None,
     ) -> PendingTransfer:
         assert self.arena is not None
         geoms = [self.geometries[layer.layer_name] for layer in layers]
-        plan = plan_transfer(geoms, layers, num_blocks, self.arena, region)
+        plan = plan_transfer(
+            geoms, layers, num_blocks, self.arena, region, first_block, object_blocks
+        )
         dev = self.arena.device if self.arena.exporter == "cuda" else 0
         local = self.agent.get_xfer_descs(
             [(a, n, dev) for a, n, _ in plan.local], self.arena.mem_type

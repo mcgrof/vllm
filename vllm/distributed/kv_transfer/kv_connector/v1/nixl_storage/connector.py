@@ -156,6 +156,9 @@ class LoadOrder:
     manifests: dict[int, str]
     block_ids: list[int]
     num_tokens: int
+    # Index within the object of the first block to fetch: a local prefix
+    # cache hit covers the blocks before it.
+    first_block: int
 
 
 @dataclass
@@ -382,6 +385,7 @@ class _Scheduler:
             manifests={rank: item.to_json() for rank, item in manifests.items()},
             block_ids=target,
             num_tokens=num_external_tokens,
+            first_block=first,
         )
         self.counters["loads_ordered"] += 1
 
@@ -745,7 +749,7 @@ class _Worker:
             layer.extent.length < expected or layer.extent.length - expected >= 4096
             for layer, expected in zip(manifest.layers, expected_lengths)
         )
-        if n > manifest.num_blocks or bad_extents:
+        if order.first_block + n > manifest.num_blocks or bad_extents:
             raise RuntimeError(
                 f"storage handoff for {order.request_id}: manifest object geometry "
                 "does not match the local cache"
@@ -759,7 +763,14 @@ class _Worker:
                 manifest.transfer_id, manifest.generation, self.consumer_id
             )
             leased = True
-            pending = self.adapter.start("READ", manifest.layers, n, region)
+            pending = self.adapter.start(
+                "READ",
+                manifest.layers,
+                n,
+                region,
+                first_block=order.first_block,
+                object_blocks=manifest.num_blocks,
+            )
         except Exception as e:
             if leased:
                 self.coord.call(

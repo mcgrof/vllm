@@ -392,6 +392,44 @@ def test_plan_pack_and_unpack_round_trip_through_the_arena():
         arena.close()
 
 
+def test_plan_reads_the_object_blocks_a_partial_restore_names():
+    # A restore that starts past a local prefix-cache hit stages fewer
+    # blocks than the object holds; on the namespace they are the object's
+    # blocks from first_block on, and every region keeps the object's
+    # stride, not the transfer's.
+    src = make_cache(2, 8)
+    geoms = [LayerGeometry.from_tensor(n, t) for n, t in src.items()]
+    g = geoms[0]
+    bb = g.block_bytes
+    arena = StagingArena(2 * HUGE_2M, "host", chunk_bytes=HUGE_2M)
+    try:
+        layers = layers_for(geoms, 8)
+        region = Extent(0, sum(gg.object_bytes(3) for gg in geoms))
+        plan = plan_transfer(
+            geoms, layers, 3, arena, region, first_block=5, object_blocks=8
+        )
+        assert plan.bytes == region.length
+        assert plan.remote[0] == (layers[0].extent.offset + 5 * bb, 3 * bb, 0)
+        assert plan.remote[1] == (
+            layers[0].extent.offset + 8 * bb + 5 * bb,
+            3 * bb,
+            0,
+        )
+        assert plan.remote[2] == (layers[1].extent.offset + 5 * bb, 3 * bb, 0)
+        # The staged side is the transfer's own layout, three blocks long.
+        assert plan.local[1][0] == arena.base + 3 * bb
+        with pytest.raises(ValueError):
+            plan_transfer(
+                geoms, layers, 3, arena, region, first_block=6, object_blocks=8
+            )
+        with pytest.raises(ValueError):
+            plan_transfer(
+                geoms, layers, 3, arena, region, first_block=-1, object_blocks=8
+            )
+    finally:
+        arena.close()
+
+
 @pytest.mark.skipif(DEVICE is None, reason="NIXL_XNVME_NVM_DEVICE not set")
 def test_write_then_read_blocks_through_the_namespace():
     params = {"device_name": DEVICE, "async": ASYNC, "num_tasks": "32"}
