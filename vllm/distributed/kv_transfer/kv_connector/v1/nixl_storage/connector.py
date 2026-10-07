@@ -389,6 +389,7 @@ class _Scheduler:
         usable = min(manifest.num_tokens, len(prompt_token_ids) - 1)
         n = usable - num_computed_tokens
         if n <= 0:
+            self.matched[rid] = (rank_manifests, 0, num_computed_tokens)
             return 0, False
         self.matched[rid] = (rank_manifests, n, num_computed_tokens)
         return n, True
@@ -397,7 +398,16 @@ class _Scheduler:
         self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
     ):
         if num_external_tokens == 0:
-            self.matched.pop(request.request_id, None)
+            matched = self.matched.pop(request.request_id, None)
+            if matched is not None and matched[1] == 0:
+                # Allocation has secured the resident prefix. Releasing at
+                # lookup time would lose storage if allocation had to retry.
+                for ready in matched[0].values():
+                    self.coord.call(
+                        "release_unread",
+                        transfer_id=ready.transfer_id,
+                        generation=ready.generation,
+                    )
             return
         manifests, n, num_computed = self.matched.pop(request.request_id)
         manifest = manifests[0]
@@ -426,6 +436,8 @@ class _Scheduler:
         return meta
 
     def request_finished(self, request: Request, block_ids):
+        self.matched.pop(request.request_id, None)
+        self.lookup_started.pop(request.request_id, None)
         params = request.kv_transfer_params or {}
         if not self.conn.is_producer or not params.get("do_remote_decode"):
             return False, None

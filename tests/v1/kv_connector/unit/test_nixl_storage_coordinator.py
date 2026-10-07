@@ -127,6 +127,25 @@ def test_allocator_rejects_nonpositive_lengths_without_mutation(length):
 # --- lifecycle -------------------------------------------------------------------
 
 
+def test_resident_consumer_releases_only_an_unclaimed_publication():
+    c = StorageHandoffCoordinator(0, 8192)
+    tid, gen, extents = c.reserve("r1", "prefill", 0, [8192])
+    c.publish(tid, gen, make_manifest(c, tid, gen, extents))
+    with pytest.raises(StaleGeneration):
+        c.release_unread(tid, gen + 1)
+    assert c.snapshot()["free_bytes"] == 0
+    c.release_unread(tid, gen)
+    assert c.snapshot()["free_bytes"] == 8192
+    tid, gen, extents = c.reserve("r1", "prefill", 0, [8192])
+    c.publish(tid, gen, make_manifest(c, tid, gen, extents))
+    c.lease(tid, gen, "reader")
+    with pytest.raises(HandoffError):
+        c.release_unread(tid, gen)
+    assert c.snapshot()["free_bytes"] == 0
+    c.ack(tid, gen, "reader")
+    assert c.reclaim() == 1
+
+
 def test_reserve_publish_lease_ack_reclaim():
     c = StorageHandoffCoordinator(base=0, size=64 * MiB, align=4096)
     tid, gen, extents = c.reserve("r1", "prefill", 0, [1 * MiB, 2 * MiB])

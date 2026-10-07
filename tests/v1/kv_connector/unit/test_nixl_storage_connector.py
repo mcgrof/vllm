@@ -123,10 +123,15 @@ class _LookupCoord:
     def __init__(self, manifests):
         self.manifests = manifests
         self.calls = []
+        self.released = []
 
     def lookup(self, request_id, producer, tp_rank):
         self.calls.append((request_id, producer, tp_rank))
         return self.manifests.get(tp_rank)
+
+    def call(self, op, **args):
+        assert op == "release_unread"
+        self.released.append(args)
 
 
 def _scheduler(manifests) -> _Scheduler:
@@ -196,6 +201,21 @@ def test_scheduler_waits_for_every_tp_manifest():
     assert scheduler.coord.calls == [
         ("prefill-request", "prefill-engine", 0),
         ("prefill-request", "prefill-engine", 1),
+    ]
+
+
+def test_fully_resident_prompt_releases_publications_only_after_allocation():
+    scheduler = _scheduler({0: _manifest(0), 1: _manifest(1)})
+    request = _decode_request()
+    assert scheduler.get_num_new_matched_tokens(request, 32) == (0, False)
+    assert scheduler.coord.released == []
+    # A retry before allocation must still be able to find the publications.
+    assert scheduler.get_num_new_matched_tokens(request, 32) == (0, False)
+    scheduler.update_state_after_alloc(request, None, 0)
+    assert scheduler.pending_loads == {}
+    assert scheduler.coord.released == [
+        {"transfer_id": "transfer-0", "generation": 0},
+        {"transfer_id": "transfer-1", "generation": 0},
     ]
 
 

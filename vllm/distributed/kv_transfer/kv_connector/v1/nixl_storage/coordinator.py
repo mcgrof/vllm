@@ -316,6 +316,21 @@ class StorageHandoffCoordinator:
             if lease is not None:
                 lease.drained = True
 
+    def release_unread(self, transfer_id: str, generation: int) -> None:
+        """Retire a READY object when the decoder needs no external tokens.
+
+        A claimed object must finish through its reader; a local cache hit
+        cannot establish that reader's I/O has drained.
+        """
+        with self._lock:
+            obj = self._get(transfer_id)
+            self._check_generation(obj, generation)
+            self._require(obj, ObjectState.READY)
+            if obj.leases:
+                raise HandoffError("cannot release a claimed publication as unread")
+            obj.state = ObjectState.DRAINING
+            self.reclaim()
+
     # ---- reclamation -------------------------------------------------------
 
     def expire_leases(self, now: float | None = None) -> int:
@@ -499,6 +514,9 @@ def _dispatch(coord: StorageHandoffCoordinator, op: str, args: dict):
         return None
     if op == "consumer_drained":
         coord.consumer_drained(args["transfer_id"], args["consumer"])
+        return None
+    if op == "release_unread":
+        coord.release_unread(args["transfer_id"], args["generation"])
         return None
     if op == "expire_leases":
         return coord.expire_leases()
