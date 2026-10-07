@@ -11,6 +11,7 @@ Without a target the device test skips.
 
 import ctypes
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -28,6 +29,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl_storage.storage import (
     LayerGeometry,
     NixlStorageAdapter,
     StagingArena,
+    StorageQuiescenceError,
     aligned_empty,
     object_layout,
     pack_blocks,
@@ -286,7 +288,7 @@ def test_adapter_rolls_back_partial_arena_registration():
         arena.close()
 
 
-def test_adapter_releases_handle_when_transfer_raises():
+def test_adapter_retains_owners_when_submission_outcome_is_unknown():
     agent = _FakeAgent(fail_transfer=True)
     adapter = NixlStorageAdapter("test", {}, 0, 4 * MiB, nixl_agent_cls=lambda _: agent)
     caches = make_cache(1, 4)
@@ -295,14 +297,10 @@ def test_adapter_releases_handle_when_transfer_raises():
     adapter.register_arena(arena)
     layers = adapter.layer_slices([Extent(0, adapter.object_lengths(1)[0])], 1)
     region = arena.allocate(adapter.object_bytes(1))
-    try:
-        with pytest.raises(RuntimeError, match="injected transfer failure"):
-            adapter.start("WRITE", layers, 1, region)
-        assert agent.released == ["handle"]
-    finally:
-        arena.free(region)
-        adapter.close()
-        arena.close()
+    with pytest.raises(StorageQuiescenceError, match="submission outcome unknown"):
+        adapter.start("WRITE", layers, 1, region)
+    assert agent.released == []
+    _assert_retained(adapter, arena, region, agent)
 
 
 def test_adapter_times_out_without_releasing_nonterminal_transfer(monkeypatch):
@@ -323,16 +321,134 @@ def test_adapter_times_out_without_releasing_nonterminal_transfer(monkeypatch):
     region = arena.allocate(adapter.object_bytes(1))
     pending = adapter.start("WRITE", layers, 1, region)
     monkeypatch.setattr(storage.time, "monotonic_ns", lambda: pending.deadline_ns)
-    try:
-        with pytest.raises(TimeoutError, match="terminal state"):
+    with pytest.raises(StorageQuiescenceError, match="terminal state"):
+        adapter.poll(pending)
+    with pytest.raises(RuntimeError, match="non-terminal"):
+        adapter.release(pending)
+    assert agent.released == []
+    _assert_retained(adapter, arena, region, agent)
+
+
+def _assert_retained(adapter, arena, region, agent):
+    base = arena.base
+    for operation in (
+        adapter.close,
+        arena.close,
+        lambda: arena.free(region),
+        lambda: arena.allocate(4096),
+    ):
+        with pytest.raises(StorageQuiescenceError):
+            operation()
+    assert arena.base == base
+    assert arena.allocated_bytes == region.length
+    assert agent.deregistrations == []
+
+
+@pytest.mark.parametrize("failure", ["close", "poll", "unknown_status"])
+def test_pending_transfer_prevents_teardown(failure, monkeypatch):
+    agent = _FakeAgent(status="PROC")
+    adapter = NixlStorageAdapter("test", {}, 0, 4 * MiB, nixl_agent_cls=lambda _: agent)
+    adapter.register_cache(make_cache(1, 4))
+    arena = StagingArena(HUGE_2M)
+    adapter.register_arena(arena)
+    region = arena.allocate(adapter.object_bytes(1))
+    layers = adapter.layer_slices([Extent(0, region.length)], 1)
+    pending = adapter.start("READ", layers, 1, region)
+    if failure == "poll":
+
+        def fail_poll(handle):
+            raise OSError("completion unavailable")
+
+        monkeypatch.setattr(agent, "check_xfer_state", fail_poll)
+    elif failure == "unknown_status":
+        agent.status = "UNRECOGNIZED"
+    with pytest.raises(StorageQuiescenceError):
+        if failure == "close":
+            adapter.close()
+        else:
             adapter.poll(pending)
-        with pytest.raises(RuntimeError, match="non-terminal"):
-            adapter.release(pending)
-        assert agent.released == []
-    finally:
+    _assert_retained(adapter, arena, region, agent)
+    assert agent.released == []
+
+
+@pytest.mark.parametrize("operation", ["pack", "unpack"])
+@pytest.mark.parametrize("sync_fails", [False, True])
+def test_partial_copy_drains_or_retains_before_region_reuse(
+    operation, sync_fails, monkeypatch
+):
+    agent = _FakeAgent()
+    adapter = NixlStorageAdapter("test", {}, 0, 4 * MiB, nixl_agent_cls=lambda _: agent)
+    arena = StagingArena(HUGE_2M)
+    adapter.register_arena(arena)
+    region = arena.allocate(4096)
+    events = []
+
+    def partial_copy(*args, **kwargs):
+        events.append("queued")
+        raise ValueError("later layer failed")
+
+    def sync():
+        events.append("sync")
+        if sync_fails:
+            raise RuntimeError("GPU unavailable")
+
+    monkeypatch.setattr(storage, operation + "_blocks", partial_copy)
+    monkeypatch.setattr(torch.accelerator, "synchronize", sync)
+    with pytest.raises(StorageQuiescenceError if sync_fails else ValueError):
+        getattr(adapter, operation)(
+            {"layer": SimpleNamespace(is_cuda=True)}, [0], region
+        )
+    assert events == ["queued", "sync"]
+    if sync_fails:
+        _assert_retained(adapter, arena, region, agent)
+    else:
         arena.free(region)
         adapter.close()
+        adapter.close()
         arena.close()
+
+
+def test_warmup_timeout_retains_registration_and_backing(monkeypatch):
+    agent = _FakeAgent(status="PROC")
+    adapter = NixlStorageAdapter(
+        "test",
+        {},
+        0,
+        4 * MiB,
+        nixl_agent_cls=lambda _: agent,
+        transfer_timeout_s=1,
+    )
+    arena = StagingArena(HUGE_2M)
+    adapter.register_arena(arena)
+    # The fake agent never uses the fd; select the real warm-up control path.
+    arena.chunks[0].dmabuf_fd = os.open(os.devnull, os.O_RDONLY)
+    ticks = iter([0, 0, 2_000_000_000])
+    monkeypatch.setattr(storage.time, "monotonic_ns", lambda: next(ticks))
+    with pytest.raises(StorageQuiescenceError, match="terminal state"):
+        adapter.warm()
+    with pytest.raises(StorageQuiescenceError):
+        adapter.close()
+    with pytest.raises(StorageQuiescenceError):
+        arena.close()
+    assert agent.released == [] and agent.deregistrations == []
+
+
+def test_failed_registration_rollback_retains_backing(monkeypatch):
+    agent = _FakeAgent(fail_registration=3)
+    adapter = NixlStorageAdapter("test", {}, 0, 4 * MiB, nixl_agent_cls=lambda _: agent)
+    arena = StagingArena(2 * HUGE_2M, chunk_bytes=HUGE_2M)
+
+    def fail_unregister(*args):
+        raise OSError("unregister failed")
+
+    monkeypatch.setattr(agent, "deregister_memory", fail_unregister)
+    with pytest.raises(StorageQuiescenceError, match="unregister outcome unknown"):
+        adapter.register_arena(arena)
+    with pytest.raises(StorageQuiescenceError):
+        adapter.close()
+    with pytest.raises(StorageQuiescenceError):
+        arena.close()
+    assert arena.base is not None
 
 
 @pytest.mark.parametrize("exporter", ["system_heap", "udmabuf", "udmabuf_hugetlb"])

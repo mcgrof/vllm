@@ -37,7 +37,13 @@ from vllm.logger import init_logger
 
 from .coordinator import CoordinatorClient, OutOfSpace
 from .manifest import Extent, HandoffManifest
-from .storage import EXPORTERS, NixlStorageAdapter, PendingTransfer, StagingArena
+from .storage import (
+    EXPORTERS,
+    NixlStorageAdapter,
+    PendingTransfer,
+    StagingArena,
+    StorageQuiescenceError,
+)
 
 if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionMetadata
@@ -543,11 +549,9 @@ class _Worker:
             adapter.register_arena(arena)
             warm_ms = adapter.warm()
         except Exception:
-            try:
-                adapter.close()
-            finally:
-                if arena is not None:
-                    arena.close()
+            adapter.close()
+            if arena is not None:
+                arena.close()
             raise
         assert arena is not None
         self.adapter = adapter
@@ -663,6 +667,8 @@ class _Worker:
                 ) from e
             self._done_send.add(order.request_id)
             return
+        except StorageQuiescenceError:
+            raise
         except Exception:
             if region is not None:
                 self.arena.free(region)
@@ -680,6 +686,9 @@ class _Worker:
             )
             self.coord.call("mark_writing", transfer_id=transfer_id)
             pending = self.adapter.start("WRITE", layers, n, region)
+        except StorageQuiescenceError:
+            # Neither the namespace reservation nor staging can be reused.
+            raise
         except Exception as e:
             self.coord.call(
                 "fail",
@@ -797,6 +806,8 @@ class _Worker:
                 first_block=order.first_block,
                 object_blocks=manifest.num_blocks,
             )
+        except StorageQuiescenceError:
+            raise
         except Exception as e:
             if leased:
                 self.coord.call(
@@ -891,6 +902,8 @@ class _Worker:
                         consumer=self.consumer_id,
                     )
                     ld.t["acked_ns"] = time.monotonic_ns()
+                except StorageQuiescenceError:
+                    raise
                 except Exception as e:
                     logger.error("storage handoff: load of %s failed: %s", rid, e)
                     status = "ERR"
@@ -954,9 +967,7 @@ class _Worker:
         try:
             if self.adapter:
                 self.adapter.close()
+            if self.arena:
+                self.arena.close()
         finally:
-            try:
-                if self.arena:
-                    self.arena.close()
-            finally:
-                self.coord.close()
+            self.coord.close()

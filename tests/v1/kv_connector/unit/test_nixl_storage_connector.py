@@ -21,6 +21,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl_storage.manifest import (
     HandoffManifest,
     LayerSlice,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl_storage.storage import (
+    StorageQuiescenceError,
+)
 
 pytestmark = pytest.mark.skip_global_cleanup
 
@@ -294,3 +297,22 @@ def test_stage_waits_for_arena_space_then_gives_up():
         assert w._stage("r3", 4096, {}).offset == 0
     finally:
         w.arena.close()
+
+
+def test_worker_close_keeps_arena_if_adapter_cannot_drain():
+    calls = []
+
+    def fail_close():
+        calls.append("adapter")
+        raise StorageQuiescenceError("pending DMA")
+
+    worker = _Worker.__new__(_Worker)
+    worker.consumer_id = "reader"
+    worker.counters = {}
+    worker._trace = None
+    worker.adapter = SimpleNamespace(close=fail_close, counters={})
+    worker.arena = SimpleNamespace(close=lambda: calls.append("arena"))
+    worker.coord = SimpleNamespace(close=lambda: calls.append("coordinator"))
+    with pytest.raises(StorageQuiescenceError):
+        worker.close()
+    assert calls == ["adapter", "coordinator"]

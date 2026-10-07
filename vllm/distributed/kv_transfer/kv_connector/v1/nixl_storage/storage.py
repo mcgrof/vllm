@@ -32,6 +32,15 @@ from .manifest import Extent, LayerSlice
 EXPORTERS = ("host", "system_heap", "udmabuf", "udmabuf_hugetlb", "cuda")
 HUGE_2M = 2 << 20
 
+# Unknown DMA/copy outcomes require process-lifetime ownership, including when
+# construction fails before the worker can adopt the adapter.
+_RETAINED_IO_OWNERS: list[object] = []
+
+
+class StorageQuiescenceError(RuntimeError):
+    """Work may still access memory; stop the worker without releasing owners."""
+
+
 # CUDA driver API constants (cuda.h)
 _CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED = 124
 _CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD = 1
@@ -295,6 +304,7 @@ class StagingArena:
         self.wait_ns = 0
         self.base: int | None = None
         self._cuda: _Cuda | None = None
+        self.retained = False
         if exporter == "cuda":
             self._init_cuda()
             return
@@ -462,10 +472,17 @@ class StagingArena:
     # -- allocation -----------------------------------------------------------
 
     def allocate(self, nbytes: int) -> Extent:
+        self.check_reusable()
         return self._alloc.allocate(nbytes)
 
     def free(self, region: Extent) -> None:
+        self.check_reusable()
         self._alloc.free(region)
+
+    def check_reusable(self) -> None:
+        """Reject reuse or teardown after an unknown transfer outcome."""
+        if self.retained:
+            raise StorageQuiescenceError("staging arena retained until process exit")
 
     @property
     def free_bytes(self) -> int:
@@ -507,6 +524,7 @@ class StagingArena:
         return self.tensor[offset : offset + nbytes].view(dtype).view(*shape)
 
     def close(self) -> None:
+        self.check_reusable()
         if self._cuda_registered_chunks:
             rt = torch.cuda.cudart()
             for c in reversed(self._cuda_registered_chunks):
@@ -764,6 +782,10 @@ class NixlStorageAdapter:
         self.backend_name = backend_name
         self.backends = [backend_name]
         self.transfer_timeout_ns = int(transfer_timeout_s * 1e9)
+        self._pending: dict[int, PendingTransfer] = {}
+        self._retained = False
+        self._closed = False
+        self._cache_owners: dict[str, torch.Tensor] = {}
         self.agent = nixl_agent_cls(agent_name)
         self.agent.create_backend(self.backend_name, backend_params)
         self.range_offset = range_offset
@@ -805,6 +827,7 @@ class NixlStorageAdapter:
     def register_cache(self, caches: dict[str, torch.Tensor]) -> None:
         """Record the paged cache's geometry; the tensors themselves are
         never handed to the backend."""
+        self._cache_owners = dict(caches)
         for name, t in caches.items():
             self.geometries[name] = LayerGeometry.from_tensor(name, t)
 
@@ -820,8 +843,17 @@ class NixlStorageAdapter:
                     )
                 )
         except Exception:
-            for reg in reversed(regs):
-                self.agent.deregister_memory(reg, self.backends)
+            try:
+                while regs:
+                    self.agent.deregister_memory(regs[-1], self.backends)
+                    regs.pop()
+            except Exception as exc:
+                self._arena_regs.extend(regs)
+                self.arena = arena
+                self._retain()
+                raise StorageQuiescenceError(
+                    "arena unregister outcome unknown"
+                ) from exc
             raise
         self._arena_regs.extend(regs)
         self.arena = arena
@@ -831,6 +863,7 @@ class NixlStorageAdapter:
         the kernel builds each device mapping now rather than under the
         first store. Returns the wall time in ms."""
         assert self.arena is not None
+        self.arena.check_reusable()
         t0 = time.monotonic_ns()
         for c in self.arena.chunks:
             if c.dmabuf_fd < 0:
@@ -843,23 +876,19 @@ class NixlStorageAdapter:
             handle = self.agent.initialize_xfer(
                 "READ", local, remote, self.agent_name, b"", self.backends
             )
-            status = "ERR"
-            try:
-                status = self.agent.transfer(handle)
-                deadline_ns = time.monotonic_ns() + self.transfer_timeout_ns
-                while status == "PROC":
-                    status = self.agent.check_xfer_state(handle)
-                    if status == "PROC" and time.monotonic_ns() >= deadline_ns:
-                        raise TimeoutError(
-                            "NIXL staging warm-up did not reach a terminal state"
-                        )
-            finally:
-                # NIXL owns the descriptors until the command is terminal.
-                # A non-terminal timeout is fatal to the worker, so leave the
-                # handle with the agent instead of enabling unsafe buffer reuse.
-                if status != "PROC":
-                    self.agent.release_xfer_handle(handle)
-            if status != "DONE":
+            started = time.monotonic_ns()
+            pending = PendingTransfer(
+                handle,
+                TransferPlan([], [], 0, 0),
+                started,
+                "WARM",
+                started + self.transfer_timeout_ns,
+            )
+            self._submit(pending)
+            while self.poll(pending) == "PROC":
+                pass
+            self.release(pending)
+            if pending.status != "DONE":
                 raise RuntimeError("warm-up read of a staging chunk failed")
         ms = (time.monotonic_ns() - t0) / 1e6
         self.counters["warm_ms"] = ms
@@ -891,19 +920,19 @@ class NixlStorageAdapter:
         assert self.arena is not None
         geoms = list(self.geometries.values())
         cuda = any(t.is_cuda for t in caches.values())
-        pack_blocks(
-            geoms,
-            caches,
-            block_ids,
-            self.arena,
-            region,
-            non_blocking=cuda
-            and (self.arena.cuda_registered or self.arena.exporter == "cuda"),
-        )
-        if cuda:
-            # Device writes into the arena (host or GPU) are complete before
-            # the command that reads them is submitted.
-            torch.accelerator.synchronize()
+        self.arena.check_reusable()
+        try:
+            pack_blocks(
+                geoms,
+                caches,
+                block_ids,
+                self.arena,
+                region,
+                non_blocking=cuda
+                and (self.arena.cuda_registered or self.arena.exporter == "cuda"),
+            )
+        finally:
+            self._finish_copy(cuda)
 
     def unpack(
         self, caches: dict[str, torch.Tensor], block_ids: list[int], region: Extent
@@ -914,17 +943,49 @@ class NixlStorageAdapter:
         # The command's completion was observed before this call, so the
         # bytes are in the arena; the copies are ordered behind it by the
         # stream and waited for before the blocks are handed back.
-        unpack_blocks(
-            geoms,
-            caches,
-            block_ids,
-            self.arena,
-            region,
-            non_blocking=cuda
-            and (self.arena.cuda_registered or self.arena.exporter == "cuda"),
-        )
+        self.arena.check_reusable()
+        try:
+            unpack_blocks(
+                geoms,
+                caches,
+                block_ids,
+                self.arena,
+                region,
+                non_blocking=cuda
+                and (self.arena.cuda_registered or self.arena.exporter == "cuda"),
+            )
+        finally:
+            self._finish_copy(cuda)
+
+    def _finish_copy(self, cuda: bool) -> None:
+        # A later layer can fail after an earlier asynchronous copy was queued.
         if cuda:
-            torch.accelerator.synchronize()
+            try:
+                torch.accelerator.synchronize()
+            except Exception as exc:
+                self._retain()
+                raise StorageQuiescenceError("GPU copy completion unknown") from exc
+
+    def _retain(self) -> None:
+        if not self._retained:
+            self._retained = True
+            if self.arena is not None:
+                self.arena.retained = True
+            _RETAINED_IO_OWNERS.append(self)
+
+    def _submit(self, pending: PendingTransfer) -> None:
+        self._pending[id(pending)] = pending
+        try:
+            pending.status = self.agent.transfer(pending.handle)
+        except Exception as exc:
+            self._retain()
+            raise StorageQuiescenceError("NIXL submission outcome unknown") from exc
+        self._check_status(pending)
+
+    def _check_status(self, pending: PendingTransfer) -> None:
+        if pending.status not in ("PROC", "DONE", "ERR"):
+            self._retain()
+            raise StorageQuiescenceError(f"unknown NIXL status: {pending.status}")
 
     def start(
         self,
@@ -936,6 +997,7 @@ class NixlStorageAdapter:
         object_blocks: int | None = None,
     ) -> PendingTransfer:
         assert self.arena is not None
+        self.arena.check_reusable()
         geoms = [self.geometries[layer.layer_name] for layer in layers]
         plan = plan_transfer(
             geoms, layers, num_blocks, self.arena, region, first_block, object_blocks
@@ -949,56 +1011,76 @@ class NixlStorageAdapter:
             op, local, remote, self.agent_name, b"", self.backends
         )
         started = time.monotonic_ns()
-        try:
-            status = self.agent.transfer(handle)
-        except Exception:
-            self.agent.release_xfer_handle(handle)
-            raise
         pending = PendingTransfer(
             handle=handle,
             plan=plan,
             started_ns=started,
             op=op,
             deadline_ns=started + self.transfer_timeout_ns,
-            status=status,
         )
+        self._submit(pending)
         self.counters["descriptors"] += plan.descriptors
-        if status == "DONE":
+        if pending.status == "DONE":
             pending.done_ns = time.monotonic_ns()
             self._account(pending)
-        elif status == "ERR":
+        elif pending.status == "ERR":
             self.counters["errors"] += 1
         return pending
 
     def poll(self, pending: PendingTransfer) -> str:
         if pending.status == "PROC":
-            pending.status = self.agent.check_xfer_state(pending.handle)
+            try:
+                pending.status = self.agent.check_xfer_state(pending.handle)
+            except Exception as exc:
+                self._retain()
+                raise StorageQuiescenceError("NIXL completion outcome unknown") from exc
+            self._check_status(pending)
             if pending.status == "DONE":
                 pending.done_ns = time.monotonic_ns()
                 self._account(pending)
             elif pending.status == "ERR":
                 self.counters["errors"] += 1
             elif time.monotonic_ns() >= pending.deadline_ns:
-                raise TimeoutError(
+                self._retain()
+                raise StorageQuiescenceError(
                     f"NIXL {pending.op.lower()} did not reach a terminal state"
                 )
         return pending.status
 
     def release(self, pending: PendingTransfer) -> None:
-        if pending.status == "PROC":
+        if pending.status not in ("DONE", "ERR"):
             raise RuntimeError("cannot release a non-terminal NIXL transfer")
         self.agent.release_xfer_handle(pending.handle)
+        self._pending.pop(id(pending), None)
 
     def _account(self, p: PendingTransfer) -> None:
         if p.op == "WRITE":
             self.counters["writes"] += 1
             self.counters["bytes_written"] += p.plan.bytes
-        else:
+        elif p.op == "READ":
             self.counters["reads"] += 1
             self.counters["bytes_read"] += p.plan.bytes
 
     def close(self) -> None:
-        for reg in self._arena_regs:
-            self.agent.deregister_memory(reg, self.backends)
-        self._arena_regs = []
-        self.agent.deregister_memory(self._blk_reg, self.backends)
+        """Unregister only after every submitted command is known terminal.
+
+        Unknown outcomes retain the agent, arena and cache owners until exit.
+        """
+        if self._closed:
+            return
+        if self._retained or any(
+            p.status not in ("DONE", "ERR") for p in self._pending.values()
+        ):
+            self._retain()
+            raise StorageQuiescenceError("NIXL owners retained until process exit")
+        try:
+            for pending in list(self._pending.values()):
+                self.release(pending)
+            while self._arena_regs:
+                self.agent.deregister_memory(self._arena_regs[-1], self.backends)
+                self._arena_regs.pop()
+            self.agent.deregister_memory(self._blk_reg, self.backends)
+        except Exception as exc:
+            self._retain()
+            raise StorageQuiescenceError("NIXL unregister outcome unknown") from exc
+        self._closed = True
