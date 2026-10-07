@@ -98,6 +98,30 @@ def test_allocator_rounds_up_and_rejects_double_free():
     a.free(e)
     with pytest.raises(HandoffError):
         a.free(e)
+    assert a.free_bytes == MiB
+    assert a.allocated_bytes == 0
+    assert a.allocate(MiB) == Extent(4096, MiB)
+    with pytest.raises(OutOfSpace):
+        a.allocate(4096)
+
+
+@pytest.mark.parametrize("lengths", [[], [4096, 0], [4096, -8192]])
+def test_invalid_reservation_does_not_consume_or_expand_free_space(lengths):
+    c = StorageHandoffCoordinator(base=0, size=8192)
+    with pytest.raises(ValueError):
+        c.reserve("bad", "producer", 0, lengths)
+    assert c.snapshot()["free_bytes"] == 8192
+    assert c.snapshot()["objects"] == {}
+    _, _, extents = c.reserve("good", "producer", 0, [8192])
+    assert extents == [Extent(0, 8192)]
+
+
+@pytest.mark.parametrize("length", [0, -1, -8192])
+def test_allocator_rejects_nonpositive_lengths_without_mutation(length):
+    a = ExtentAllocator(0, 8192, 4096)
+    with pytest.raises(ValueError):
+        a.allocate(length)
+    assert a.allocate(8192) == Extent(0, 8192)
 
 
 # --- lifecycle -------------------------------------------------------------------

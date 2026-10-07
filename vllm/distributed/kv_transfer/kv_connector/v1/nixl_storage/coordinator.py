@@ -73,8 +73,10 @@ class ExtentAllocator:
     Frees coalesce with their neighbours."""
 
     def __init__(self, base: int, size: int, align: int):
-        if align <= 0 or base % align or size % align:
-            raise ValueError("base and size must be multiples of align")
+        if align <= 0 or base < 0 or size <= 0 or base % align or size % align:
+            raise ValueError(
+                "nonnegative base and positive size must be multiples of align"
+            )
         self.base = base
         self.size = size
         self.align = align
@@ -82,9 +84,9 @@ class ExtentAllocator:
         self.allocated_bytes = 0
 
     def allocate(self, length: int) -> Extent:
+        if length <= 0:
+            raise ValueError("allocation length must be positive")
         length = (length + self.align - 1) // self.align * self.align
-        if length == 0:
-            raise ValueError("zero-length allocation")
         for i, hole in enumerate(self._free):
             if hole.length >= length:
                 out = Extent(hole.offset, length)
@@ -98,10 +100,18 @@ class ExtentAllocator:
         raise OutOfSpace(f"no hole of {length} bytes")
 
     def free(self, extent: Extent) -> None:
-        self._free.append(extent)
-        self._free.sort(key=lambda e: e.offset)
+        if (
+            extent.length <= 0
+            or extent.offset < self.base
+            or extent.end > self.base + self.size
+            or extent.offset % self.align
+            or extent.length % self.align
+        ):
+            raise HandoffError("invalid free extent")
         merged: list[Extent] = []
-        for e in self._free:
+        # Validate on a temporary list: a rejected double free must not leave
+        # overlapping holes available to subsequent allocations.
+        for e in sorted([*self._free, extent], key=lambda e: e.offset):
             if merged and merged[-1].end == e.offset:
                 merged[-1] = Extent(merged[-1].offset, merged[-1].length + e.length)
             elif merged and e.offset < merged[-1].end:
@@ -156,6 +166,8 @@ class StorageHandoffCoordinator:
         the older generation stays allocated until it is reclaimed.
         """
         with self._lock:
+            if not lengths or any(length <= 0 for length in lengths):
+                raise ValueError("reservation lengths must be nonempty and positive")
             key = (producer, request_id, tp_rank)
             generation = 0
             old = self._by_request.get(key)
