@@ -5,7 +5,7 @@
 from dataclasses import dataclass
 from enum import Enum
 from functools import partial
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 import numpy as np
 import torch
@@ -85,6 +85,10 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.utils import CpuGpuBuffer
+
+if TYPE_CHECKING:
+    from vllm.v1.attention.backends.compact_prefill import CompactPrefillWorkspace
+    from vllm.v1.attention.backends.compact_prefill_metadata import CompactPagePlan
 
 FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT = 2048 * 1024 * 1024
 
@@ -489,6 +493,9 @@ class FIPrefill:
     """Metadata for the native FlashInfer prefill pathway (non-TRTLLM)."""
 
     wrapper: BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper
+    compact: "CompactPrefillWorkspace | None" = None
+    compact_plan: "CompactPagePlan | None" = None
+    source_indices: torch.Tensor | None = None
 
 
 @dataclass
@@ -1148,6 +1155,15 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             num_prefill_tokens = num_actual_tokens
 
         page_size = self.page_size
+        compact_workspace = getattr(
+            self.vllm_config, "_compact_prefill_workspace", None
+        )
+        if compact_workspace is not None:
+            compact_workspace.calls["batch_total"] += 1
+            if num_prefills == 0:
+                compact_workspace.calls["batch_decode_only"] += 1
+            elif common_prefix_len > 0:
+                compact_workspace.calls["batch_mask_or_prefix"] += 1
         max_seq_len = common_attn_metadata.max_seq_len
         seq_lens = common_attn_metadata.seq_lens
         block_table_tensor = common_attn_metadata.block_table_tensor
@@ -1461,6 +1477,57 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         disable_split_kv=self.disable_split_kv,
                     )
                 attn_metadata.prefill = FIPrefill(wrapper=prefill_wrapper)
+
+                compact = getattr(self.vllm_config, "_compact_prefill_workspace", None)
+                if compact is not None:
+                    from vllm.v1.attention.backends.compact_prefill_metadata import (
+                        plan_whole_prompt,
+                    )
+
+                    supported = (
+                        self._is_asymmetric
+                        and not self.use_dcp
+                        and current_platform.is_device_capability(90)
+                        and get_kv_cache_layout() == "NHD"
+                        and self.k_cache_dtype == torch.float16
+                        and self.v_cache_dtype == torch.float8_e4m3fn
+                        and self.q_data_type_prefill == torch.float16
+                        and self.model_config.dtype == torch.float16
+                        and self.page_size == 16
+                        and self.num_qo_heads == 32
+                        and self.num_kv_heads == 8
+                        and self.head_dim == 128
+                        and self.window_left == -1
+                        and not self.logits_soft_cap
+                        and not self.has_sinks
+                        and not self.cache_config.enable_prefix_caching
+                        and not self.vllm_config.scheduler_config.enable_chunked_prefill
+                    )
+                    page_plan, reason = plan_whole_prompt(
+                        qo_indptr_cpu.tolist(),
+                        seq_lens_np,
+                        max_sequences=self.vllm_config.scheduler_config.max_num_seqs,
+                        num_decodes=num_decodes,
+                        causal=causal,
+                        prefix=use_cascade,
+                        supported=supported,
+                    )
+                    compact.calls["batch_" + reason] += 1
+                    if page_plan is not None:
+                        compact.plan(
+                            page_plan,
+                            qo_indptr_prefill_cpu,
+                            paged_kv_indptr_prefill_cpu,
+                            paged_kv_last_page_len_prefill_cpu,
+                            sm_scale=self.sm_scale,
+                            window_left=self.window_left,
+                            logits_soft_cap=self.logits_soft_cap,
+                            fixed_split_size=self.prefill_fixed_split_size,
+                            disable_split_kv=self.disable_split_kv,
+                        )
+                        attn_metadata.prefill.compact = compact
+                        attn_metadata.prefill.compact_plan = page_plan
+                        attn_metadata.prefill.source_indices = paged_kv_indices
 
         ## DECODE PATHWAY
         if num_decodes > 0:
@@ -2066,7 +2133,16 @@ class FlashInferImpl(AttentionImpl):
                     else:
                         out_prefill = output[num_decode_tokens:]
 
-                    prefill_wrapper.run(
+                    compact = attn_metadata.prefill.compact
+                    run_prefill = prefill_wrapper.run
+                    extra = {}
+                    if compact is not None:
+                        run_prefill = compact.run
+                        extra = dict(
+                            source_indices=attn_metadata.prefill.source_indices,
+                            page_plan=attn_metadata.prefill.compact_plan,
+                        )
+                    run_prefill(
                         prefill_query,
                         paged_kv_cache,
                         q_scale=layer._q_scale_float,
@@ -2074,6 +2150,7 @@ class FlashInferImpl(AttentionImpl):
                         v_scale=layer._v_scale_float,
                         out=out_prefill,
                         kv_cache_sf=kv_cache_sf,
+                        **extra,
                     )
 
                     if needs_fp8_out_prefill:

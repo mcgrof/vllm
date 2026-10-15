@@ -439,6 +439,18 @@ class Worker(WorkerBase):
             You may limit the usage of GPU memory
             by adjusting the `gpu_memory_utilization` parameter.
         """
+        compact_prefill_bytes = 0
+        if os.environ.get("VLLM_COMPACT_PREFILL", "0") == "1":
+            from vllm.v1.attention.backends.compact_prefill import initialize_workspace
+
+            workspace = initialize_workspace(self.vllm_config, self.device)
+            assert workspace is not None
+            receipt = workspace.allocation_before_profile
+            assert receipt is not None
+            compact_prefill_bytes = (
+                receipt["allocated_after"] - receipt["allocated_before"]
+            )
+
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
@@ -490,6 +502,8 @@ class Worker(WorkerBase):
             profile_result.non_torch_increase
             + profile_result.torch_peak_increase
             + profile_result.weights_memory
+            # The profiling delta excludes storage allocated before its reset.
+            + compact_prefill_bytes
         )
 
         # On ROCm, cudagraph_memory_estimate is always 0 so this is a no-op.
