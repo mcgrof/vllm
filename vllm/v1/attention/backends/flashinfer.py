@@ -2388,28 +2388,39 @@ class FlashInferImpl(AttentionImpl):
                     "tuple kv_cache requires an asymmetric "
                     "kv_cache_dtype with a V dtype string"
                 )
-                # Write K at native dtype (no quantization)
-                torch.ops._C_cache_ops.reshape_and_cache_flash(
-                    key,
-                    key,
-                    k_cache,
-                    k_cache,
-                    slot_mapping,
-                    "auto",
-                    layer._k_scale,
-                    layer._k_scale,
-                )
-                # Write V at the (FP8) V dtype
-                torch.ops._C_cache_ops.reshape_and_cache_flash(
-                    value,
-                    value,
-                    v_cache,
-                    v_cache,
-                    slot_mapping,
-                    v_dtype,
-                    layer._v_scale,
-                    layer._v_scale,
-                )
+                import os
+
+                if os.environ.get("VLLM_ASYM_SINGLE_WRITER", "0") == "1":
+                    from vllm.v1.attention.ops.mixed_reshape_and_cache import (
+                        mixed_reshape_and_cache,
+                    )
+
+                    mixed_reshape_and_cache(
+                        key, value, k_cache, v_cache, slot_mapping, layer._v_scale
+                    )
+                else:
+                    # Write K at native dtype (no quantization)
+                    torch.ops._C_cache_ops.reshape_and_cache_flash(
+                        key,
+                        key,
+                        k_cache,
+                        k_cache,
+                        slot_mapping,
+                        "auto",
+                        layer._k_scale,
+                        layer._k_scale,
+                    )
+                    # Write V at the (FP8) V dtype
+                    torch.ops._C_cache_ops.reshape_and_cache_flash(
+                        value,
+                        value,
+                        v_cache,
+                        v_cache,
+                        slot_mapping,
+                        v_dtype,
+                        layer._v_scale,
+                        layer._v_scale,
+                    )
             else:
                 torch.ops._C_cache_ops.reshape_and_cache_flash(
                     key,
