@@ -298,7 +298,6 @@ class StagingArena:
         self.chunk_bytes = chunk_bytes
         self.chunks: list[ArenaChunk] = []
         self.cuda_registered = False
-        self._cuda_registered_chunks: list[ArenaChunk] = []
         self.mapping_type = ""
         self.waits = 0
         self.wait_ns = 0
@@ -455,17 +454,16 @@ class StagingArena:
         runtime refuses; the caller logs it."""
         if not torch.cuda.is_available() or self.exporter == "cuda":
             return False
+        if self.cuda_registered:
+            return True
+        assert self.base is not None
         rt = torch.cuda.cudart()
-        for c in self.chunks:
-            if rt.cudaHostRegister(c.addr, c.length, 0) != 0:
-                for registered in reversed(self._cuda_registered_chunks):
-                    rt.cudaHostUnregister(registered.addr)
-                self._cuda_registered_chunks = []
-                # The failure sits in the runtime's last-error slot and torch
-                # would report it from an unrelated later kernel launch.
-                _clear_cuda_last_error()
-                return False
-            self._cuda_registered_chunks.append(c)
+        # A KV copy may span storage chunks. CUDA copies cannot cross separate
+        # host registrations, so register the contiguous virtual arena once.
+        if rt.cudaHostRegister(self.base, self.nbytes, 0) != 0:
+            # Do not leave a failed registration in the runtime's error slot.
+            _clear_cuda_last_error()
+            return False
         self.cuda_registered = True
         return True
 
@@ -525,11 +523,9 @@ class StagingArena:
 
     def close(self) -> None:
         self.check_reusable()
-        if self._cuda_registered_chunks:
+        if self.cuda_registered:
             rt = torch.cuda.cudart()
-            for c in reversed(self._cuda_registered_chunks):
-                rt.cudaHostUnregister(c.addr)
-            self._cuda_registered_chunks = []
+            rt.cudaHostUnregister(self.base)
             self.cuda_registered = False
         for c in self.chunks:
             if c.dmabuf_fd >= 0:

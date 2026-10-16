@@ -161,7 +161,7 @@ def test_arena_rejects_bad_parameters():
         StagingArena(0, "host")
 
 
-def test_cuda_register_rolls_back_partial_registration(monkeypatch):
+def test_cuda_register_failure_leaves_the_arena_pageable(monkeypatch):
     arena = StagingArena(2 * HUGE_2M, "host", chunk_bytes=HUGE_2M)
 
     class Runtime:
@@ -170,9 +170,9 @@ def test_cuda_register_rolls_back_partial_registration(monkeypatch):
             self.unregistered = []
 
         def cudaHostRegister(self, addr, length, flags):
-            del length, flags
-            self.registered.append(addr)
-            return 0 if len(self.registered) == 1 else 1
+            del flags
+            self.registered.append((addr, length))
+            return 1
 
         def cudaHostUnregister(self, addr):
             self.unregistered.append(addr)
@@ -184,15 +184,14 @@ def test_cuda_register_rolls_back_partial_registration(monkeypatch):
     monkeypatch.setattr(storage, "_clear_cuda_last_error", lambda: None)
     try:
         assert not arena.cuda_register()
-        assert rt.registered == [c.addr for c in arena.chunks]
-        assert rt.unregistered == [arena.chunks[0].addr]
+        assert rt.registered == [(arena.base, arena.nbytes)]
+        assert rt.unregistered == []
         assert not arena.cuda_registered
-        assert arena._cuda_registered_chunks == []
     finally:
         arena.close()
 
 
-def test_cuda_registered_chunks_are_unregistered_on_close(monkeypatch):
+def test_cuda_registration_is_reused_and_unregistered_on_close(monkeypatch):
     arena = StagingArena(2 * HUGE_2M, "host", chunk_bytes=HUGE_2M)
 
     class Runtime:
@@ -201,8 +200,8 @@ def test_cuda_registered_chunks_are_unregistered_on_close(monkeypatch):
             self.unregistered = []
 
         def cudaHostRegister(self, addr, length, flags):
-            del length, flags
-            self.registered.append(addr)
+            del flags
+            self.registered.append((addr, length))
             return 0
 
         def cudaHostUnregister(self, addr):
@@ -213,12 +212,12 @@ def test_cuda_registered_chunks_are_unregistered_on_close(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "cudart", lambda: rt)
     assert arena.cuda_register()
-    expected = [c.addr for c in arena.chunks]
+    assert arena.cuda_register()
+    expected = (arena.base, arena.nbytes)
     arena.close()
-    assert rt.registered == expected
-    assert rt.unregistered == list(reversed(expected))
+    assert rt.registered == [expected]
+    assert rt.unregistered == [expected[0]]
     assert not arena.cuda_registered
-    assert arena._cuda_registered_chunks == []
 
 
 class _FakeAgent:
@@ -511,14 +510,22 @@ def test_cuda_exporter_is_device_memory_in_dmabuf_chunks():
         arena.close()
 
 
-def test_plan_pack_and_unpack_round_trip_through_the_arena():
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_plan_pack_and_unpack_round_trip_through_the_arena(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("no CUDA device")
     src = make_cache(2, 8)
     dst = make_cache(2, 8)
+    fill(src, [2, 3, 4, 7], seed=3)
+    src = {name: t.to(device) for name, t in src.items()}
+    dst = {name: t.to(device) for name, t in dst.items()}
     geoms = [LayerGeometry.from_tensor(n, t) for n, t in src.items()]
     g = geoms[0]
     block_ids = [2, 3, 4, 7]
     arena = StagingArena(2 * HUGE_2M, "host", chunk_bytes=HUGE_2M)
     try:
+        if device == "cuda":
+            assert arena.cuda_register()
         # Place the object so that layer 1's V region crosses the chunk boundary.
         obj = sum(gg.object_bytes(4) for gg in geoms)
         region = Extent(HUGE_2M - obj + 3 * g.block_bytes, obj)
@@ -535,13 +542,12 @@ def test_plan_pack_and_unpack_round_trip_through_the_arena():
         split = [d for d in plan.local if d[0] + d[1] == arena.base + HUGE_2M]
         assert len(split) == 1
         assert sum(d[1] for d in plan.local) == sum(d[1] for d in plan.remote) == obj
-        fill(src, block_ids, seed=3)
         pack_blocks(geoms, src, block_ids, arena, region)
         # The staged bytes are the object layout: layer 0 K blocks, then V.
         k0 = arena.view(
             region.offset, 4 * g.block_bytes, torch.bfloat16, (4, *g.inner_shape)
         )
-        assert torch.equal(k0, src["layers.0"][0, block_ids])
+        assert torch.equal(k0, src["layers.0"][0, block_ids].cpu())
         unpack_blocks(geoms, dst, [5, 6, 0, 1], arena, region)
         for name in src:
             assert torch.equal(src[name][:, block_ids], dst[name][:, [5, 6, 0, 1]])
