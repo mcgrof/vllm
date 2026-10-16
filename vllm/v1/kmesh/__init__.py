@@ -9,6 +9,19 @@ from vllm.v1.kmesh.grouping import (
     context_key_mismatch_reason,
     kmesh_token_slice_digest,
 )
+from vllm.v1.kmesh.master_mirror import (
+    MasterMirrorByteAccounting,
+    MasterMirrorCandidateMetrics,
+    MasterMirrorCodec,
+    MasterMirrorCorruptionError,
+    MasterMirrorError,
+    MasterMirrorIdentityError,
+    MasterMirrorInfo,
+    MasterMirrorRequest,
+    MasterMirrorRequestNotFoundError,
+    MirrorDiffInfo,
+    TensorInfo,
+)
 from vllm.v1.kmesh.metrics import (
     KMESH_SELECTED_PLAN_OPPORTUNITY_SCOPE,
     KMeshGroupObserverMetrics,
@@ -103,4 +116,15 @@ __all__ = [
     "parse_kmesh_extra_args",
     "parse_kmesh_request_context",
     "parse_ttsep_segment_spans",
+    "MasterMirrorByteAccounting",
+    "MasterMirrorCandidateMetrics",
+    "MasterMirrorCodec",
+    "MasterMirrorCorruptionError",
+    "MasterMirrorError",
+    "MasterMirrorIdentityError",
+    "MasterMirrorInfo",
+    "MasterMirrorRequest",
+    "MasterMirrorRequestNotFoundError",
+    "MirrorDiffInfo",
+    "TensorInfo",
 ]
