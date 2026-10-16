@@ -168,6 +168,12 @@ KVConnectorFactory.register_connector(
 )
 
 KVConnectorFactory.register_connector(
+    "KMeshConnector",
+    "vllm.distributed.kv_transfer.kv_connector.v1.kmesh_connector",
+    "KMeshConnector",
+)
+
+KVConnectorFactory.register_connector(
     "LMCacheMPConnector",
     "vllm.distributed.kv_transfer.kv_connector.v1.lmcache_mp_connector",
     "LMCacheMPConnector",

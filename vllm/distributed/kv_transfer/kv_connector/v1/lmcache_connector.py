@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -15,6 +15,7 @@ from vllm.distributed.kv_events import (
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
+    KVConnectorRequestSidecar,
     KVConnectorRole,
 )
 from vllm.logger import init_logger
@@ -29,6 +30,38 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+KMESH_HANDOFF_PROTOCOL_VERSION = 2
+_KMESH_HANDOFF_METHODS = (
+    "prepare_request_lookup",
+    "validate_peer_connector_metadata",
+    "bind_peer_connector_metadata",
+    "clear_peer_connector_metadata",
+    "begin_connector_metadata_transaction",
+    "commit_connector_metadata_transaction",
+    "finalize_connector_metadata_transaction",
+    "abort_connector_metadata_transaction",
+    "shutdown",
+)
+
+
+def _validate_kmesh_handoff_adapter(adapter: object, target_profile: str) -> None:
+    version = getattr(adapter, "KMESH_HANDOFF_PROTOCOL_VERSION", None)
+    if type(version) is not int or version != KMESH_HANDOFF_PROTOCOL_VERSION:
+        raise ValueError(
+            f"KMesh {target_profile} requires external LMCache handoff protocol "
+            f"version {KMESH_HANDOFF_PROTOCOL_VERSION}; got {version!r}"
+        )
+    missing = tuple(
+        method_name
+        for method_name in _KMESH_HANDOFF_METHODS
+        if not callable(getattr(adapter, method_name, None))
+    )
+    if missing:
+        raise ValueError(
+            f"KMesh {target_profile} requires external LMCache handoff methods: "
+            + ", ".join(missing)
+        )
 
 
 class LMCacheKVEvents(KVConnectorKVEvents):
@@ -93,6 +126,25 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         use_native = vllm_config.kv_transfer_config.get_from_extra_config(
             "use_native", False
         )
+        from vllm.v1.kmesh.config import (
+            KMESH_COLLECTIVE_PROFILES,
+            KMESH_SERIAL_PIC_V1_PROFILE,
+            KMESH_TARGET_PROFILE_KEY,
+        )
+
+        target_profile = vllm_config.kv_transfer_config.get_from_extra_config(
+            KMESH_TARGET_PROFILE_KEY, None
+        )
+        target_profiles = (
+            KMESH_SERIAL_PIC_V1_PROFILE,
+            *KMESH_COLLECTIVE_PROFILES,
+        )
+        if target_profile is not None and target_profile not in target_profiles:
+            raise ValueError(f"unsupported KMesh target profile: {target_profile!r}")
+        if target_profile in target_profiles and use_native:
+            raise ValueError(
+                f"KMesh {target_profile} requires the external LMCache adapter"
+            )
         if use_native:
             logger.info("Initializing native LMCache connector")
             # lazy import
@@ -110,13 +162,249 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
 
             cls = LMCacheConnectorLatestImpl
 
+        if target_profile in target_profiles:
+            assert isinstance(target_profile, str)
+            _validate_kmesh_handoff_adapter(cls, target_profile)
+        self._kmesh_target_profile = target_profile
+        self._kmesh_handoff_required = target_profile in target_profiles
+        self._kmesh_handoff_adapter_class = (
+            cls if self._kmesh_handoff_required else None
+        )
         self._lmcache_engine = cls(vllm_config, role, self)
 
         self._kv_cache_events: LMCacheKVEvents | None = None
+        self._metadata_transaction_abort_method: Callable[[], object] | None = None
+        self._metadata_transaction_abort_pending = False
+        self._metadata_transaction_state = "idle"
+
+    def validate_runtime_profile(self, parent_config: VllmConfig) -> None:
+        """Revalidate the exact external adapter and frozen child profile."""
+        if not getattr(self, "_kmesh_handoff_required", False):
+            return
+        from vllm.v1.kmesh.config import (
+            validate_lmcache_target_profile_child_runtime,
+        )
+
+        profile = validate_lmcache_target_profile_child_runtime(self._vllm_config)
+        if profile != self._kmesh_target_profile:
+            raise ValueError("KMesh LMCache child target profile drifted")
+        self.validate_kmesh_handoff_contract()
+
+    def validate_kmesh_handoff_contract(self) -> None:
+        """Validate the public class and instance handoff contract."""
+        if not getattr(self, "_kmesh_handoff_required", False):
+            return
+        adapter_class = self._kmesh_handoff_adapter_class
+        if adapter_class is None or type(self._lmcache_engine) is not adapter_class:
+            raise ValueError("KMesh external LMCache adapter identity drifted")
+        target_profile = self._kmesh_target_profile
+        if not isinstance(target_profile, str):
+            raise ValueError("KMesh external LMCache target profile vanished")
+        _validate_kmesh_handoff_adapter(adapter_class, target_profile)
+        _validate_kmesh_handoff_adapter(self._lmcache_engine, target_profile)
+
+    def _validated_kmesh_handoff_method(
+        self, method_name: str
+    ) -> Callable[..., object]:
+        self.validate_runtime_profile(self._vllm_config)
+        method = getattr(self._lmcache_engine, method_name, None)
+        if not callable(method):
+            raise RuntimeError(f"required LMCache KMesh {method_name} handoff vanished")
+        return method
+
+    def _abort_kmesh_metadata_transaction(self) -> None:
+        """Run the begin-captured abort even if runtime validation drifted."""
+        validation_error: BaseException | None = None
+        try:
+            validated_method = self._validated_kmesh_handoff_method(
+                "abort_connector_metadata_transaction"
+            )
+        except BaseException as error:
+            validation_error = error
+            validated_method = None
+        method = self._metadata_transaction_abort_method or validated_method
+        if method is None:
+            assert validation_error is not None
+            raise validation_error
+        try:
+            method()
+        except BaseException as cleanup_error:
+            self._metadata_transaction_abort_pending = True
+            self._metadata_transaction_state = "abort_pending"
+            if validation_error is not None:
+                raise cleanup_error from validation_error
+            raise
+        self._metadata_transaction_abort_method = None
+        self._metadata_transaction_abort_pending = False
+        self._metadata_transaction_state = "idle"
+        if validation_error is not None:
+            raise validation_error
 
     # ==============================
     # Worker-side methods
     # ==============================
+    def register_model(self, model: torch.nn.Module) -> None:
+        """Forward optional model registration to the selected adapter.
+
+        CacheBlend adapters use the already-loaded vLLM model to construct
+        their request-local recovery path. Older and native adapters may not
+        implement this optional hook, in which case ordinary LMCache behavior
+        remains unchanged.
+        """
+        if getattr(self, "_kmesh_handoff_required", False):
+            self.validate_runtime_profile(self._vllm_config)
+        method = getattr(self._lmcache_engine, "register_model", None)
+        if callable(method):
+            method(model)
+
+    def shutdown(self) -> None:
+        """Forward optional teardown to the selected adapter."""
+        method = getattr(self._lmcache_engine, "shutdown", None)
+        if getattr(self, "_kmesh_handoff_required", False) and not callable(method):
+            raise RuntimeError("required LMCache KMesh shutdown handoff vanished")
+        if callable(method):
+            method()
+
+    def bind_peer_connector_metadata(
+        self, peer_connector_metadata: tuple[KVConnectorMetadata, ...]
+    ) -> None:
+        """Forward optional composite metadata to the selected adapter."""
+        method: Callable[..., object] | None
+        if getattr(self, "_kmesh_handoff_required", False):
+            method = self._validated_kmesh_handoff_method(
+                "bind_peer_connector_metadata"
+            )
+        else:
+            method = getattr(self._lmcache_engine, "bind_peer_connector_metadata", None)
+        if callable(method):
+            method(peer_connector_metadata)
+
+    def validate_peer_connector_metadata(
+        self, peer_connector_metadata: tuple[KVConnectorMetadata, ...]
+    ) -> None:
+        """Preflight composite metadata through the selected adapter."""
+        method: Callable[..., object] | None
+        if getattr(self, "_kmesh_handoff_required", False):
+            method = self._validated_kmesh_handoff_method(
+                "validate_peer_connector_metadata"
+            )
+        else:
+            method = getattr(
+                self._lmcache_engine, "validate_peer_connector_metadata", None
+            )
+        if callable(method):
+            method(peer_connector_metadata)
+
+    def clear_peer_connector_metadata(self) -> None:
+        """Forward optional composite-metadata cleanup to the selected adapter."""
+        method: Callable[..., object] | None
+        if getattr(self, "_kmesh_handoff_required", False):
+            method = self._validated_kmesh_handoff_method(
+                "clear_peer_connector_metadata"
+            )
+        else:
+            method = getattr(
+                self._lmcache_engine, "clear_peer_connector_metadata", None
+            )
+        if callable(method):
+            method()
+
+    def validate_connector_metadata(
+        self, connector_metadata: KVConnectorMetadata
+    ) -> None:
+        """Validate the target contract before own-metadata binding."""
+        if getattr(self, "_kmesh_handoff_required", False):
+            self.validate_runtime_profile(self._vllm_config)
+
+    def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
+        self.validate_connector_metadata(connector_metadata)
+        super().bind_connector_metadata(connector_metadata)
+
+    def clear_connector_metadata(self) -> None:
+        if getattr(self, "_kmesh_handoff_required", False):
+            self.validate_runtime_profile(self._vllm_config)
+        super().clear_connector_metadata()
+
+    def begin_connector_metadata_transaction(self) -> None:
+        method: Callable[..., object] | None
+        abort_method: Callable[..., object] | None = None
+        if getattr(self, "_kmesh_handoff_required", False):
+            if self._metadata_transaction_abort_pending:
+                self._abort_kmesh_metadata_transaction()
+            if self._metadata_transaction_state == "finalized":
+                self._metadata_transaction_abort_method = None
+                self._metadata_transaction_state = "idle"
+            method = self._validated_kmesh_handoff_method(
+                "begin_connector_metadata_transaction"
+            )
+            abort_method = self._validated_kmesh_handoff_method(
+                "abort_connector_metadata_transaction"
+            )
+        else:
+            method = getattr(
+                self._lmcache_engine,
+                "begin_connector_metadata_transaction",
+                None,
+            )
+        if callable(method):
+            if getattr(self, "_kmesh_handoff_required", False):
+                assert abort_method is not None
+                self._metadata_transaction_abort_method = abort_method
+                self._metadata_transaction_state = "begun"
+            method()
+
+    def commit_connector_metadata_transaction(self) -> None:
+        method: Callable[..., object] | None
+        if getattr(self, "_kmesh_handoff_required", False):
+            method = self._validated_kmesh_handoff_method(
+                "commit_connector_metadata_transaction"
+            )
+        else:
+            method = getattr(
+                self._lmcache_engine,
+                "commit_connector_metadata_transaction",
+                None,
+            )
+        if callable(method):
+            method()
+
+    def finalize_connector_metadata_transaction(self) -> None:
+        method: Callable[..., object] | None
+        if getattr(self, "_kmesh_handoff_required", False):
+            method = self._validated_kmesh_handoff_method(
+                "finalize_connector_metadata_transaction"
+            )
+        else:
+            method = getattr(
+                self._lmcache_engine,
+                "finalize_connector_metadata_transaction",
+                None,
+            )
+        if callable(method):
+            method()
+            if getattr(self, "_kmesh_handoff_required", False):
+                self._metadata_transaction_state = "finalized"
+
+    def abort_connector_metadata_transaction(self) -> None:
+        if getattr(self, "_kmesh_handoff_required", False):
+            if self._metadata_transaction_state == "idle":
+                self._validated_kmesh_handoff_method(
+                    "abort_connector_metadata_transaction"
+                )
+                return
+            self._metadata_transaction_abort_pending = True
+            self._metadata_transaction_state = "abort_pending"
+            self._abort_kmesh_metadata_transaction()
+            return
+        else:
+            method = getattr(
+                self._lmcache_engine,
+                "abort_connector_metadata_transaction",
+                None,
+            )
+        if callable(method):
+            method()
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """
         Initialize with the KV caches. Useful for pre-registering the
@@ -125,6 +413,8 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         Args:
             kv_caches: dictionary of layer names, kv cache
         """
+        if getattr(self, "_kmesh_handoff_required", False):
+            self.validate_runtime_profile(self._vllm_config)
         if hasattr(self._lmcache_engine, "register_kv_caches"):
             self._lmcache_engine.register_kv_caches(kv_caches)
         else:
@@ -148,6 +438,8 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
             the same.
 
         """
+        if getattr(self, "_kmesh_handoff_required", False):
+            self.validate_runtime_profile(self._vllm_config)
         self._lmcache_engine.start_load_kv(forward_context, **kwargs)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
@@ -161,6 +453,8 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         Args:
             layer_name: the name of that layer
         """
+        if getattr(self, "_kmesh_handoff_required", False):
+            self.validate_runtime_profile(self._vllm_config)
         self._lmcache_engine.wait_for_layer_load(layer_name)
 
     def save_kv_layer(
@@ -182,6 +476,8 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
             attn_metadata (AttentionMetadata): the attention metadata.
             **kwargs: additional arguments for the save operation.
         """
+        if getattr(self, "_kmesh_handoff_required", False):
+            self.validate_runtime_profile(self._vllm_config)
         self._lmcache_engine.save_kv_layer(
             layer_name, kv_layer, attn_metadata, **kwargs
         )
@@ -194,6 +490,8 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
 
         This prevents overwrites of paged KV buffer before saving done.
         """
+        if getattr(self, "_kmesh_handoff_required", False):
+            self.validate_runtime_profile(self._vllm_config)
         self._lmcache_engine.wait_for_save()
 
     def get_finished(
@@ -210,6 +508,8 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
             The finished saves/sends req ids must belong to a set provided in a
             call to this method (this call or a prior one).
         """
+        if getattr(self, "_kmesh_handoff_required", False):
+            self.validate_runtime_profile(self._vllm_config)
         return self._lmcache_engine.get_finished(finished_req_ids)
 
     def get_block_ids_with_load_errors(self) -> set[int]:
@@ -220,6 +520,8 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
             Set of block IDs that encountered load errors.
             Empty set if no load errors occurred.
         """
+        if getattr(self, "_kmesh_handoff_required", False):
+            self.validate_runtime_profile(self._vllm_config)
         method = getattr(self._lmcache_engine, "get_block_ids_with_load_errors", None)
         if callable(method):
             return method()
@@ -232,11 +534,13 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         Get the KV connector kv cache events collected during the last interval.
         """
 
+        if getattr(self, "_kmesh_handoff_required", False):
+            self.validate_runtime_profile(self._vllm_config)
         events = self._lmcache_engine.get_kv_events()  # type: ignore [attr-defined]
         if not events:
             return None
 
-        blocks: list[BlockStored] = [
+        blocks: list[KVCacheEvent] = [
             BlockStored(
                 block_hashes=e.block_hashes,
                 parent_block_hash=e.parent_block_hash,
@@ -256,6 +560,20 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
     # ==============================
     # Scheduler-side methods
     # ==============================
+    def prepare_request_lookup(
+        self,
+        request: "Request",
+        peer_sidecars: tuple[KVConnectorRequestSidecar, ...],
+    ) -> None:
+        """Forward optional composite request evidence to the selected adapter."""
+        method: Callable[..., object] | None
+        if getattr(self, "_kmesh_handoff_required", False):
+            method = self._validated_kmesh_handoff_method("prepare_request_lookup")
+        else:
+            method = getattr(self._lmcache_engine, "prepare_request_lookup", None)
+        if callable(method):
+            method(request, peer_sidecars)
+
     def get_num_new_matched_tokens(
         self,
         request: "Request",
@@ -274,6 +592,8 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
             the number of tokens that can be loaded from the
             external KV cache beyond what is already computed.
         """
+        if getattr(self, "_kmesh_handoff_required", False):
+            self.validate_runtime_profile(self._vllm_config)
         return self._lmcache_engine.get_num_new_matched_tokens(
             request, num_computed_tokens
         ), False
@@ -284,6 +604,8 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         """
         Update KVConnector state after block allocation.
         """
+        if getattr(self, "_kmesh_handoff_required", False):
+            self.validate_runtime_profile(self._vllm_config)
         self._lmcache_engine.update_state_after_alloc(request, num_external_tokens)
 
     def build_connector_meta(
@@ -298,6 +620,8 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         Args:
             scheduler_output (SchedulerOutput): the scheduler output object.
         """
+        if getattr(self, "_kmesh_handoff_required", False):
+            self.validate_runtime_profile(self._vllm_config)
         return self._lmcache_engine.build_connector_meta(scheduler_output)
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
@@ -337,6 +661,8 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
             Optional KVTransferParams to be included in the request outputs
             returned by the engine.
         """
+        if getattr(self, "_kmesh_handoff_required", False):
+            self.validate_runtime_profile(self._vllm_config)
         return self._lmcache_engine.request_finished(request, block_ids)
 
     def take_events(self) -> Iterable["KVCacheEvent"]:

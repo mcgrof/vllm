@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.v1.worker import startup_plan
+from vllm.v1.worker.gpu_worker import Worker
 from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
     maybe_save_startup_plan,
@@ -77,3 +79,43 @@ def test_startup_plan_apply_gate(plan_env):
     explicit = _plan_worker(kv_bytes=7 * GiB_bytes)
     maybe_apply_startup_plan(explicit)
     assert explicit.cache_config.kv_cache_memory_bytes == 7 * GiB_bytes
+
+
+@pytest.mark.skip_global_cleanup
+def test_initialize_registers_loaded_model_before_kv_cache() -> None:
+    events: list[str] = []
+    model = MagicMock()
+    connector = MagicMock()
+    model_runner = MagicMock()
+    model_runner.get_model.return_value = model
+    connector.register_model.side_effect = lambda _: events.append("register_model")
+    model_runner.initialize_kv_cache.side_effect = lambda _: events.append(
+        "initialize_kv_cache"
+    )
+    worker = SimpleNamespace(
+        cache_config=SimpleNamespace(num_gpu_blocks=None),
+        vllm_config=MagicMock(),
+        model_runner=model_runner,
+        model_config=SimpleNamespace(enable_return_routed_experts=False),
+        _maybe_get_memory_pool_context=lambda **_: nullcontext(),
+    )
+    kv_cache_config = SimpleNamespace(
+        num_blocks=8,
+        needs_kv_cache_zeroing=False,
+    )
+
+    with (
+        patch(
+            "vllm.v1.worker.gpu_worker.ensure_kv_transfer_initialized"
+        ) as initialize_connector,
+        patch("vllm.v1.worker.gpu_worker.has_kv_transfer_group", return_value=True),
+        patch(
+            "vllm.v1.worker.gpu_worker.get_kv_transfer_group",
+            return_value=connector,
+        ),
+    ):
+        Worker.initialize_from_config(worker, kv_cache_config)  # type: ignore[arg-type]
+
+    initialize_connector.assert_called_once_with(worker.vllm_config, kv_cache_config)
+    connector.register_model.assert_called_once_with(model)
+    assert events == ["register_model", "initialize_kv_cache"]

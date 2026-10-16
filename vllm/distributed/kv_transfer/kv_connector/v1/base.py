@@ -43,7 +43,8 @@ The class provides the following primitives:
 import enum
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable
-from typing import TYPE_CHECKING, Any, Literal
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
 import torch
 
@@ -147,6 +148,38 @@ class KVConnectorMetadata(ABC):  # noqa: B024
     pass
 
 
+KVConnectorRequestSidecarValue: TypeAlias = (
+    str | int | float | bool | None | tuple["KVConnectorRequestSidecarValue", ...]
+)
+
+
+def _is_request_sidecar_value(value: object) -> bool:
+    return (
+        value is None
+        or type(value) in (str, int, float, bool)
+        or (
+            type(value) is tuple
+            and all(_is_request_sidecar_value(item) for item in value)
+        )
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class KVConnectorRequestSidecar:
+    """Immutable, tensor-free data shared between scheduler-side connectors."""
+
+    provider_id: str
+    payload: KVConnectorRequestSidecarValue = None
+
+    def __post_init__(self) -> None:
+        if type(self.provider_id) is not str or not self.provider_id:
+            raise ValueError("provider_id must be a non-empty string")
+        if not _is_request_sidecar_value(self.payload):
+            raise TypeError(
+                "request sidecar payloads may contain only scalar primitives and tuples"
+            )
+
+
 class KVConnectorWorkerMetadata(ABC):
     """
     Abstract Metadata used to communicate back
@@ -216,6 +249,39 @@ class KVConnectorBase_V1(ABC):
     def role(self) -> KVConnectorRole:
         return self._role
 
+    def validate_shared_vllm_config(
+        self, parent_config: "VllmConfig", fields: tuple[str, ...]
+    ) -> None:
+        """Validate identity-shared engine configuration in a composite.
+
+        Args:
+            parent_config: The composite connector's engine configuration.
+            fields: Engine-global configuration fields that must be shared by
+                identity.
+
+        Raises:
+            ValueError: If this connector replaced a required shared object.
+        """
+        for field in fields:
+            if getattr(self._vllm_config, field, None) is not getattr(
+                parent_config, field, None
+            ):
+                raise ValueError(
+                    f"connector must share read-only engine-global {field}"
+                )
+
+    def validate_runtime_profile(self, parent_config: "VllmConfig") -> None:
+        """Validate any connector-specific frozen runtime profile.
+
+        Composite connectors call this public hook before handing mutable
+        request or step state to a child. Connectors without a frozen runtime
+        profile keep the default no-op implementation.
+
+        Args:
+            parent_config: The composite connector's engine configuration.
+        """
+        return
+
     # ==============================
     # Worker-side methods
     # ==============================
@@ -232,6 +298,52 @@ class KVConnectorBase_V1(ABC):
         """
         self._connector_metadata = connector_metadata
 
+    def validate_connector_metadata(
+        self, connector_metadata: KVConnectorMetadata
+    ) -> None:
+        """Validate connector metadata without changing connector state.
+
+        Composite connectors call this hook for every child before binding any
+        metadata. Connectors with fallible metadata validation should override
+        it so a rejected composite step remains retryable.
+
+        Args:
+            connector_metadata: The scheduler metadata intended for this
+                connector.
+        """
+        return
+
+    def begin_connector_metadata_transaction(self) -> None:
+        """Begin a composite metadata-bind transaction.
+
+        The default implementation is a no-op. A connector that mutates replay
+        state during commit must retain an exact rollback checkpoint until
+        finalize_connector_metadata_transaction() succeeds.
+        """
+        return
+
+    def commit_connector_metadata_transaction(self) -> None:
+        """Tentatively commit a successfully bound metadata transaction.
+
+        Until finalization, abort must restore the exact state that preceded
+        begin, even if this method completed or raised a ``BaseException``.
+        """
+        return
+
+    def finalize_connector_metadata_transaction(self) -> None:
+        """End a tentative transaction after every child committed.
+
+        Finalization may run sequentially across a composite. A connector that
+        mutates replay state must therefore retain its pre-begin checkpoint
+        until the next begin replaces it, so abort can still restore state if
+        a later child's finalize raises.
+        """
+        return
+
+    def abort_connector_metadata_transaction(self) -> None:
+        """Restore state from before begin, including after finalization."""
+        return
+
     def clear_connector_metadata(self) -> None:
         """Clear the connector metadata.
 
@@ -239,6 +351,33 @@ class KVConnectorBase_V1(ABC):
         after the model execution.
         """
         self._connector_metadata = None
+
+    def bind_peer_connector_metadata(
+        self, peer_connector_metadata: tuple[KVConnectorMetadata, ...]
+    ) -> None:
+        """Bind metadata for cross-connector coordination in a composite.
+
+        MultiConnector calls this only after every child has received its own
+        metadata. The tuple contains every child's metadata in connector order,
+        including the receiver's. Connectors that need another child's
+        execution plan may override the hook; ordinary connectors inherit this
+        no-op.
+        """
+        return
+
+    def validate_peer_connector_metadata(
+        self, peer_connector_metadata: tuple[KVConnectorMetadata, ...]
+    ) -> None:
+        """Validate composite peer metadata without changing connector state.
+
+        Args:
+            peer_connector_metadata: Every child's metadata in connector order.
+        """
+        return
+
+    def clear_peer_connector_metadata(self) -> None:
+        """Clear state installed by bind_peer_connector_metadata()."""
+        return
 
     def _get_connector_metadata(self) -> KVConnectorMetadata:
         """Get the connector metadata.
@@ -267,6 +406,19 @@ class KVConnectorBase_V1(ABC):
 
         Args:
             kv_caches: dictionary of layer names, kv cache
+        """
+        return
+
+    def register_model(self, model: torch.nn.Module) -> None:
+        """Register the worker's already-loaded model with the connector.
+
+        Connectors that execute a separate model path, such as position-
+        independent cache recovery, may override this hook. It is called after
+        connector construction and before KV-cache initialization. Ordinary KV
+        transfer connectors do not need the model and inherit this no-op.
+
+        Args:
+            model: The model instance owned by this worker.
         """
         return
 
@@ -451,6 +603,31 @@ class KVConnectorBase_V1(ABC):
     # ==============================
     # Scheduler-side methods
     # ==============================
+
+    def export_request_sidecar(
+        self, request: "Request"
+    ) -> KVConnectorRequestSidecar | None:
+        """Return immutable request data for a composite connector, if any.
+
+        The hook may be called repeatedly for the same request and must be
+        side-effect free. Ordinary connectors inherit this no-op.
+        """
+        return None
+
+    def prepare_request_lookup(
+        self,
+        request: "Request",
+        peer_sidecars: tuple[KVConnectorRequestSidecar, ...],
+    ) -> None:
+        """Prepare a request lookup using sidecars from the same composite.
+
+        MultiConnector calls this for every child before invoking any child's
+        ``get_num_new_matched_tokens``. The tuple follows connector order and
+        includes the child's own exported sidecar, if any. An empty tuple
+        clears request-scoped input from a previous lookup. Ordinary connectors
+        inherit this no-op.
+        """
+        return
 
     def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
         """

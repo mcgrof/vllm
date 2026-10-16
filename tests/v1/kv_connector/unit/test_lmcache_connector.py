@@ -1,15 +1,485 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
+from vllm.config import KVTransferConfig
 from vllm.distributed.kv_events import BlockStored
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorMetadata,
+    KVConnectorRequestSidecar,
+    KVConnectorRole,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_connector import (
+    KMESH_HANDOFF_PROTOCOL_VERSION,
     LMCacheConnectorV1,
     LMCacheKVEvents,
 )
 from vllm.v1.outputs import KVConnectorOutput
+
+
+def _external_connector(
+    monkeypatch: pytest.MonkeyPatch, adapter_class: type[object]
+) -> LMCacheConnectorV1:
+    module_name = "lmcache.integration.vllm.vllm_v1_adapter"
+    adapter_module = ModuleType(module_name)
+    adapter_module.LMCacheConnectorV1Impl = adapter_class  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, module_name, adapter_module)
+    vllm_config = SimpleNamespace(
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="LMCacheConnectorV1",
+            kv_role="kv_both",
+            kv_connector_extra_config={"use_native": False},
+        )
+    )
+    return LMCacheConnectorV1(vllm_config, KVConnectorRole.SCHEDULER, MagicMock())
+
+
+class _SerialPICAdapterProtocol:
+    """Minimal exact protocol-v2 adapter for wrapper contract tests."""
+
+    KMESH_HANDOFF_PROTOCOL_VERSION = KMESH_HANDOFF_PROTOCOL_VERSION
+
+    def __init__(self, *args: object) -> None:
+        pass
+
+    def prepare_request_lookup(self, *args: object) -> None:
+        pass
+
+    def validate_peer_connector_metadata(self, *args: object) -> None:
+        pass
+
+    def bind_peer_connector_metadata(self, *args: object) -> None:
+        pass
+
+    def clear_peer_connector_metadata(self) -> None:
+        pass
+
+    def begin_connector_metadata_transaction(self) -> None:
+        pass
+
+    def commit_connector_metadata_transaction(self) -> None:
+        pass
+
+    def finalize_connector_metadata_transaction(self) -> None:
+        pass
+
+    def abort_connector_metadata_transaction(self) -> None:
+        pass
+
+    def shutdown(self) -> None:
+        pass
+
+
+@pytest.mark.skip_global_cleanup
+def test_register_model_forwards_to_adapter() -> None:
+    connector = object.__new__(LMCacheConnectorV1)
+    connector._lmcache_engine = MagicMock()
+    model = MagicMock()
+
+    connector.register_model(model)
+
+    connector._lmcache_engine.register_model.assert_called_once_with(model)
+
+
+@pytest.mark.skip_global_cleanup
+def test_register_model_is_compatible_with_older_adapter() -> None:
+    connector = object.__new__(LMCacheConnectorV1)
+    connector._lmcache_engine = object()
+
+    connector.register_model(MagicMock())
+
+
+@pytest.mark.skip_global_cleanup
+def test_shutdown_forwards_to_adapter() -> None:
+    connector = object.__new__(LMCacheConnectorV1)
+    connector._lmcache_engine = MagicMock()
+
+    connector.shutdown()
+
+    connector._lmcache_engine.shutdown.assert_called_once_with()
+
+
+@pytest.mark.skip_global_cleanup
+def test_shutdown_is_compatible_with_older_adapter() -> None:
+    connector = object.__new__(LMCacheConnectorV1)
+    connector._lmcache_engine = object()
+
+    connector.shutdown()
+
+
+@pytest.mark.skip_global_cleanup
+def test_kmesh_peer_handoffs_forward_to_external_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ExternalAdapter:
+        calls: list[tuple[str, tuple[object, ...]]] = []
+
+        def __init__(self, *args: object) -> None:
+            pass
+
+        def prepare_request_lookup(self, *args: object) -> None:
+            type(self).calls.append(("prepare", args))
+
+        def validate_peer_connector_metadata(self, *args: object) -> None:
+            type(self).calls.append(("validate", args))
+
+        def bind_peer_connector_metadata(self, *args: object) -> None:
+            type(self).calls.append(("bind", args))
+
+        def clear_peer_connector_metadata(self) -> None:
+            type(self).calls.append(("clear", ()))
+
+    connector = _external_connector(monkeypatch, ExternalAdapter)
+    request = MagicMock()
+    sidecars = (KVConnectorRequestSidecar("kmesh", ("descriptor", 7)),)
+    peer_metadata = (KVConnectorMetadata(),)
+
+    connector.prepare_request_lookup(request, sidecars)
+    connector.prepare_request_lookup(request, ())
+    connector.validate_peer_connector_metadata(peer_metadata)
+    connector.validate_peer_connector_metadata(())
+    connector.bind_peer_connector_metadata(peer_metadata)
+    connector.bind_peer_connector_metadata(())
+    connector.clear_peer_connector_metadata()
+
+    assert ExternalAdapter.calls == [
+        ("prepare", (request, sidecars)),
+        ("prepare", (request, ())),
+        ("validate", (peer_metadata,)),
+        ("validate", ((),)),
+        ("bind", (peer_metadata,)),
+        ("bind", ((),)),
+        ("clear", ()),
+    ]
+
+
+@pytest.mark.skip_global_cleanup
+def test_kmesh_peer_handoffs_are_compatible_with_older_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class OlderAdapter:
+        def __init__(self, *args: object) -> None:
+            pass
+
+    connector = _external_connector(monkeypatch, OlderAdapter)
+
+    connector.prepare_request_lookup(MagicMock(), ())
+    connector.validate_peer_connector_metadata(())
+    connector.bind_peer_connector_metadata(())
+    connector.clear_peer_connector_metadata()
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize(
+    ("method_name", "args"),
+    [
+        ("prepare_request_lookup", (MagicMock(), ())),
+        ("validate_peer_connector_metadata", ((),)),
+        ("bind_peer_connector_metadata", ((),)),
+        ("clear_peer_connector_metadata", ()),
+    ],
+)
+def test_kmesh_peer_handoff_errors_propagate(
+    monkeypatch: pytest.MonkeyPatch,
+    method_name: str,
+    args: tuple[object, ...],
+) -> None:
+    adapter_error = RuntimeError("adapter rejected KMesh handoff")
+
+    class RejectingAdapter:
+        def __init__(self, *args: object) -> None:
+            pass
+
+        def _handoff(self, name: str) -> None:
+            if name == method_name:
+                raise adapter_error
+
+        def prepare_request_lookup(self, *args: object) -> None:
+            self._handoff("prepare_request_lookup")
+
+        def validate_peer_connector_metadata(self, *args: object) -> None:
+            self._handoff("validate_peer_connector_metadata")
+
+        def bind_peer_connector_metadata(self, *args: object) -> None:
+            self._handoff("bind_peer_connector_metadata")
+
+        def clear_peer_connector_metadata(self) -> None:
+            self._handoff("clear_peer_connector_metadata")
+
+    connector = _external_connector(monkeypatch, RejectingAdapter)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        getattr(connector, method_name)(*args)
+
+    assert exc_info.value is adapter_error
+
+
+@pytest.mark.skip_global_cleanup
+def test_explicit_use_native_false_selects_external_adapter(monkeypatch) -> None:
+    adapter_module_name = "lmcache.integration.vllm.vllm_v1_adapter"
+    adapter_module = ModuleType(adapter_module_name)
+
+    class ExternalAdapter:
+        instances: list[tuple[object, ...]] = []
+
+        def __init__(self, *args: object) -> None:
+            type(self).instances.append(args)
+
+    adapter_module.LMCacheConnectorV1Impl = ExternalAdapter  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, adapter_module_name, adapter_module)
+    vllm_config = SimpleNamespace(
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="LMCacheConnectorV1",
+            kv_role="kv_both",
+            kv_connector_extra_config={"use_native": False},
+        )
+    )
+    kv_cache_config = MagicMock()
+
+    connector = LMCacheConnectorV1(
+        vllm_config, KVConnectorRole.SCHEDULER, kv_cache_config
+    )
+
+    assert ExternalAdapter.instances == [
+        (
+            vllm_config,
+            KVConnectorRole.SCHEDULER,
+            connector,
+        )
+    ]
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("target_profile", ["serial_pic_v1", "collective_lockstep_v1"])
+def test_kmesh_target_profiles_reject_native_adapter(target_profile: str) -> None:
+    vllm_config = SimpleNamespace(
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="LMCacheConnectorV1",
+            kv_role="kv_both",
+            kv_connector_extra_config={
+                "use_native": True,
+                "kmesh_target_profile": target_profile,
+            },
+        )
+    )
+
+    with pytest.raises(ValueError, match="requires the external LMCache adapter"):
+        LMCacheConnectorV1(vllm_config, KVConnectorRole.SCHEDULER, MagicMock())
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("target_profile", ["serial_pic_v1", "collective_lockstep_v1"])
+def test_kmesh_target_profiles_require_versioned_external_handoff(
+    monkeypatch, target_profile: str
+) -> None:
+    adapter_module_name = "lmcache.integration.vllm.vllm_v1_adapter"
+    adapter_module = ModuleType(adapter_module_name)
+
+    class ExternalAdapter(_SerialPICAdapterProtocol):
+        instances = 0
+
+        def __init__(self, *args: object) -> None:
+            type(self).instances += 1
+
+        def prepare_request_lookup(self, *args: object) -> None:
+            pass
+
+        def validate_peer_connector_metadata(self, *args: object) -> None:
+            pass
+
+        def bind_peer_connector_metadata(self, *args: object) -> None:
+            pass
+
+        def clear_peer_connector_metadata(self) -> None:
+            pass
+
+    adapter_module.LMCacheConnectorV1Impl = ExternalAdapter  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, adapter_module_name, adapter_module)
+    vllm_config = SimpleNamespace(
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="LMCacheConnectorV1",
+            kv_role="kv_both",
+            kv_connector_extra_config={
+                "use_native": False,
+                "kmesh_target_profile": target_profile,
+            },
+        )
+    )
+
+    connector = LMCacheConnectorV1(vllm_config, KVConnectorRole.SCHEDULER, MagicMock())
+
+    connector.validate_kmesh_handoff_contract()
+    assert ExternalAdapter.instances == 1
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("shutdown_raises", [False, True])
+def test_serial_pic_v1_failed_instance_revalidation_shuts_down_adapter(
+    monkeypatch: pytest.MonkeyPatch, shutdown_raises: bool
+) -> None:
+    adapter_module_name = "lmcache.integration.vllm.vllm_v1_adapter"
+    adapter_module = ModuleType(adapter_module_name)
+    cleanup_error = KeyboardInterrupt("adapter shutdown interrupted")
+
+    class RevalidatedAdapter(_SerialPICAdapterProtocol):
+        def __init__(self, *args: object) -> None:
+            self.KMESH_HANDOFF_PROTOCOL_VERSION = 3
+            self.shutdown_calls = 0
+            instances.append(self)
+
+        def prepare_request_lookup(self, *args: object) -> None:
+            pass
+
+        def validate_peer_connector_metadata(self, *args: object) -> None:
+            pass
+
+        def bind_peer_connector_metadata(self, *args: object) -> None:
+            pass
+
+        def clear_peer_connector_metadata(self) -> None:
+            pass
+
+        def shutdown(self) -> None:
+            self.shutdown_calls += 1
+            if shutdown_raises and self.shutdown_calls == 1:
+                raise cleanup_error
+
+    instances: list[RevalidatedAdapter] = []
+
+    adapter_module.LMCacheConnectorV1Impl = RevalidatedAdapter  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, adapter_module_name, adapter_module)
+    vllm_config = SimpleNamespace(
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="LMCacheConnectorV1",
+            kv_role="kv_both",
+            kv_connector_extra_config={
+                "use_native": False,
+                "kmesh_target_profile": "serial_pic_v1",
+            },
+        )
+    )
+
+    connector = LMCacheConnectorV1(vllm_config, KVConnectorRole.SCHEDULER, MagicMock())
+
+    with pytest.raises(ValueError, match="handoff protocol version 2"):
+        connector.validate_kmesh_handoff_contract()
+
+    assert len(instances) == 1
+    assert instances[0].shutdown_calls == 0
+    if shutdown_raises:
+        with pytest.raises(KeyboardInterrupt) as exc_info:
+            connector.shutdown()
+        assert exc_info.value is cleanup_error
+        connector.shutdown()
+        assert instances[0].shutdown_calls == 2
+    else:
+        connector.shutdown()
+        assert instances[0].shutdown_calls == 1
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("version", [None, True, 0, 1, 3])
+def test_serial_pic_v1_rejects_legacy_or_wrong_handoff_version(
+    monkeypatch, version: object
+) -> None:
+    adapter_module_name = "lmcache.integration.vllm.vllm_v1_adapter"
+    adapter_module = ModuleType(adapter_module_name)
+
+    class LegacyAdapter:
+        def __init__(self, *args: object) -> None:
+            raise AssertionError("legacy adapter must be rejected before init")
+
+        def prepare_request_lookup(self, *args: object) -> None:
+            pass
+
+        def bind_peer_connector_metadata(self, *args: object) -> None:
+            pass
+
+        def clear_peer_connector_metadata(self) -> None:
+            pass
+
+    if version is not None:
+        LegacyAdapter.KMESH_HANDOFF_PROTOCOL_VERSION = version  # type: ignore[attr-defined]
+    adapter_module.LMCacheConnectorV1Impl = LegacyAdapter  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, adapter_module_name, adapter_module)
+    vllm_config = SimpleNamespace(
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="LMCacheConnectorV1",
+            kv_role="kv_both",
+            kv_connector_extra_config={
+                "use_native": False,
+                "kmesh_target_profile": "serial_pic_v1",
+            },
+        )
+    )
+
+    with pytest.raises(ValueError, match="handoff protocol version 2"):
+        LMCacheConnectorV1(vllm_config, KVConnectorRole.SCHEDULER, MagicMock())
+
+
+@pytest.mark.skip_global_cleanup
+def test_serial_pic_v1_rejects_missing_handoff_method(monkeypatch) -> None:
+    adapter_module_name = "lmcache.integration.vllm.vllm_v1_adapter"
+    adapter_module = ModuleType(adapter_module_name)
+
+    class IncompleteAdapter:
+        KMESH_HANDOFF_PROTOCOL_VERSION = 2
+
+        def prepare_request_lookup(self, *args: object) -> None:
+            pass
+
+        def bind_peer_connector_metadata(self, *args: object) -> None:
+            pass
+
+    adapter_module.LMCacheConnectorV1Impl = IncompleteAdapter  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, adapter_module_name, adapter_module)
+    vllm_config = SimpleNamespace(
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="LMCacheConnectorV1",
+            kv_role="kv_both",
+            kv_connector_extra_config={
+                "use_native": False,
+                "kmesh_target_profile": "serial_pic_v1",
+            },
+        )
+    )
+
+    with pytest.raises(ValueError, match="clear_peer_connector_metadata"):
+        LMCacheConnectorV1(vllm_config, KVConnectorRole.SCHEDULER, MagicMock())
+
+
+@pytest.mark.skip_global_cleanup
+def test_serial_pic_v1_requires_shutdown_before_adapter_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter_module_name = "lmcache.integration.vllm.vllm_v1_adapter"
+    adapter_module = ModuleType(adapter_module_name)
+
+    class MissingShutdownAdapter(_SerialPICAdapterProtocol):
+        shutdown = None  # type: ignore[assignment]
+
+        def __init__(self, *args: object) -> None:
+            raise AssertionError("adapter without shutdown must not be constructed")
+
+    adapter_module.LMCacheConnectorV1Impl = MissingShutdownAdapter  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, adapter_module_name, adapter_module)
+    vllm_config = SimpleNamespace(
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="LMCacheConnectorV1",
+            kv_role="kv_both",
+            kv_connector_extra_config={
+                "use_native": False,
+                "kmesh_target_profile": "serial_pic_v1",
+            },
+        )
+    )
+
+    with pytest.raises(ValueError, match="shutdown"):
+        LMCacheConnectorV1(vllm_config, KVConnectorRole.SCHEDULER, MagicMock())
 
 
 @pytest.fixture
