@@ -1546,6 +1546,73 @@ def test_hisparse_external_import_survives_capacity_retry():
     assert len(hot) == 2
 
 
+@pytest.mark.parametrize("fork_tokens", [32, 37])
+def test_exact_fork_shares_full_blocks_and_isolates_boundary(fork_tokens):
+    """Share immutable ancestors while keeping each child's append private."""
+    block_size = 16
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(block_size, 64),
+        max_model_len=128,
+        hash_block_size=block_size,
+        enable_caching=True,
+    )
+    parent_tokens = list(range(fork_tokens))
+    parent = make_request("parent", parent_tokens, block_size, sha256)
+    assert manager.allocate_slots(parent, parent.num_tokens) is not None
+    parent_ids = manager.get_block_ids("parent")[0]
+    manager.free(parent)
+
+    children = []
+    for i in range(3):
+        child = make_request(
+            f"child-{i}", parent_tokens + [100 + i] * 20, block_size, sha256
+        )
+        computed, hit, _ = manager.get_computed_blocks(child)
+        assert hit == fork_tokens // block_size * block_size
+        assert (
+            manager.allocate_slots(child, child.num_tokens - hit, hit, computed)
+            is not None
+        )
+        children.append(child)
+
+    tables = [manager.get_block_ids(child.request_id)[0] for child in children]
+    full = fork_tokens // block_size
+    for table in tables:
+        assert table[:full] == parent_ids[:full]
+    for i, left in enumerate(tables):
+        for right in tables[i + 1 :]:
+            assert set(left[full:]).isdisjoint(right[full:])
+
+    # Count distinct causal prefixes independently of the block-count formula.
+    expected = {
+        tuple(child.prompt_token_ids[:end])
+        for child in children
+        for end in range(block_size, child.num_tokens + block_size, block_size)
+    }
+    assert len(set().union(*map(set, tables))) == len(expected)
+    manager.free(children[0])
+    assert manager.get_block_ids(children[1].request_id)[0] == tables[1]
+    for child in children[1:]:
+        manager.free(child)
+    assert manager.block_pool.free_block_queue.num_free_blocks == 63
+
+
+def test_matching_suffix_after_divergence_is_not_a_prefix_hit():
+    """Identical suffix tokens cannot alias KV with different causal history."""
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(16, 64),
+        max_model_len=128,
+        hash_block_size=16,
+        enable_caching=True,
+    )
+    parent = make_request("left", [1] * 16 + [3] * 32, 16, sha256)
+    assert manager.allocate_slots(parent, parent.num_tokens) is not None
+    manager.free(parent)
+    other = make_request("right", [2] * 16 + [3] * 32, 16, sha256)
+    _, hit, _ = manager.get_computed_blocks(other)
+    assert hit == 0
+
+
 def make_kv_cache_config_hybrid_model(
     block_size: int,
     num_blocks: int,

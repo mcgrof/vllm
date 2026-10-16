@@ -161,3 +161,31 @@ scheduler, and source identity. It requires output equivalence before reporting
 a timing ratio. For batch runs it compares replay time; for serial-paced runs it
 compares mean request service time so the configured arrival delay cannot appear
 as inference speedup.
+
+## Exact-prefix fork accounting
+
+Reasoning branches often extend an identical ancestor with different tails.
+Before adding tree-specific ownership, measure whether automatic prefix caching
+already shares those ancestor blocks. `fork_block_accounting.py` drives the real
+`KVCacheManager` on CPU, treating allocation as completed prefill. It runs five
+synthetic tree shapes with cached, uncached, concurrent, sequential and pool
+pressure controls, then sweeps unrelated cache churn before child admission.
+
+```bash
+CUDA_VISIBLE_DEVICES= HIP_VISIBLE_DEVICES= ROCR_VISIBLE_DEVICES= \
+  .venv/bin/python benchmarks/kmesh/fork_block_accounting.py \
+  --output fork-accounting.json
+```
+
+The output must not exist. The default seed preserves the workload; `--smoke`
+runs a smaller diagnostic instead of the full matrix. Each successful request
+records its actual block IDs, cache hits and simulated writes. The fork oracle
+counts shared full ancestors once and gives each child a private boundary block.
+Pool occupancy includes the reserved null block. Byte counts project model
+geometry, with no tensor allocation, model execution, scheduler, or storage I/O.
+This benchmark cannot establish inference speed or attention read savings.
+
+The existing `tests/v1/core/test_prefix_caching.py` suite checks ancestor aliasing,
+private writable tails, reference lifetime and the negative case of matching
+suffix tokens after different causal prefixes. The separate knlp reproducer pins
+the runtime and verifies the complete accounting and eviction matrix.
