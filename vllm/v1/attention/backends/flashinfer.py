@@ -1481,7 +1481,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 compact = getattr(self.vllm_config, "_compact_prefill_workspace", None)
                 if compact is not None:
                     from vllm.v1.attention.backends.compact_prefill_metadata import (
-                        plan_whole_prompt,
+                        plan_prefill_subset,
                     )
 
                     supported = (
@@ -1503,9 +1503,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         and not self.cache_config.enable_prefix_caching
                         and not self.vllm_config.scheduler_config.enable_chunked_prefill
                     )
-                    page_plan, reason = plan_whole_prompt(
+                    page_plan, reason = plan_prefill_subset(
                         qo_indptr_cpu.tolist(),
                         seq_lens_np,
+                        self.paged_kv_indptr.cpu[: num_reqs + 1].tolist(),
                         max_sequences=self.vllm_config.scheduler_config.max_num_seqs,
                         num_decodes=num_decodes,
                         causal=causal,
@@ -1517,7 +1518,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         compact.plan(
                             page_plan,
                             qo_indptr_prefill_cpu,
-                            paged_kv_indptr_prefill_cpu,
+                            paged_kv_indptr_prefill_cpu - page_plan.source_page_start,
                             paged_kv_last_page_len_prefill_cpu,
                             sm_scale=self.sm_scale,
                             window_left=self.window_left,
@@ -1527,7 +1528,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         )
                         attn_metadata.prefill.compact = compact
                         attn_metadata.prefill.compact_plan = page_plan
-                        attn_metadata.prefill.source_indices = paged_kv_indices
+                        attn_metadata.prefill.source_indices = paged_kv_indices[
+                            page_plan.source_page_start : page_plan.source_page_end
+                        ]
 
         ## DECODE PATHWAY
         if num_decodes > 0:

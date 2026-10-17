@@ -17,6 +17,11 @@ class CompactPagePlan:
     query_lengths: tuple[int, ...]
     page_indptr: tuple[int, ...]
     last_page_lengths: tuple[int, ...]
+    source_page_start: int = 0
+
+    @property
+    def source_page_end(self) -> int:
+        return self.source_page_start + self.pages
 
     @property
     def pages(self) -> int:
@@ -55,3 +60,57 @@ def plan_whole_prompt(
         return None, "page_budget"
     tails = tuple((n - 1) % PAGE_SIZE + 1 for n in kv)
     return CompactPagePlan(lengths, ptr, tails), "candidate"
+
+
+def plan_prefill_subset(
+    query_indptr,
+    kv_lengths,
+    page_indptr,
+    *,
+    max_sequences: int,
+    num_decodes: int = 0,
+    causal: bool = True,
+    prefix: bool = False,
+    supported: bool = True,
+) -> tuple[CompactPagePlan | None, str]:
+    """Plan only whole fresh prompts after the scheduler's decode prefix."""
+    q = tuple(int(x) for x in query_indptr)
+    kv = tuple(int(x) for x in kv_lengths)
+    pages = tuple(int(x) for x in page_indptr)
+    count = len(kv)
+    if (
+        not 0 <= num_decodes <= count
+        or count > max_sequences
+        or len(q) != count + 1
+        or not q
+        or q[0] != 0
+        or any(b <= a for a, b in zip(q, q[1:]))
+    ):
+        return None, "request_count"
+    if (
+        len(pages) != count + 1
+        or pages[0] != 0
+        or any(n <= 0 for n in kv)
+        or tuple(b - a for a, b in zip(pages, pages[1:]))
+        != tuple((n + PAGE_SIZE - 1) // PAGE_SIZE for n in kv)
+    ):
+        return None, "page_mapping"
+    if num_decodes == count:
+        return None, "decode_only"
+    offset = q[num_decodes]
+    plan, reason = plan_whole_prompt(
+        tuple(x - offset for x in q[num_decodes:]),
+        kv[num_decodes:],
+        max_sequences=max_sequences,
+        causal=causal,
+        prefix=prefix,
+        supported=supported,
+    )
+    if plan is None:
+        return None, reason
+    return CompactPagePlan(
+        plan.query_lengths,
+        plan.page_indptr,
+        plan.last_page_lengths,
+        source_page_start=pages[num_decodes],
+    ), reason
