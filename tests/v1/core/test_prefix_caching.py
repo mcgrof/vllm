@@ -494,6 +494,7 @@ def test_connector_completes_partial_prefix_without_importing_missing_host_kv(
     if nested:
         for _ in range(2):
             outer = object.__new__(MultiConnector)
+            outer._kmesh_target_profile = None
             outer._connectors = (connector,)
             outer._requests_to_connector = {}
             connector = outer
@@ -1017,6 +1018,7 @@ def test_host_receive_completion_without_spill_metadata(failed):
     connector = object.__new__(HiSparseConnector)
     connector.connector_scheduler = scheduler
     composite = object.__new__(MultiConnector)
+    composite._kmesh_target_profile = None
     composite._connectors = (connector,)
     composite.update_connector_output(
         KVConnectorOutput(

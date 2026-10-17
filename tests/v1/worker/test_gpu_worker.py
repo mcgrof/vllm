@@ -3,7 +3,7 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -12,7 +12,7 @@ from tests.utils import create_new_process_for_each_test
 from vllm.platforms import current_platform
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.v1.worker import gpu_worker, startup_plan
-from vllm.v1.worker.gpu_worker import maybe_rocm_profiling_fallback
+from vllm.v1.worker.gpu_worker import Worker, maybe_rocm_profiling_fallback
 from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
     maybe_save_startup_plan,
@@ -387,3 +387,44 @@ def test_jit_monitor_activation_follows_enable_jit_warmup(
     calls.clear()
     gpu_worker.Worker._maybe_activate_jit_monitor(worker(False))
     assert calls == []
+
+
+@pytest.mark.skip_global_cleanup
+def test_initialize_registers_loaded_model_before_kv_cache() -> None:
+    events: list[str] = []
+    model = MagicMock()
+    connector = MagicMock()
+    model_runner = MagicMock()
+    model_runner.get_model.return_value = model
+    connector.register_model.side_effect = lambda _: events.append("register_model")
+    model_runner.initialize_kv_cache.side_effect = lambda _, **_kwargs: events.append(
+        "initialize_kv_cache"
+    )
+    worker = SimpleNamespace(
+        cache_config=SimpleNamespace(num_gpu_blocks=None),
+        vllm_config=MagicMock(),
+        model_runner=model_runner,
+        model_config=SimpleNamespace(enable_return_routed_experts=False),
+        _maybe_get_memory_pool_context=lambda **_: nullcontext(),
+    )
+    kv_cache_config = SimpleNamespace(
+        num_blocks=8,
+        kv_cache_layout=None,
+        needs_kv_cache_zeroing=False,
+    )
+
+    with (
+        patch(
+            "vllm.v1.worker.gpu_worker.ensure_kv_transfer_initialized"
+        ) as initialize_connector,
+        patch("vllm.v1.worker.gpu_worker.has_kv_transfer_group", return_value=True),
+        patch(
+            "vllm.v1.worker.gpu_worker.get_kv_transfer_group",
+            return_value=connector,
+        ),
+    ):
+        Worker.initialize_from_config(worker, kv_cache_config)  # type: ignore[arg-type]
+
+    initialize_connector.assert_called_once_with(worker.vllm_config, kv_cache_config)
+    connector.register_model.assert_called_once_with(model)
+    assert events == ["register_model", "initialize_kv_cache"]

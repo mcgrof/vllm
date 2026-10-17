@@ -829,6 +829,8 @@ class Worker(WorkerBase):
         # because `initialize_kv_cache` will inject kv cache groups not
         # related to kv cache connector (e.g. kv cache sharing layers).
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
+        if has_kv_transfer_group():
+            get_kv_transfer_group().register_model(self.model_runner.get_model())
 
         # If the connector provides a custom memory pool (e.g. Mooncake
         # NVLink/BAREX), use it for KV cache allocation; otherwise fall

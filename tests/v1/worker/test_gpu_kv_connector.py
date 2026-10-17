@@ -18,6 +18,7 @@ def _make_connector(
     events: list[str],
 ) -> ActiveKVConnector:
     backend = Mock()
+    backend.requires_pre_forward_load = False
     backend.handle_preemptions.side_effect = lambda _: events.append("handle")
     backend.bind_connector_metadata.side_effect = lambda _: events.append("bind")
     backend.start_load_kv.side_effect = lambda *_args, **_kwargs: events.append("start")
@@ -53,12 +54,15 @@ def _scheduler_output(has_sync_kv_loads: bool) -> SimpleNamespace:
 
 
 @pytest.mark.parametrize("has_sync_kv_loads", [False, True])
+@pytest.mark.parametrize("requires_pre_forward_load", [False, True])
 def test_load_start_phase(
     monkeypatch: pytest.MonkeyPatch,
     has_sync_kv_loads: bool,
+    requires_pre_forward_load: bool,
 ):
     events: list[str] = []
     connector = _make_connector(monkeypatch, events)
+    connector.kv_connector.requires_pre_forward_load = requires_pre_forward_load
     output = _scheduler_output(has_sync_kv_loads)
 
     request_indices = torch.tensor([3, 1])
@@ -71,7 +75,9 @@ def test_load_start_phase(
         attn_metadata=attn_metadata,
     )
     assert events == (
-        ["handle", "bind", "start"] if has_sync_kv_loads else ["handle", "bind"]
+        ["handle", "bind", "start"]
+        if has_sync_kv_loads or requires_pre_forward_load
+        else ["handle", "bind"]
     )
 
     connector.post_forward(set())

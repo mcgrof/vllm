@@ -3,6 +3,7 @@
 import filecmp
 import shutil
 import tempfile
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -17,6 +18,8 @@ from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
+    KVConnectorMetadata,
+    KVConnectorRequestSidecar,
     SupportsHMA,
     supports_hma,
 )
@@ -26,6 +29,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
     MultiConnector,
+    MultiKVConnectorMetadata,
     MultiKVConnectorPromMetrics,
     MultiKVConnectorStats,
     MultiKVConnectorWorkerMetadata,
@@ -69,6 +73,8 @@ class MockConnector(KVConnectorBase_V1):
         mock.build_kv_connector_stats = cls.build_kv_connector_stats
         mock.get_kv_connector_stats.return_value = None
         mock.get_mem_pool_context.return_value = None
+
+        mock.export_request_sidecar.return_value = None
         return mock
 
     @classmethod
@@ -110,6 +116,7 @@ class MockHMAConnector(KVConnectorBase_V1, SupportsHMA):
             cls._supports_divergent_local_hybrid_hits
         )
         mock.get_kv_connector_stats.return_value = None
+        mock.export_request_sidecar.return_value = None
         return mock
 
     def start_load_kv(self, forward_context, **kwargs):
@@ -139,6 +146,105 @@ class MockHMAConnector(KVConnectorBase_V1, SupportsHMA):
 
 class MockDivergentHMAConnector(MockHMAConnector):
     _supports_divergent_local_hybrid_hits = True
+
+
+class MetadataProbeConnector(MockConnector):
+    """Publicly observable connector used for lifecycle fault injection."""
+
+    events: list[tuple[str, str]] = []
+    failure: tuple[str, str] | None = None
+    failure_error: BaseException | None = None
+    failure_remaining = 0
+    queued_failures: dict[tuple[str, str], list[BaseException]] = {}
+
+    def __new__(cls, *args: object, **kwargs: object):
+        return object.__new__(cls)
+
+    def __init__(self, vllm_config, role, kv_cache_config) -> None:
+        super().__init__(vllm_config, role, kv_cache_config)
+        self.name = self._kv_transfer_config.kv_connector_extra_config["name"]
+        type(self).events.append(("construct", self.name))
+
+    @classmethod
+    def reset_probe(cls) -> None:
+        cls.events = []
+        cls.failure = None
+        cls.failure_error = None
+        cls.failure_remaining = 0
+        cls.queued_failures = {}
+
+    def _record(self, phase: str) -> None:
+        type(self).events.append((phase, self.name))
+        queued_failures = type(self).queued_failures.get((phase, self.name))
+        if queued_failures:
+            raise queued_failures.pop(0)
+        if (
+            type(self).failure == (phase, self.name)
+            and type(self).failure_remaining > 0
+        ):
+            type(self).failure_remaining -= 1
+            error = type(self).failure_error
+            assert error is not None
+            raise error
+
+    def begin_connector_metadata_transaction(self) -> None:
+        self._record("begin")
+
+    def commit_connector_metadata_transaction(self) -> None:
+        self._record("commit")
+
+    def finalize_connector_metadata_transaction(self) -> None:
+        self._record("finalize")
+
+    def abort_connector_metadata_transaction(self) -> None:
+        self._record("abort")
+
+    def validate_connector_metadata(
+        self, connector_metadata: KVConnectorMetadata
+    ) -> None:
+        self._record("validate-own")
+
+    def validate_peer_connector_metadata(
+        self, peer_connector_metadata: tuple[KVConnectorMetadata, ...]
+    ) -> None:
+        self._record("validate-peer")
+
+    def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
+        self._record("bind-own")
+        super().bind_connector_metadata(connector_metadata)
+
+    def bind_peer_connector_metadata(
+        self, peer_connector_metadata: tuple[KVConnectorMetadata, ...]
+    ) -> None:
+        self._record("bind-peer")
+
+    def clear_peer_connector_metadata(self) -> None:
+        self._record("clear-peer")
+
+    def clear_connector_metadata(self) -> None:
+        self._record("clear-own")
+        super().clear_connector_metadata()
+
+    def shutdown(self) -> None:
+        self._record("shutdown")
+
+
+class ConstructionProbeConnector(MetadataProbeConnector):
+    """Connector that fails construction and one owned shutdown attempt."""
+
+    construction_error = RuntimeError("third child construction failed")
+    cleanup_error = KeyboardInterrupt("second child shutdown interrupted")
+
+    def __init__(self, vllm_config, role, kv_cache_config) -> None:
+        super().__init__(vllm_config, role, kv_cache_config)
+        if self.name == "third":
+            raise type(self).construction_error
+
+    def shutdown(self) -> None:
+        type(self).events.append(("shutdown", self.name))
+        if self.name == "second" and type(self).failure_remaining > 0:
+            type(self).failure_remaining -= 1
+            raise type(self).cleanup_error
 
 
 # Register mock connectors
@@ -244,6 +350,311 @@ def test_multi_connector_rejects_multiple_mem_pool_contexts(mc: MultiConnector):
         match="Multiple connectors provide a KV cache memory pool",
     ):
         mc.get_mem_pool_context()
+
+
+def _probe_multi_connector(
+    connector_name: str = "MetadataProbeConnector",
+    names: tuple[str, ...] = ("first", "second"),
+) -> MultiConnector:
+    connectors = [
+        {
+            "kv_connector": connector_name,
+            "kv_role": "kv_both",
+            "kv_connector_module_path": __name__,
+            "kv_connector_extra_config": {"name": name},
+        }
+        for name in names
+    ]
+    config = create_vllm_config(
+        kv_connector="MultiConnector",
+        kv_connector_extra_config={"connectors": connectors},
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[]
+    )
+    return MultiConnector(config, KVConnectorRole.WORKER, kv_cache_config)
+
+
+@pytest.mark.skip_global_cleanup
+def test_register_model_is_forwarded_to_every_child(mc: MultiConnector) -> None:
+    model = MagicMock(spec=torch.nn.Module)
+
+    mc.register_model(model)
+
+    for connector in mc._connectors:
+        connector.register_model.assert_called_once_with(model)
+
+
+@pytest.mark.skip_global_cleanup
+def test_request_sidecar_is_immutable_and_tensor_free() -> None:
+    sidecar = KVConnectorRequestSidecar("provider", ("value", (1, True, None)))
+
+    with pytest.raises(FrozenInstanceError):
+        sidecar.payload = "changed"  # type: ignore[misc]
+
+    with pytest.raises(TypeError, match="scalar primitives and tuples"):
+        KVConnectorRequestSidecar("provider", torch.empty(0))  # type: ignore[arg-type]
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("provider_index", [0, 1])
+def test_request_sidecars_are_delivered_before_lookup_independent_of_order(
+    mc: MultiConnector, provider_index: int
+) -> None:
+    request = MagicMock()
+    request.request_id = "request"
+    sidecar = KVConnectorRequestSidecar("provider", ("descriptor", 7))
+    events: list[tuple[str, int]] = []
+
+    for i, connector in enumerate(mc._connectors):
+
+        def export_sidecar(request, *, index=i):
+            events.append(("export_sidecar", index))
+            return sidecar if index == provider_index else None
+
+        def prepare_lookup(request, peer_sidecars, *, index=i):
+            events.append(("prepare_lookup", index))
+            assert peer_sidecars == (sidecar,)
+
+        def get_matches(request, num_computed_tokens, *, index=i):
+            events.append(("lookup", index))
+            return (7, False) if index != provider_index else (0, False)
+
+        connector.export_request_sidecar.side_effect = export_sidecar
+        connector.prepare_request_lookup.side_effect = prepare_lookup
+        connector.get_num_new_matched_tokens.side_effect = get_matches
+
+    assert mc.get_num_new_matched_tokens(request, 0) == (7, False)
+    assert events == [
+        ("export_sidecar", 0),
+        ("export_sidecar", 1),
+        ("prepare_lookup", 0),
+        ("prepare_lookup", 1),
+        ("lookup", 0),
+        ("lookup", 1),
+    ]
+
+
+@pytest.mark.skip_global_cleanup
+def test_request_sidecar_hooks_preserve_noop_connector_behavior(
+    mc: MultiConnector,
+) -> None:
+    request = MagicMock()
+    request.request_id = "request"
+    mc._connectors[0].get_num_new_matched_tokens.return_value = (3, False)
+    mc._connectors[1].get_num_new_matched_tokens.return_value = (5, True)
+
+    assert mc.get_num_new_matched_tokens(request, 0) == (3, False)
+    for connector in mc._connectors:
+        connector.prepare_request_lookup.assert_called_once_with(request, ())
+
+
+@pytest.mark.skip_global_cleanup
+def test_duplicate_request_sidecar_providers_are_rejected(mc: MultiConnector) -> None:
+    request = MagicMock()
+    request.request_id = "request"
+    for i, connector in enumerate(mc._connectors):
+        connector.export_request_sidecar.return_value = KVConnectorRequestSidecar(
+            "duplicate", i
+        )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "Duplicate request sidecar provider 'duplicate' at connector "
+            "indices 0 and 1"
+        ),
+    ):
+        mc.get_num_new_matched_tokens(request, 0)
+
+    for connector in mc._connectors:
+        connector.prepare_request_lookup.assert_not_called()
+        connector.get_num_new_matched_tokens.assert_not_called()
+
+
+@pytest.mark.skip_global_cleanup
+def test_peer_metadata_is_bound_after_own_metadata_and_cleared_with_it(
+    mc: MultiConnector,
+) -> None:
+    metadata = (KVConnectorMetadata(), KVConnectorMetadata())
+    multi_metadata = MultiKVConnectorMetadata(metadata)
+    events: list[tuple[str, int]] = []
+    own_metadata_bound = [False, False]
+
+    for i, connector in enumerate(mc._connectors):
+
+        def bind_own(connector_metadata, *, index=i):
+            events.append(("bind_own", index))
+            assert connector_metadata is metadata[index]
+            own_metadata_bound[index] = True
+
+        def bind_peers(peer_metadata, *, index=i):
+            events.append(("bind_peers", index))
+            assert all(own_metadata_bound)
+            assert peer_metadata == metadata
+
+        def clear_peers(*, index=i):
+            events.append(("clear_peers", index))
+
+        def clear_own(*, index=i):
+            events.append(("clear_own", index))
+
+        connector.bind_connector_metadata.side_effect = bind_own
+        connector.bind_peer_connector_metadata.side_effect = bind_peers
+        connector.clear_peer_connector_metadata.side_effect = clear_peers
+        connector.clear_connector_metadata.side_effect = clear_own
+
+    mc.bind_connector_metadata(multi_metadata)
+    assert mc.has_connector_metadata()
+    assert events == [
+        ("bind_own", 0),
+        ("bind_own", 1),
+        ("bind_peers", 0),
+        ("bind_peers", 1),
+    ]
+
+    mc.clear_connector_metadata()
+    assert not mc.has_connector_metadata()
+    assert events[4:] == [
+        ("clear_peers", 0),
+        ("clear_peers", 1),
+        ("clear_own", 0),
+        ("clear_own", 1),
+    ]
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("phase", ["own", "peer"])
+@pytest.mark.parametrize("failure_index", [0, 1])
+def test_metadata_bind_failure_rolls_back_every_child(
+    phase: str, failure_index: int
+) -> None:
+    MetadataProbeConnector.reset_probe()
+    connector = _probe_multi_connector()
+    metadata = (KVConnectorMetadata(), KVConnectorMetadata())
+    multi_metadata = MultiKVConnectorMetadata(metadata)
+    bind_error = RuntimeError(f"{phase} bind {failure_index} failed")
+    failure_name = ("first", "second")[failure_index]
+    MetadataProbeConnector.failure = (f"bind-{phase}", failure_name)
+    MetadataProbeConnector.failure_error = bind_error
+    MetadataProbeConnector.failure_remaining = 1
+
+    with pytest.raises(RuntimeError) as exc_info:
+        connector.bind_connector_metadata(multi_metadata)
+
+    assert exc_info.value is bind_error
+    assert not connector.has_connector_metadata()
+    for name in ("first", "second"):
+        assert ("clear-peer", name) in MetadataProbeConnector.events
+        assert ("clear-own", name) in MetadataProbeConnector.events
+        assert ("abort", name) in MetadataProbeConnector.events
+
+
+@pytest.mark.skip_global_cleanup
+def test_metadata_abort_failure_retains_only_failed_children() -> None:
+    MetadataProbeConnector.reset_probe()
+    connector = _probe_multi_connector()
+    metadata = MultiKVConnectorMetadata((KVConnectorMetadata(), KVConnectorMetadata()))
+    bind_error = RuntimeError("peer bind interrupted")
+    first_abort_error = SystemExit("first abort interrupted")
+    second_abort_error = KeyboardInterrupt("second abort interrupted")
+    retry_abort_error = KeyboardInterrupt("second abort retry interrupted")
+    MetadataProbeConnector.queued_failures = {
+        ("bind-peer", "second"): [bind_error],
+        ("abort", "first"): [first_abort_error],
+        ("abort", "second"): [second_abort_error, retry_abort_error],
+    }
+
+    with pytest.raises(RuntimeError) as exc_info:
+        connector.bind_connector_metadata(metadata)
+
+    assert exc_info.value is bind_error
+    assert not connector.has_connector_metadata()
+    assert MetadataProbeConnector.events.count(("abort", "second")) == 1
+    assert MetadataProbeConnector.events.count(("abort", "first")) == 1
+
+    MetadataProbeConnector.events = []
+    with pytest.raises(KeyboardInterrupt) as exc_info:
+        connector.abort_connector_metadata_transaction()
+
+    assert exc_info.value is retry_abort_error
+    assert MetadataProbeConnector.events == [
+        ("abort", "second"),
+        ("abort", "first"),
+    ]
+
+    MetadataProbeConnector.events = []
+    connector.abort_connector_metadata_transaction()
+    assert MetadataProbeConnector.events == [("abort", "second")]
+
+    MetadataProbeConnector.events = []
+    connector.abort_connector_metadata_transaction()
+    assert MetadataProbeConnector.events == []
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("phase", ["peer", "own"])
+@pytest.mark.parametrize("failure_index", [0, 1])
+def test_metadata_clear_attempts_every_cleanup_and_is_retryable(
+    phase: str, failure_index: int
+) -> None:
+    MetadataProbeConnector.reset_probe()
+    connector = _probe_multi_connector()
+    metadata = (KVConnectorMetadata(), KVConnectorMetadata())
+    multi_metadata = MultiKVConnectorMetadata(metadata)
+    cleanup_error: BaseException
+    if phase == "peer" and failure_index == 0:
+        cleanup_error = KeyboardInterrupt("peer cleanup interrupted")
+    else:
+        cleanup_error = RuntimeError(f"{phase} clear {failure_index} failed")
+    failure_name = ("first", "second")[failure_index]
+
+    connector.bind_connector_metadata(multi_metadata)
+    MetadataProbeConnector.events = []
+    MetadataProbeConnector.failure = (f"clear-{phase}", failure_name)
+    MetadataProbeConnector.failure_error = cleanup_error
+    MetadataProbeConnector.failure_remaining = 1
+    with pytest.raises(type(cleanup_error)) as exc_info:
+        connector.clear_connector_metadata()
+
+    assert exc_info.value is cleanup_error
+    assert not connector.has_connector_metadata()
+    for name in ("first", "second"):
+        assert MetadataProbeConnector.events.count(("clear-peer", name)) == 1
+        assert MetadataProbeConnector.events.count(("clear-own", name)) == 1
+
+    connector.clear_connector_metadata()
+    for name in ("first", "second"):
+        assert MetadataProbeConnector.events.count(("clear-peer", name)) == 2
+        assert MetadataProbeConnector.events.count(("clear-own", name)) == 2
+
+
+@pytest.mark.skip_global_cleanup
+def test_construction_failure_shuts_down_created_children_in_reverse() -> None:
+    ConstructionProbeConnector.reset_probe()
+    ConstructionProbeConnector.failure_remaining = 1
+    pending_before = MultiConnector.pending_construction_cleanup_count()
+
+    with pytest.raises(RuntimeError) as exc_info:
+        _probe_multi_connector(
+            "ConstructionProbeConnector", ("first", "second", "third")
+        )
+
+    assert exc_info.value is ConstructionProbeConnector.construction_error
+    assert exc_info.value.__cause__ is ConstructionProbeConnector.cleanup_error
+    assert ConstructionProbeConnector.events == [
+        ("construct", "first"),
+        ("construct", "second"),
+        ("construct", "third"),
+        ("shutdown", "second"),
+        ("shutdown", "first"),
+    ]
+    assert MultiConnector.pending_construction_cleanup_count() == pending_before + 1
+
+    MultiConnector.retry_failed_construction_cleanup()
+
+    assert ConstructionProbeConnector.events[-1] == ("shutdown", "second")
+    assert MultiConnector.pending_construction_cleanup_count() == pending_before
 
 
 # Helper function to compare directories recursively
@@ -462,7 +873,15 @@ def test_multi_example_connector_consistency():
 def _ignore_event_collection(events: list[str]) -> list[str]:
     # Filter out per-step polling hooks that the scheduler calls repeatedly
     # and which are not meaningful state transitions for these assertions.
-    ignored = {"get_kv_connector_stats", "has_pending_push_work", "take_events"}
+    ignored = {
+        "bind_peer_connector_metadata",
+        "clear_peer_connector_metadata",
+        "export_request_sidecar",
+        "get_kv_connector_stats",
+        "has_pending_push_work",
+        "prepare_request_lookup",
+        "take_events",
+    }
     return [event for event in events if event not in ignored]
 
 
@@ -583,6 +1002,33 @@ def test_multi_connector_handle_preemptions_integration():
 
 class TestMultiConnectorStats:
     """Tests for MultiConnector stats reconstruction and operations."""
+
+    @pytest.mark.skip_global_cleanup
+    def test_prometheus_projection_uses_serialized_child_payload(self):
+        """Project the same flattened payload sent from the worker."""
+        child_prom = MagicMock()
+        prom = MultiKVConnectorPromMetrics.__new__(MultiKVConnectorPromMetrics)
+        prom._prom_metrics = {"MockConnector": child_prom}
+        child = MockConnectorStats(data={"mock_field": [1, 2, 3]})
+        stats = MultiKVConnectorStats(data={"MockConnector": child})
+
+        prom.observe(stats.to_dict(), engine_idx=2)
+
+        child_prom.observe.assert_called_once_with(child.data, 2)
+
+    @pytest.mark.skip_global_cleanup
+    def test_prometheus_projection_after_stats_reconstruction(self):
+        """Logging reconstruction preserves the Prometheus payload."""
+        child_prom = MagicMock()
+        prom = MultiKVConnectorPromMetrics.__new__(MultiKVConnectorPromMetrics)
+        prom._prom_metrics = {"MockConnector": child_prom}
+        child = MockConnectorStats(data={"mock_field": [1, 2, 3]})
+        stats = MultiKVConnectorStats(data={"MockConnector": child})
+        restored = MultiConnector.build_kv_connector_stats(stats.to_dict())
+
+        prom.observe(restored.to_dict(), engine_idx=2)
+
+        child_prom.observe.assert_called_once_with(child.data, 2)
 
     def test_build_kv_connector_stats_with_none(self):
         """Test that build_kv_connector_stats returns empty stats when given None."""
@@ -981,9 +1427,13 @@ def test_multi_connector_overrides_all_base_methods():
     # TODO(https://github.com/vllm-project/vllm/pull/31811): Remove
     # get_kv_connector_kv_cache_events from INHERITED_OK once implemented.
     INHERITED_OK = {
+        "bind_peer_connector_metadata",
+        "clear_peer_connector_metadata",
+        "export_request_sidecar",
         "role",
         "has_connector_metadata",
         "get_kv_connector_kv_cache_events",
+        "prepare_request_lookup",
     }
 
     base_members = {

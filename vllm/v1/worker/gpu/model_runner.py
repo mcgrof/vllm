@@ -1217,15 +1217,54 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if (idx := self.req_states.req_id_to_index.get(req_id)) is not None:
                 self.block_tables.append_block_ids(idx, block_ids, overwrite=True)
         num_computed_tokens_np = self.req_states.num_computed_tokens_np
-        for req_id, num_computed_tokens, req_new_block_ids in zip(
-            reqs.req_ids, reqs.num_computed_tokens, reqs.new_block_ids
+        rewound_context_outputs = False
+        for (
+            req_id,
+            num_computed_tokens,
+            num_output_tokens,
+            req_new_block_ids,
+        ) in zip(
+            reqs.req_ids,
+            reqs.num_computed_tokens,
+            reqs.num_output_tokens,
+            reqs.new_block_ids,
         ):
             req_index = self.req_states.req_id_to_index[req_id]
+            previous_num_computed_tokens = num_computed_tokens_np[req_index]
+            if (
+                not self.scheduler_config.async_scheduling
+                and num_output_tokens == 0
+                and num_computed_tokens < previous_num_computed_tokens
+            ):
+                # The scheduler can rewind a cached request after a synchronous
+                # KV-load failure. postprocess_sampled() has already advanced
+                # the GPU-owned frontier optimistically, so repair it before
+                # prepare_inputs() reads it.
+                self.req_states.num_computed_tokens.stage_write_elem(
+                    req_index, num_computed_tokens
+                )
+
+                # Context-phase recovery discarded the optimistic sample.
+                # Make its token and sampling side effects unreachable; the
+                # stale all_token_ids suffix is overwritten by the next
+                # accepted sample at prefill_len.
+                prefill_len = int(self.req_states.prefill_len.np[req_index])
+                self.req_states.total_len.stage_write_elem(req_index, prefill_len)
+                self.req_states.last_sampled_tokens[req_index].zero_()
+                self.req_states.draft_tokens[req_index].zero_()
+                if self.sampler is not None:
+                    self.sampler.penalties_state.output_bin_counts[req_index].zero_()
+                rewound_context_outputs = True
+
             num_computed_tokens_np[req_index] = num_computed_tokens
             if req_new_block_ids is not None and req_id not in table_updates:
                 self.block_tables.append_block_ids(
                     req_index, req_new_block_ids, overwrite=False
                 )
+
+        if rewound_context_outputs:
+            self.req_states.num_computed_tokens.apply_write()
+            self.req_states.total_len.apply_write()
 
         # Update CPU num_computed_prefill_tokens.
         np.minimum(
