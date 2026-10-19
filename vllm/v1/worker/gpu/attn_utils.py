@@ -325,6 +325,38 @@ def _reshape_kv_cache(
                     kv_cache_spec.v_dtype is not None
                     and kv_cache_spec.v_dtype != kv_cache_spec.dtype
                 ):
+                    # Region splits require exclusive, tightly packed storage.
+                    # Hybrid groups can reuse physical pages across attention
+                    # and recurrent layers; splitting across those pages would
+                    # violate the scheduler's ownership of individual pages.
+                    if (
+                        packing is not None
+                        or kv_cache_spec.page_size_padded is not None
+                    ):
+                        raise NotImplementedError(
+                            "Asymmetric K/V region splits do not support packed "
+                            "or padded cache pages."
+                        )
+                    if (
+                        kv_cache_spec.block_size != kernel_block_size
+                        or kv_cache_spec.storage_block_size != kernel_block_size
+                    ):
+                        raise NotImplementedError(
+                            "Asymmetric K/V region splits require identical "
+                            "scheduler, storage and kernel block sizes."
+                        )
+                    raw_storage = kv_raw_tensor.untyped_storage().data_ptr()
+                    if any(
+                        other != layer_name
+                        and other not in shared_kv_cache_layers
+                        and tensor.device == kv_raw_tensor.device
+                        and tensor.untyped_storage().data_ptr() == raw_storage
+                        for other, tensor in kv_cache_raw_tensors.items()
+                    ):
+                        raise NotImplementedError(
+                            "Asymmetric K/V region splits do not support "
+                            "physical backing shared by independent layers."
+                        )
                     # The split below materializes NHD-shaped tensors.
                     if (envs.VLLM_KV_CACHE_LAYOUT or "NHD") != "NHD":
                         raise NotImplementedError(

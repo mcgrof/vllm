@@ -225,5 +225,28 @@ def test_symmetric_kv_cache_reshape_preserves_legacy_contract():
     assert out.shape[1] == 2
 
 
+@pytest.mark.parametrize("layout", ["subdivided", "padded", "packed", "shared"])
+def test_asym_rejects_cache_layouts_with_different_page_ownership(layout):
+    spec = FullAttentionSpec(
+        block_size=BLOCK_SIZE * (2 if layout == "subdivided" else 1),
+        num_kv_heads=NUM_KV_HEADS,
+        head_size=HEAD_SIZE,
+        dtype=torch.float16,
+        v_dtype=torch.float8_e4m3fn,
+        page_size_padded=65536 if layout == "padded" else None,
+    )
+    cfg, raw_tensors = _build_kv_cache_config(spec)
+    if layout == "packed":
+        cfg.kv_cache_tensors[0].block_stride = spec.page_size_bytes
+    if layout == "shared":
+        # A distinct view can still alias another group's physical backing.
+        raw_tensors["model.layers.1.linear_attn"] = raw_tensors[LAYER].view(-1)
+    raw_tensors[LAYER].fill_(0x33)
+    before = raw_tensors[LAYER].clone()
+    with pytest.raises(NotImplementedError, match="Asymmetric K/V region splits"):
+        _reshape(cfg, spec, raw_tensors)
+    assert torch.equal(raw_tensors[LAYER], before)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
