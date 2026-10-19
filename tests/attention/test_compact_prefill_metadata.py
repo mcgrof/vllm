@@ -159,7 +159,8 @@ def test_subset_preserves_fallbacks_and_rejects_bad_metadata():
     )
 
 
-def test_production_metadata_branch_slices_actual_source_ids(monkeypatch):
+@pytest.mark.parametrize("shape", [(32, 8, 128), (40, 10, 128), (16, 4, 256)])
+def test_production_metadata_branch_slices_actual_source_ids(monkeypatch, shape):
     """Execute the builder's compact branch with real CPU metadata tensors."""
     import ast
     from types import SimpleNamespace
@@ -195,6 +196,7 @@ def test_production_metadata_branch_slices_actual_source_ids(monkeypatch):
     )
     calls = []
     compact = SimpleNamespace(
+        geometry=metadata.select_geometry(*shape),
         calls=__import__("collections").Counter(),
         plan=lambda *args, **kw: calls.append((args, kw)),
     )
@@ -209,9 +211,9 @@ def test_production_metadata_branch_slices_actual_source_ids(monkeypatch):
         q_data_type_prefill=torch.float16,
         model_config=SimpleNamespace(dtype=torch.float16),
         page_size=16,
-        num_qo_heads=32,
-        num_kv_heads=8,
-        head_dim=128,
+        num_qo_heads=shape[0],
+        num_kv_heads=shape[1],
+        head_dim=shape[2],
         window_left=-1,
         logits_soft_cap=None,
         has_sinks=False,
@@ -252,6 +254,10 @@ def test_production_metadata_branch_slices_actual_source_ids(monkeypatch):
     assert attn.prefill.source_indices.tolist() == [0, 79, 3, 79, 0]
     assert torch.equal(ptr, original)
     assert args[0] is attn.prefill.compact_plan and attn.prefill.compact is compact
+    owner.head_dim = 64
+    env["production"]()
+    assert len(calls) == 1
+    assert compact.calls["batch_unsupported_geometry"] == 1
 
 
 def test_workspace_lifetime_guards_and_output_placement():
@@ -339,3 +345,30 @@ def test_workspace_lifetime_guards_and_output_placement():
     env["out_prefill"].fill_(9)
     assert torch.equal(out[:3], torch.full_like(out[:3], -1))
     assert torch.equal(out[3:], torch.full_like(out[3:], 9))
+
+
+@pytest.mark.parametrize(
+    "shape,payload_mib",
+    [((32, 8, 128), 256), ((40, 10, 128), 320), ((16, 4, 256), 256)],
+)
+def test_geometry_payload_and_gather_coordinates(shape, payload_mib):
+    """Every flattened tile element maps to one valid source coordinate."""
+    geometry = metadata.select_geometry(*shape)
+    assert geometry.payload_bytes == payload_mib * 2**20
+    coordinates = [
+        (
+            x // (geometry.kv_heads * geometry.head_dim),
+            (x // geometry.head_dim) % geometry.kv_heads,
+            x % geometry.head_dim,
+        )
+        for x in range(geometry.page_elements)
+    ]
+    assert len(set(coordinates)) == 16 * shape[1] * shape[2]
+    assert coordinates[0] == (0, 0, 0)
+    assert coordinates[-1] == (15, shape[1] - 1, shape[2] - 1)
+
+
+@pytest.mark.parametrize("shape", [(32, 8, 64), (16, 8, 256), (16, 1, 512)])
+def test_unqualified_geometries_remain_closed(shape):
+    with pytest.raises(ValueError, match="unsupported"):
+        metadata.select_geometry(*shape)

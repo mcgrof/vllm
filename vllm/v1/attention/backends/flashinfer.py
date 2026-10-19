@@ -1494,9 +1494,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         and self.q_data_type_prefill == torch.float16
                         and self.model_config.dtype == torch.float16
                         and self.page_size == 16
-                        and self.num_qo_heads == 32
-                        and self.num_kv_heads == 8
-                        and self.head_dim == 128
+                        and self.num_qo_heads == compact.geometry.query_heads
+                        and self.num_kv_heads == compact.geometry.kv_heads
+                        and self.head_dim == compact.geometry.head_dim
                         and self.window_left == -1
                         and not self.logits_soft_cap
                         and not self.has_sinks

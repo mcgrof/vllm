@@ -13,10 +13,10 @@ from flashinfer import BatchPrefillWithPagedKVCacheWrapper
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.compact_prefill_metadata import (
     MAX_PAGES,
-    PAGE_ELEMENTS,
     PAGE_SIZE,
-    PAYLOAD_BYTES,
+    CompactGeometry,
     CompactPagePlan,
+    select_geometry,
 )
 
 
@@ -36,34 +36,41 @@ def _gather(
     VS2: tl.constexpr,
     VS3: tl.constexpr,
     ELEMENTS: tl.constexpr,
+    KV_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     page = tl.program_id(0)
     x = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     src = tl.load(IDs + page).to(tl.int64)
-    token, head, dim = x // 1024, (x // 128) % 8, x % 128
-    k = tl.load(K + src * KS0 + token * KS1 + head * KS2 + dim * KS3)
-    v = tl.load(V + src * VS0 + token * VS1 + head * VS2 + dim * VS3)
-    tl.store(DK + page * ELEMENTS + x, k)
-    tl.store(DV + page * ELEMENTS + x, v.to(tl.float16))
+    token = x // (KV_HEADS * HEAD_DIM)
+    head, dim = (x // HEAD_DIM) % KV_HEADS, x % HEAD_DIM
+    mask = x < ELEMENTS
+    k = tl.load(K + src * KS0 + token * KS1 + head * KS2 + dim * KS3, mask=mask)
+    v = tl.load(V + src * VS0 + token * VS1 + head * VS2 + dim * VS3, mask=mask)
+    tl.store(DK + page * ELEMENTS + x, k, mask=mask)
+    tl.store(DV + page * ELEMENTS + x, v.to(tl.float16), mask=mask)
 
 
 class CompactPrefillWorkspace:
     """One worker owns this storage and submits all accesses on one stream."""
 
-    def __init__(self, device):
+    def __init__(self, device, geometry: CompactGeometry | None = None):
+        self.geometry = geometry = geometry or select_geometry(32, 8, 128)
         self.backing = torch.empty(
-            PAYLOAD_BYTES // 2, dtype=torch.float16, device=device
+            geometry.payload_bytes // 2, dtype=torch.float16, device=device
         )
-        self.k, self.v = self.backing.view(2, MAX_PAGES, PAGE_SIZE, 8, 128).unbind(0)
+        self.k, self.v = self.backing.view(
+            2, MAX_PAGES, PAGE_SIZE, geometry.kv_heads, geometry.head_dim
+        ).unbind(0)
         self.indices = torch.arange(MAX_PAGES, dtype=torch.int32, device=device)
         self.float_workspace = torch.empty(32 * 2**20, dtype=torch.uint8, device=device)
         self.wrapper = BatchPrefillWithPagedKVCacheWrapper(
             self.float_workspace, "NHD", backend="fa3"
         )
         self._lock = threading.Lock()
-        self._stream = None
-        self._thread = None
+        self._stream: int | None = None
+        self._thread: int | None = None
         self.calls: Counter[str] = Counter()
         self.queries = self.read_pages = 0
         self.last_plan: CompactPagePlan | None = None
@@ -97,9 +104,9 @@ class CompactPrefillWorkspace:
                 paged_kv_indptr=indptr,
                 paged_kv_indices=self.indices[: page_plan.pages],
                 paged_kv_last_page_len=tails,
-                num_qo_heads=32,
-                num_kv_heads=8,
-                head_dim_qk=128,
+                num_qo_heads=self.geometry.query_heads,
+                num_kv_heads=self.geometry.kv_heads,
+                head_dim_qk=self.geometry.head_dim,
                 page_size=PAGE_SIZE,
                 causal=True,
                 q_data_type=torch.float16,
@@ -115,12 +122,17 @@ class CompactPrefillWorkspace:
         k, v = cache
         if k.dtype != torch.float16 or v.dtype != torch.float8_e4m3fn:
             raise RuntimeError("compact prefill requires stored K16/V8")
-        if k.shape != v.shape or tuple(k.shape[1:]) != (PAGE_SIZE, 8, 128):
+        if k.shape != v.shape or tuple(k.shape[1:]) != (
+            PAGE_SIZE,
+            self.geometry.kv_heads,
+            self.geometry.head_dim,
+        ):
             raise RuntimeError("compact prefill requires matching NHD cache planes")
         n = source_indices.numel()
         if not 0 < n <= MAX_PAGES:
             raise RuntimeError("compact prefill page budget exceeded")
-        _gather[(n, PAGE_ELEMENTS // 4096)](
+        elements = self.geometry.page_elements
+        _gather[(n, triton.cdiv(elements, 4096))](
             k,
             v,
             source_indices,
@@ -128,7 +140,9 @@ class CompactPrefillWorkspace:
             self.v,
             *k.stride(),
             *v.stride(),
-            ELEMENTS=PAGE_ELEMENTS,
+            ELEMENTS=elements,
+            KV_HEADS=self.geometry.kv_heads,
+            HEAD_DIM=self.geometry.head_dim,
             BLOCK=4096,
             num_warps=8,
         )
@@ -147,6 +161,11 @@ class CompactPrefillWorkspace:
 
     def receipt(self):
         return {
+            "geometry": {
+                "query_heads": self.geometry.query_heads,
+                "kv_heads": self.geometry.kv_heads,
+                "head_dim": self.geometry.head_dim,
+            },
             "calls": dict(self.calls),
             "total_queries": self.queries,
             "read_pages": self.read_pages,
@@ -156,7 +175,7 @@ class CompactPrefillWorkspace:
             "compact_index_bytes": self.indices.numel() * self.indices.element_size(),
             "active_payload_bytes": 0
             if self.last_plan is None
-            else self.last_plan.pages * PAGE_ELEMENTS * 4,
+            else self.last_plan.pages * self.geometry.page_elements * 4,
             "stream": self._stream,
             "submission_thread": self._thread,
             "allocation_before_KV_profile": self.allocation_before_profile,
@@ -177,8 +196,13 @@ def initialize_workspace(config, device):
         raise ValueError("compact prefill requires TP1 and one worker stream")
     workspace = getattr(config, "_compact_prefill_workspace", None)
     if workspace is None:
+        geometry = select_geometry(
+            config.model_config.get_num_attention_heads(parallel),
+            config.model_config.get_num_kv_heads(parallel),
+            config.model_config.get_head_size(),
+        )
         before = torch.accelerator.memory_allocated(device)
-        workspace = CompactPrefillWorkspace(device)
+        workspace = CompactPrefillWorkspace(device, geometry)
         workspace.allocation_before_profile = {
             "allocated_before": before,
             "allocated_after": torch.accelerator.memory_allocated(device),

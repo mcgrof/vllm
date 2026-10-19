@@ -13,6 +13,32 @@ PAYLOAD_BYTES = 2 * PLANE_BYTES
 
 
 @dataclass(frozen=True)
+class CompactGeometry:
+    query_heads: int
+    kv_heads: int
+    head_dim: int
+
+    @property
+    def page_elements(self) -> int:
+        return PAGE_SIZE * self.kv_heads * self.head_dim
+
+    @property
+    def payload_bytes(self) -> int:
+        return MAX_PAGES * self.page_elements * 4
+
+
+def select_geometry(query_heads: int, kv_heads: int, head_dim: int) -> CompactGeometry:
+    geometry = CompactGeometry(query_heads, kv_heads, head_dim)
+    if (query_heads, kv_heads, head_dim) not in (
+        (32, 8, 128),  # Qwen3-8B
+        (40, 10, 128),  # Phi-4
+        (16, 4, 256),  # Qwen3.5-9B full-attention layers
+    ):
+        raise ValueError("unsupported compact prefill geometry")
+    return geometry
+
+
+@dataclass(frozen=True)
 class CompactPagePlan:
     query_lengths: tuple[int, ...]
     page_indptr: tuple[int, ...]
