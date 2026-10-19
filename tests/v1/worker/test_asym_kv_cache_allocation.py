@@ -225,8 +225,7 @@ def test_symmetric_kv_cache_reshape_preserves_legacy_contract():
     assert out.shape[1] == 2
 
 
-@pytest.mark.parametrize("layout", ["subdivided", "padded", "packed", "shared"])
-def test_asym_rejects_cache_layouts_with_different_page_ownership(layout):
+def _assert_asym_rejects_layout(layout):
     spec = FullAttentionSpec(
         block_size=BLOCK_SIZE * (2 if layout == "subdivided" else 1),
         num_kv_heads=NUM_KV_HEADS,
@@ -246,6 +245,22 @@ def test_asym_rejects_cache_layouts_with_different_page_ownership(layout):
     with pytest.raises(NotImplementedError, match="Asymmetric K/V region splits"):
         _reshape(cfg, spec, raw_tensors)
     assert torch.equal(raw_tensors[LAYER], before)
+
+
+def test_asym_rejects_subdivided_pages():
+    _assert_asym_rejects_layout("subdivided")
+
+
+def test_asym_rejects_padded_pages():
+    _assert_asym_rejects_layout("padded")
+
+
+def test_asym_rejects_packed_pages():
+    _assert_asym_rejects_layout("packed")
+
+
+def test_asym_rejects_shared_backing():
+    _assert_asym_rejects_layout("shared")
 
 
 if __name__ == "__main__":
