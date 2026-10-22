@@ -183,6 +183,7 @@ def _reshape_cache_per_token_head(
     QUANT_MAX: tl.constexpr = 127.0,
     QUANT_MIN: tl.constexpr = -128.0,
     IS_INT_QUANT: tl.constexpr = False,
+    REFERENCE_FP8: tl.constexpr = False,
 ):
     tok = tl.program_id(0)
     head = tl.program_id(1)
@@ -204,7 +205,12 @@ def _reshape_cache_per_token_head(
         other=0.0,
     ).to(tl.float32)
 
-    k_scale = tl.maximum(tl.max(tl.abs(k_h)) / QUANT_MAX, 1e-6)
+    if REFERENCE_FP8:
+        tl.static_assert(QUANT_MAX == 448.0 and not IS_INT_QUANT)
+        # Match the FP32 reciprocal multiply used by a scalar Torch /448.
+        k_scale = tl.maximum(tl.max(tl.abs(k_h)), 1e-12) * 0.0022321429569274187
+    else:
+        k_scale = tl.maximum(tl.max(tl.abs(k_h)) / QUANT_MAX, 1e-6)
     tl.store(
         k_scale_cache_ptr
         + blk * stride_ks_blk
@@ -213,7 +219,7 @@ def _reshape_cache_per_token_head(
         k_scale,
     )
 
-    k_q = k_h * (1.0 / k_scale)
+    k_q = tl.div_rn(k_h, k_scale) if REFERENCE_FP8 else k_h * (1.0 / k_scale)
     if IS_INT_QUANT:
         # Round half away from zero before the int8 store truncates.
         k_q = tl.where(k_q >= 0, k_q + 0.5, k_q - 0.5)
@@ -236,7 +242,10 @@ def _reshape_cache_per_token_head(
         other=0.0,
     ).to(tl.float32)
 
-    v_scale = tl.maximum(tl.max(tl.abs(v_h)) / QUANT_MAX, 1e-6)
+    if REFERENCE_FP8:
+        v_scale = tl.maximum(tl.max(tl.abs(v_h)), 1e-12) * 0.0022321429569274187
+    else:
+        v_scale = tl.maximum(tl.max(tl.abs(v_h)) / QUANT_MAX, 1e-6)
     tl.store(
         v_scale_cache_ptr
         + blk * stride_vs_blk
@@ -245,7 +254,7 @@ def _reshape_cache_per_token_head(
         v_scale,
     )
 
-    v_q = v_h * (1.0 / v_scale)
+    v_q = tl.div_rn(v_h, v_scale) if REFERENCE_FP8 else v_h * (1.0 / v_scale)
     if IS_INT_QUANT:
         # Round half away from zero before the int8 store truncates.
         v_q = tl.where(v_q >= 0, v_q + 0.5, v_q - 0.5)
@@ -278,6 +287,8 @@ def triton_reshape_and_cache_flash_per_token_head_quant(
     v_scale_cache: torch.Tensor,  # [num_blocks, block_size, num_kv_heads] float32
     slot_mapping: torch.Tensor,  # [num_tokens]
     kv_quant_mode: KVQuantMode,
+    *,
+    reference_fp8: bool = False,
 ):
     """Quantize key/value per (token, head) and write to paged cache.
 
@@ -288,7 +299,16 @@ def triton_reshape_and_cache_flash_per_token_head_quant(
     INT4 needs sub-byte packing + a Hadamard rotation, so it is handled by
     its own kernel; INT8 / FP8 share this kernel, with the quantization
     range (QUANT_MAX, QUANT_MIN) derived from the cache tensor dtype.
+
+    The opt-in E4M3 reference policy clamps absmax to 1e-12, multiplies by
+    FP32(1/448), and uses precise division before clipping and conversion.
     """
+    if reference_fp8 and (
+        kv_quant_mode != KVQuantMode.FP8_PER_TOKEN_HEAD
+        or key_cache.dtype != torch.float8_e4m3fn
+        or value_cache.dtype != torch.float8_e4m3fn
+    ):
+        raise ValueError("Reference per-token/head quantization requires FP8 E4M3FN")
     if kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
         from vllm.v1.attention.ops.int4_per_token_head import (
             reshape_and_cache_int4,
@@ -356,6 +376,7 @@ def triton_reshape_and_cache_flash_per_token_head_quant(
         QUANT_MAX=quant_max,
         QUANT_MIN=quant_min,
         IS_INT_QUANT=cache_dtype == torch.int8,
+        REFERENCE_FP8=reference_fp8,
         num_warps=num_warps,
     )
 

@@ -531,6 +531,14 @@ class TritonAttentionImpl(AttentionImpl):
 
         self._kv_quant_mode = get_kv_quant_mode(kv_cache_dtype)
         self._is_per_token_head_quant = self._kv_quant_mode.is_per_token_head
+        self.reference_fp8_per_token_head = envs.VLLM_FP8_PER_TOKEN_HEAD_REFERENCE
+        if self.reference_fp8_per_token_head and (
+            self._kv_quant_mode != KVQuantMode.FP8_PER_TOKEN_HEAD
+            or self.fp8_dtype != torch.float8_e4m3fn
+        ):
+            raise ValueError(
+                "Reference per-token/head quantization requires FP8 E4M3FN"
+            )
 
         # Enable tensor descriptors for Q/K/V load/store on platforms that
         # benefit from HW 2D block reads (Intel Xe2/Xe3).  The dead branch
@@ -778,6 +786,7 @@ class TritonAttentionImpl(AttentionImpl):
                 v_scale_cache,
                 slot_mapping,
                 kv_quant_mode=self._kv_quant_mode,
+                reference_fp8=self.reference_fp8_per_token_head,
             )
             return
         # For decoder and cross-attention, use KV cache as before.
