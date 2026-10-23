@@ -522,6 +522,97 @@ def _captured_serial_pic_sidecars(
     return _SerialPICAdapterProbe.prepared_sidecars[request.request_id]
 
 
+@pytest.mark.parametrize("proof", ["missing", "failed", "valid"])
+def test_handoff_proof_precedes_kmesh_arming(
+    monkeypatch: pytest.MonkeyPatch,
+    serial_pic_connector: Callable[..., MultiConnector],
+    proof: str,
+) -> None:
+    """A named child cannot authorize recovery without its current proof."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_connector import (
+        LMCacheConnectorV1,
+    )
+
+    connector = serial_pic_connector()
+    events: list[str] = []
+    validate = LMCacheConnectorV1.validate_kmesh_handoff_contract
+    arm = KMeshConnector.arm_serial_pic_v1
+
+    def prove(child: LMCacheConnectorV1) -> None:
+        events.append("proof")
+        if proof == "failed":
+            raise RuntimeError("handoff refused")
+        validate(child)
+
+    def arm_after_proof(child: KMeshConnector) -> None:
+        events.append("arm")
+        arm(child)
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(KMeshConnector, "arm_serial_pic_v1", arm_after_proof)
+            patch.setattr(
+                LMCacheConnectorV1,
+                "validate_kmesh_handoff_contract",
+                None if proof == "missing" else prove,
+            )
+            request = _request("handoff", _context("handoff"))
+            if proof == "missing":
+                with pytest.raises(ValueError, match="validate_kmesh_handoff_contract"):
+                    connector.on_new_request(request)
+            elif proof == "failed":
+                with pytest.raises(RuntimeError, match="handoff refused"):
+                    connector.on_new_request(request)
+            else:
+                connector.on_new_request(request)
+        if proof == "valid":
+            assert "proof" in events
+            assert events.index("proof") < events.index("arm")
+        else:
+            assert "arm" not in events
+    finally:
+        connector.shutdown()
+
+
+@pytest.mark.parametrize("proof", ["missing", "failed"])
+def test_construction_refuses_unproven_handoff_and_releases_children(
+    monkeypatch: pytest.MonkeyPatch,
+    serial_pic_connector: Callable[..., MultiConnector],
+    proof: str,
+) -> None:
+    from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_connector import (
+        LMCacheConnectorV1,
+    )
+
+    shutdown = []
+    monkeypatch.setattr(
+        _SerialPICAdapterProbe, "shutdown", lambda self: shutdown.append("child")
+    )
+    arm = []
+    monkeypatch.setattr(
+        KMeshConnector, "arm_serial_pic_v1", lambda self: arm.append(True)
+    )
+
+    def reject(child: LMCacheConnectorV1) -> None:
+        raise RuntimeError("handoff refused")
+
+    monkeypatch.setattr(
+        LMCacheConnectorV1,
+        "validate_kmesh_handoff_contract",
+        None if proof == "missing" else reject,
+    )
+    error = ValueError if proof == "missing" else RuntimeError
+    message = (
+        "validate_kmesh_handoff_contract" if proof == "missing" else "handoff refused"
+    )
+    debt_before = MultiConnector.pending_construction_cleanup_count()
+    with pytest.raises(error, match=message):
+        serial_pic_connector()
+    assert shutdown == ["child"]
+    assert arm == []
+    assert MultiConnector.pending_construction_cleanup_count() == debt_before
+
+
 def test_factory_registers_kmesh_connector() -> None:
     assert (
         KVConnectorFactory.get_connector_class_by_name("KMeshConnector")

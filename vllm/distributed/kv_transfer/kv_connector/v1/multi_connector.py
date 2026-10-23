@@ -240,6 +240,7 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
                 vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
                 or self._all_support_hma
             ), "HMA should not be enabled unless all sub-connectors support it"
+            self._validate_target_profile_runtime(arm=False)
         except BaseException as construction_error:
             cleanup_errors: list[BaseException] = []
             for connector in reversed(self._connectors):
@@ -311,11 +312,24 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         profile = validate_kmesh_target_profile(self._vllm_config)
         if profile != self._kmesh_target_profile:
             raise ValueError("KMesh target profile drifted after construction")
+        if len(self._connectors) != 2:
+            raise ValueError(f"KMesh {profile} requires exactly two child connectors")
+        lmcache_child = self._connectors[1]
+        handoff_contract = getattr(
+            lmcache_child, "validate_kmesh_handoff_contract", None
+        )
+        if not callable(handoff_contract):
+            raise ValueError(
+                f"KMesh {profile} requires the LMCache child to implement "
+                "validate_kmesh_handoff_contract; "
+                f"{type(lmcache_child).__name__} does not provide it"
+            )
         for connector in self._connectors:
             connector.validate_shared_vllm_config(
                 self._vllm_config, _KMESH_TARGET_PROFILE_SHARED_CONFIG_FIELDS
             )
             connector.validate_runtime_profile(self._vllm_config)
+        handoff_contract()
         if not arm:
             return
         kmesh_child = self._connectors[0]
@@ -425,6 +439,14 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
                     "LMCacheConnectorV1": lmcache_connector.LMCacheConnectorV1,
                 }
                 connector_name = cast(str, temp_config.kv_transfer_config.kv_connector)
+                if connector_name == "LMCacheMPConnector":
+                    from vllm.distributed.kv_transfer.kv_connector.v1 import (
+                        lmcache_mp_connector,
+                    )
+
+                    expected_classes[connector_name] = (
+                        lmcache_mp_connector.LMCacheMPConnector
+                    )
                 if connector_cls is not expected_classes.get(connector_name):
                     raise ValueError(
                         "KMesh target profile requires the exact built-in "

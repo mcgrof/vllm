@@ -24,6 +24,9 @@ KMESH_COLLECTIVE_BATCHED_POSITION_RECOVERY_V1_PROFILE = (
     "collective_batched_position_recovery_v1"
 )
 KMESH_COLLECTIVE_BATCHED_QKV_V1_PROFILE = "collective_batched_qkv_v1"
+KMESH_ADMITTED_LMCACHE_CHILD_CONNECTORS = frozenset(
+    {"LMCacheConnectorV1", "LMCacheMPConnector"}
+)
 KMESH_SERIAL_PIC_V1_MODEL_REVISION = "7ae557604adf67be50417f59c2c2f167def9a775"
 KMESH_SERIAL_PIC_V1_MODEL_PATH = (
     "/scratch/hf/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/"
@@ -945,8 +948,15 @@ def validate_lmcache_target_profile_child_runtime(vllm_config: VllmConfig) -> st
     profile = _revalidate_kmesh_target_profile_child_qualification(vllm_config)
     kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
     _reject_retired_kv_transfer_fields(kv_transfer_config, profile)
+    child_connector = getattr(kv_transfer_config, "kv_connector", None)
+    if (
+        type(child_connector) is not str
+        or child_connector not in KMESH_ADMITTED_LMCACHE_CHILD_CONNECTORS
+    ):
+        raise _target_profile_error(
+            profile, "an admitted LMCache child connector", child_connector
+        )
     for field, expected, requirement in (
-        ("kv_connector", "LMCacheConnectorV1", "LMCache child connector identity"),
         ("kv_connector_module_path", None, "LMCache child module path unset"),
         ("kv_buffer_device", "cuda", "LMCache child kv_buffer_device='cuda'"),
         ("kv_role", "kv_both", "LMCache child kv_role='kv_both'"),
@@ -1148,11 +1158,17 @@ def validate_kmesh_target_profile(vllm_config: VllmConfig) -> str | None:
     ):
         raise profile_error("string-keyed connector mappings", connectors)
     connector_names = tuple(connector.get("kv_connector") for connector in connectors)
-    require(
-        connector_names,
-        ("KMeshConnector", "LMCacheConnectorV1"),
-        "connector order [KMeshConnector, LMCacheConnectorV1]",
-    )
+    if not all(
+        type(name) is str for name in connector_names
+    ) or connector_names not in {
+        ("KMeshConnector", child) for child in KMESH_ADMITTED_LMCACHE_CHILD_CONNECTORS
+    }:
+        raise profile_error(
+            "connector order [KMeshConnector, "
+            + "|".join(sorted(KMESH_ADMITTED_LMCACHE_CHILD_CONNECTORS))
+            + "]",
+            connector_names,
+        )
 
     for index, connector in enumerate(connectors):
         admitted_child_fields = {

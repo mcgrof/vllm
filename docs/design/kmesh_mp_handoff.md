@@ -1,7 +1,9 @@
 # KMesh multiprocess handoff admission
 
-Status: proposed engine boundary. The existing in-process position-recovery
-profiles are separate from ordinary multiprocess LMCache prefix caching.
+Status: inspection and refusal are implemented. CPU constructor and arming
+controls cover both MP implementations; CUDA configuration qualification is
+separate. The existing in-process position-recovery profiles are separate from
+ordinary multiprocess LMCache prefix caching.
 
 Two prompts can contain the same update after different private histories.
 KMesh can describe that update explicitly, but recognizing an MP connector name

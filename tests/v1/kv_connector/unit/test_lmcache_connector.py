@@ -10,6 +10,7 @@ import pytest
 from vllm.config import KVTransferConfig
 from vllm.distributed.kv_events import BlockStored
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRequestSidecar,
     KVConnectorRole,
@@ -20,6 +21,67 @@ from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_connector import (
     LMCacheKVEvents,
 )
 from vllm.v1.outputs import KVConnectorOutput
+
+
+@pytest.mark.parametrize("role", [KVConnectorRole.SCHEDULER, KVConnectorRole.WORKER])
+@pytest.mark.parametrize(
+    "profile", ["serial_pic_v1", "collective_lockstep_v1", "", False]
+)
+def test_builtin_mp_refuses_kmesh_before_allocating_resources(
+    monkeypatch: pytest.MonkeyPatch, role: KVConnectorRole, profile: object
+) -> None:
+    pytest.importorskip("lmcache")
+    from vllm.distributed.kv_transfer.kv_connector.v1 import lmcache_mp_connector as mp
+
+    base_init = MagicMock(side_effect=AssertionError("base initialized"))
+    scheduler = MagicMock(side_effect=AssertionError("scheduler initialized"))
+    worker = MagicMock(side_effect=AssertionError("worker initialized"))
+    monkeypatch.setattr(KVConnectorBase_V1, "__init__", base_init)
+    monkeypatch.setattr(mp, "create_scheduler_adapter", scheduler)
+    monkeypatch.setattr(mp, "create_worker_adapter", worker)
+    config = SimpleNamespace(
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="LMCacheMPConnector",
+            kv_role="kv_both",
+            kv_connector_extra_config={"kmesh_target_profile": profile},
+        )
+    )
+    with pytest.raises(NotImplementedError, match="does not provide a qualified"):
+        mp.LMCacheMPConnectorUpstream(config, role, MagicMock())
+    base_init.assert_not_called()
+    scheduler.assert_not_called()
+    worker.assert_not_called()
+
+
+@pytest.mark.parametrize("role", [KVConnectorRole.SCHEDULER, KVConnectorRole.WORKER])
+def test_unprofiled_builtin_mp_constructs_but_refuses_kmesh_proof(
+    monkeypatch: pytest.MonkeyPatch, role: KVConnectorRole
+) -> None:
+    pytest.importorskip("lmcache")
+    from vllm.distributed.kv_transfer.kv_connector.v1 import lmcache_mp_connector as mp
+
+    base_init = MagicMock(return_value=None)
+    scheduler = MagicMock()
+    worker = MagicMock()
+    monkeypatch.setattr(KVConnectorBase_V1, "__init__", base_init)
+    monkeypatch.setattr(
+        mp.LMCacheMPConnectorUpstream, "role", property(lambda self: role)
+    )
+    monkeypatch.setattr(mp, "create_scheduler_adapter", scheduler)
+    monkeypatch.setattr(mp, "create_worker_adapter", worker)
+    monkeypatch.setattr(mp.zmq.Context, "instance", lambda: object())
+    config = SimpleNamespace(
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="LMCacheMPConnector", kv_role="kv_both"
+        ),
+        cache_config=SimpleNamespace(block_size=16),
+    )
+    connector = mp.LMCacheMPConnectorUpstream(config, role, MagicMock())
+    base_init.assert_called_once()
+    assert scheduler.call_count == (role == KVConnectorRole.SCHEDULER)
+    assert worker.call_count == (role == KVConnectorRole.WORKER)
+    with pytest.raises(NotImplementedError, match="does not provide a qualified"):
+        connector.validate_kmesh_handoff_contract()
 
 
 def _external_connector(

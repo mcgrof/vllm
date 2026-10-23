@@ -11,7 +11,7 @@ import zmq
 from lmcache.integration.vllm.utils import mla_enabled
 from lmcache.utils import init_logger as lmcache_init_logger
 
-from vllm.config import VllmConfig
+from vllm.config import KVTransferConfig, VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
@@ -458,6 +458,25 @@ class LMCacheMPConnectorMetadata(KVConnectorMetadata):
         return self.__str__()
 
 
+_UNSUPPORTED_KMESH_HANDOFF = (
+    "The builtin multiprocess LMCache connector does not provide a qualified "
+    "KMesh handoff: server-bound runtime evidence, explicit-span execution and "
+    "completion/exporter lifetime are not integrated. Use the in-process "
+    "LMCacheConnectorV1 for supported KMesh position-recovery profiles."
+)
+
+
+def reject_kmesh_target_profile(kv_transfer_config: KVTransferConfig) -> None:
+    """Refuse explicit KMesh profiles before MP adapters acquire resources."""
+    from vllm.v1.kmesh.config import KMESH_TARGET_PROFILE_KEY
+
+    profile = kv_transfer_config.get_from_extra_config(KMESH_TARGET_PROFILE_KEY, None)
+    if profile is not None:
+        raise NotImplementedError(
+            f"KMesh target profile {profile!r}: {_UNSUPPORTED_KMESH_HANDOFF}"
+        )
+
+
 class LMCacheMPConnectorUpstream(KVConnectorBase_V1):
     """The connector for LMCache multi-process mode.
 
@@ -475,6 +494,9 @@ class LMCacheMPConnectorUpstream(KVConnectorBase_V1):
         role: KVConnectorRole,
         kv_cache_config: "KVCacheConfig",
     ):
+        transfer = vllm_config.kv_transfer_config
+        if transfer is not None:
+            reject_kmesh_target_profile(transfer)
         super().__init__(vllm_config, role, kv_cache_config)
 
         assert vllm_config.kv_transfer_config is not None
@@ -522,6 +544,10 @@ class LMCacheMPConnectorUpstream(KVConnectorBase_V1):
     @property
     def role(self) -> KVConnectorRole:
         return self._role
+
+    def validate_kmesh_handoff_contract(self) -> None:
+        """Refuse proof of an unsupported MP handoff, even without a profile."""
+        raise NotImplementedError(_UNSUPPORTED_KMESH_HANDOFF)
 
     # ==============================
     # Worker-side methods

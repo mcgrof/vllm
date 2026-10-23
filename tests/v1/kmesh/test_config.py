@@ -526,6 +526,53 @@ def test_serial_pic_v1_target_profile_accepts_exact_outer_runtime() -> None:
     assert validate_kmesh_target_profile(config) == KMESH_SERIAL_PIC_V1_PROFILE
 
 
+@pytest.mark.parametrize("substitute_class", [False, True])
+def test_mp_child_inspection_requires_the_resolved_connector_class(
+    monkeypatch: pytest.MonkeyPatch, substitute_class: bool
+) -> None:
+    """Permit inspection without granting a lookalike MP class admission."""
+
+    class ResolvedMPConnector:
+        pass
+
+    class LookalikeMPConnector:
+        pass
+
+    module_name = "vllm.distributed.kv_transfer.kv_connector.v1.lmcache_mp_connector"
+    module = ModuleType(module_name)
+    module.LMCacheMPConnector = ResolvedMPConnector  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, module_name, module)
+    original_resolve = KVConnectorFactory.get_connector_class
+
+    def resolve(cls: type, transfer: KVTransferConfig) -> type:
+        if transfer.kv_connector == "LMCacheMPConnector":
+            return LookalikeMPConnector if substitute_class else ResolvedMPConnector
+        return original_resolve(transfer)
+
+    monkeypatch.setattr(KVConnectorFactory, "get_connector_class", classmethod(resolve))
+    config = _serial_pic_v1_vllm_config()
+    config.kv_transfer_config.kv_connector_extra_config["connectors"][1][
+        "kv_connector"
+    ] = "LMCacheMPConnector"
+    assert validate_kmesh_target_profile(config) == KMESH_SERIAL_PIC_V1_PROFILE
+    if substitute_class:
+        with pytest.raises(ValueError, match="exact built-in LMCacheMPConnector"):
+            MultiConnector.inspect_connector_classes_and_configs(config)
+    else:
+        children = MultiConnector.inspect_connector_classes_and_configs(config)
+        assert children[1][0] is ResolvedMPConnector
+
+
+@pytest.mark.parametrize("child", ["UnknownConnector", [], False, None])
+def test_target_profile_rejects_unadmitted_child_names(child: object) -> None:
+    config = _serial_pic_v1_vllm_config()
+    config.kv_transfer_config.kv_connector_extra_config["connectors"][1][
+        "kv_connector"
+    ] = child
+    with pytest.raises(ValueError, match="connector order"):
+        validate_kmesh_target_profile(config)
+
+
 def _collective_batched_position_recovery_v1_vllm_config() -> SimpleNamespace:
     config = _serial_pic_v1_vllm_config()
     config.kv_transfer_config.engine_id = "kmesh-collective-batched-pr-v1"
@@ -1987,16 +2034,14 @@ def test_serial_pic_v1_revalidates_after_lmcache_construction(
     monkeypatch.setattr(KMeshConnector, "arm_serial_pic_v1", arm)
     config = _serial_pic_v1_vllm_config()
 
-    connector = MultiConnector(
-        config,
-        KVConnectorRole.SCHEDULER,
-        SimpleNamespace(kv_cache_groups=[]),
-    )
     with pytest.raises(ValueError, match="TP=1"):
-        connector.build_connector_meta(_empty_scheduler_output())
+        MultiConnector(
+            config,
+            KVConnectorRole.SCHEDULER,
+            SimpleNamespace(kv_cache_groups=[]),
+        )
 
     arm.assert_not_called()
-    connector.shutdown()
     assert MutatingExternalAdapter.shutdown_calls == 1
 
 
@@ -2024,13 +2069,12 @@ def test_serial_pic_v1_rejects_child_global_config_replacement(
     monkeypatch.setattr(KMeshConnector, "arm_serial_pic_v1", arm)
     config = _serial_pic_v1_vllm_config()
 
-    connector = MultiConnector(
-        config,
-        KVConnectorRole.SCHEDULER,
-        SimpleNamespace(kv_cache_groups=[]),
-    )
     with pytest.raises(ValueError, match="share read-only engine-global"):
-        connector.build_connector_meta(_empty_scheduler_output())
+        MultiConnector(
+            config,
+            KVConnectorRole.SCHEDULER,
+            SimpleNamespace(kv_cache_groups=[]),
+        )
 
     arm.assert_not_called()
 

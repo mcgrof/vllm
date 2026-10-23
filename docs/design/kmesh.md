@@ -27,6 +27,12 @@ failed load suppresses external handoff before local recomputation. Abort,
 preemption and replacement cannot authorize reuse through a stale descriptor.
 Ordinary connectors inherit no-op lifecycle and peer-metadata hooks.
 
+The composite requires a positive handoff contract during construction and
+before arming recovery. The exact multiprocess LMCache child can be inspected,
+but both MP implementations currently refuse these KMesh profiles before
+allocating adapters. Ordinary MP prefix reuse does not establish support for
+shifted-span recovery. See [the MP admission contract](kmesh_mp_handoff.md).
+
 Supported target profiles are:
 
 | Profile | Execution |
