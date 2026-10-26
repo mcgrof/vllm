@@ -4,6 +4,7 @@
 
 import json
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 
@@ -16,7 +17,7 @@ class ArtifactRegistry:
 
     def __init__(self, db_path: str | Path) -> None:
         self._db_path = str(db_path)
-        with sqlite3.connect(self._db_path) as conn:
+        with closing(sqlite3.connect(self._db_path)) as conn, conn:
             conn.execute("PRAGMA synchronous=FULL")
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS context_artifacts ("
@@ -31,7 +32,7 @@ class ArtifactRegistry:
         A separate connection allows reads from storage worker threads.
         """
         encoded = json.dumps(record, sort_keys=True, separators=(",", ":"))
-        with sqlite3.connect(self._db_path) as conn:
+        with closing(sqlite3.connect(self._db_path)) as conn, conn:
             conn.execute("PRAGMA synchronous=FULL")
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
@@ -46,7 +47,7 @@ class ArtifactRegistry:
 
     def lookup_artifact(self, artifact_id: str) -> dict | None:
         """Resolve an exact typed artifact ID without reading its payload."""
-        with sqlite3.connect(self._db_path) as conn:
+        with closing(sqlite3.connect(self._db_path)) as conn, conn:
             row = conn.execute(
                 "SELECT record FROM context_artifacts WHERE id=?", (artifact_id,)
             ).fetchone()
